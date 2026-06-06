@@ -115,10 +115,8 @@ function(rexglue_configure_target target_name)
         endforeach()
     elseif(APPLE)
         set(_rexglue_macos_vulkan_lib_dirs)
-        set(_rexglue_macos_vulkan_roots)
         if(DEFINED ENV{VULKAN_SDK})
             list(APPEND _rexglue_macos_vulkan_lib_dirs "$ENV{VULKAN_SDK}/lib")
-            list(APPEND _rexglue_macos_vulkan_roots "$ENV{VULKAN_SDK}")
         endif()
         list(APPEND _rexglue_macos_vulkan_lib_dirs /opt/homebrew/lib /usr/local/lib)
 
@@ -136,33 +134,12 @@ function(rexglue_configure_target target_name)
             endforeach()
         endforeach()
 
-        foreach(_vk_lib_dir ${_rexglue_macos_vulkan_lib_dirs})
-            if(EXISTS "${_vk_lib_dir}/libMoltenVK.dylib")
-                add_custom_command(TARGET ${target_name} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E make_directory
-                        $<TARGET_FILE_DIR:${target_name}>/lib
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${_vk_lib_dir}/libMoltenVK.dylib"
-                        $<TARGET_FILE_DIR:${target_name}>/lib
-                    VERBATIM
-                )
-                break()
-            endif()
-        endforeach()
-
-        foreach(_vk_root ${_rexglue_macos_vulkan_roots})
-            if(EXISTS "${_vk_root}/share/vulkan/icd.d/MoltenVK_icd.json")
-                add_custom_command(TARGET ${target_name} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E make_directory
-                        $<TARGET_FILE_DIR:${target_name}>/share/vulkan/icd.d
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${_vk_root}/share/vulkan/icd.d/MoltenVK_icd.json"
-                        $<TARGET_FILE_DIR:${target_name}>/share/vulkan/icd.d
-                    VERBATIM
-                )
-                break()
-            endif()
-        endforeach()
+        add_custom_command(TARGET ${target_name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                -DOUTPUT=$<TARGET_FILE_DIR:${target_name}>/MoltenVK_icd.json
+                -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/write_moltenvk_icd.cmake"
+            VERBATIM
+        )
     endif()
 endfunction()
 
