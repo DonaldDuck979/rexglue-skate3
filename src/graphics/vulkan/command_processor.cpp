@@ -73,35 +73,9 @@ REXCVAR_DEFINE_INT32(vulkan_async_placeholder_max_consecutive_skips, 120, "GPU/V
     .range(0, 3600)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(vulkan_debug_log_frame_summaries_remaining, 0, "GPU/Vulkan",
-                     "Track Vulkan per-frame draw summaries for this many frames")
-    .range(0, 36000)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload)
-    .debug_only();
-
-REXCVAR_DEFINE_INT32(vulkan_debug_frame_summary_interval_frames, 30, "GPU/Vulkan",
-                     "Frame interval for Vulkan debug frame summary logging")
-    .range(1, 600)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload)
-    .debug_only();
-
 REXCVAR_DEFINE_INT32(vulkan_debug_log_resolve_decisions_remaining, 0, "GPU/Vulkan",
                      "Log Vulkan render-target resolve/readback decisions for this many copy "
                      "commands")
-    .range(0, 10000)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload)
-    .debug_only();
-
-REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_candidates_remaining, 0,
-                     "GPU/Vulkan",
-                     "Log texture lifecycle events matching team_profile_background_0.rx2")
-    .range(0, 10000)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload)
-    .debug_only();
-
-REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_bindings_remaining, 0,
-                     "GPU/Vulkan",
-                     "Log texture binding events matching team_profile_background_0.rx2")
     .range(0, 10000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();

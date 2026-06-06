@@ -80,6 +80,32 @@ REXCVAR_DEFINE_INT32(resolution_scale, 2, "GPU",
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(vulkan_debug_log_frame_summaries_remaining, 0, "GPU/Vulkan",
+                     "Track Vulkan per-frame draw summaries for this many frames")
+    .range(0, 36000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_frame_summary_interval_frames, 30, "GPU/Vulkan",
+                     "Frame interval for Vulkan debug frame summary logging")
+    .range(1, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_candidates_remaining, 0,
+                     "GPU/Vulkan",
+                     "Log texture lifecycle events matching team_profile_background_0.rx2")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_bindings_remaining, 0,
+                     "GPU/Vulkan",
+                     "Log texture binding events matching team_profile_background_0.rx2")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
