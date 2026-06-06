@@ -17,6 +17,7 @@
 #include <rex/assert.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/ui/vulkan/immediate_drawer.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
@@ -603,7 +604,11 @@ bool VulkanImmediateDrawer::EnsurePipelinesCreatedForCurrentRenderPass() {
   input_assembly_state.pNext = nullptr;
   input_assembly_state.flags = 0;
   input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+#if REX_PLATFORM_MAC
+  input_assembly_state.primitiveRestartEnable = VK_TRUE;
+#else
   input_assembly_state.primitiveRestartEnable = VK_FALSE;
+#endif
 
   VkPipelineViewportStateCreateInfo viewport_state;
   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;

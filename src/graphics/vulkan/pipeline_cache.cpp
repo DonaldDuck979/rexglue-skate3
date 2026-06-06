@@ -29,6 +29,7 @@
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/thread.h>
 #include <rex/memory.h>
 #include <rex/graphics/util/draw.h>
@@ -3213,7 +3214,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       assert_unhandled_case(description.primitive_topology);
       return false;
   }
+#if REX_PLATFORM_MAC
+  // Metal always has primitive restart enabled in the paths MoltenVK exposes.
+  // Requesting it disabled produces VK_ERROR_FEATURE_NOT_PRESENT pipeline
+  // creation warnings and repeated failed/retried pipeline setup on macOS.
+  input_assembly_state.primitiveRestartEnable = VK_TRUE;
+#else
   input_assembly_state.primitiveRestartEnable = description.primitive_restart ? VK_TRUE : VK_FALSE;
+#endif
 
   VkPipelineViewportStateCreateInfo viewport_state;
   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;

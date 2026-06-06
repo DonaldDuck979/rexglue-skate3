@@ -37,6 +37,7 @@
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
+#include <rex/perf/counter.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/vulkan/linked_type_descriptor_set_allocator.h>
 #include <rex/ui/vulkan/presenter.h>
@@ -242,6 +243,9 @@ class VulkanCommandProcessor : public CommandProcessor {
                                     bool keep_dynamic_blend_constants = false,
                                     bool keep_dynamic_stencil_mask_ref = false);
   void BindExternalComputePipeline(VkPipeline pipeline);
+  uint32_t BeginGpuTimestampedRegion(rex::perf::DrawBucket bucket) {
+    return BeginGpuTimestampedDraw(bucket);
+  }
   void SetViewport(const VkViewport& viewport);
   void SetScissor(const VkRect2D& scissor);
 
@@ -446,6 +450,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DisableHostOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
+  bool InitializeGpuTimestampResources();
+  void ShutdownGpuTimestampResources();
+  void BeginGpuTimestampFrame();
+  void EndGpuTimestampFrame();
+  void ResolveGpuTimestampFrame(VkCommandBuffer command_buffer);
+  void ProcessGpuTimestampResults();
+  uint32_t BeginGpuTimestampedDraw(rex::perf::DrawBucket bucket);
+  void EndGpuTimestampedDraw(uint32_t start_query);
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
@@ -747,6 +759,32 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  // MoltenVK maps timestamp queries to Metal counter sample buffers with a
+  // small per-pool limit, so keep the per-frame query budget modest.
+  static constexpr uint32_t kMaxGpuTimestampQueriesPerFrame = 1024;
+  VkQueryPool gpu_timestamp_query_pool_ = VK_NULL_HANDLE;
+  VkBuffer gpu_timestamp_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory gpu_timestamp_readback_memory_ = VK_NULL_HANDLE;
+  uint32_t gpu_timestamp_readback_memory_type_ = UINT32_MAX;
+  VkDeviceSize gpu_timestamp_readback_memory_size_ = 0;
+  uint64_t* gpu_timestamp_readback_mapping_ = nullptr;
+  bool gpu_timestamp_resources_available_ = false;
+  struct GpuTimestampFrame {
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+    uint32_t query_base = 0;
+    uint32_t query_count = 0;
+    uint32_t frame_start_query = UINT32_MAX;
+    uint32_t frame_end_query = UINT32_MAX;
+    bool pending = false;
+    bool active_bucket_valid = false;
+    rex::perf::DrawBucket active_bucket = rex::perf::DrawBucket::kMainColorDepth;
+    uint32_t active_bucket_index = UINT32_MAX;
+    std::vector<rex::perf::DrawBucket> buckets;
+    std::vector<uint32_t> bucket_start_queries;
+    std::vector<uint32_t> bucket_end_queries;
+  };
+  std::array<GpuTimestampFrame, kMaxFramesInFlight> gpu_timestamp_frames_;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

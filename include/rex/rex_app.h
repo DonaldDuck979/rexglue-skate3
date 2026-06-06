@@ -22,7 +22,11 @@
 #include <thread>
 
 #include <rex/image_info.h>
+#include <rex/platform.h>
 #include <rex/runtime.h>
+#if REX_PLATFORM_MAC
+#include <rex/system/xthread.h>
+#endif
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
@@ -221,6 +225,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::filesystem::path cache_root_;
   std::unique_ptr<Runtime> runtime_;
   std::unique_ptr<ui::Window> window_;
+#if REX_PLATFORM_MAC
+  system::object_ref<system::XThread> main_thread_;
+#endif
   std::thread module_thread_;
   std::atomic<bool> shutting_down_{false};
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;

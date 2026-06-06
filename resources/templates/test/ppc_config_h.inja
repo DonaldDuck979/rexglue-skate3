@@ -55,9 +55,18 @@
 #endif
 
 #ifndef DEFINE_REX_FUNC
+#if defined(__APPLE__)
+#define DEFINE_REX_FUNC(name)             \
+  REX_EXTERN(__imp__##name);              \
+  REX_WEAK_FUNC(name) {                   \
+    __imp__##name(ctx, base);             \
+  }                                       \
+  REX_EXTERN(__imp__##name)
+#else
 #define DEFINE_REX_FUNC(name)                                  \
   __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
   REX_EXTERN(__imp__##name)
+#endif
 #endif
 
 #if REX_PLATFORM_WIN32
@@ -177,4 +186,3 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
     assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
     rex::thread::global_critical_region::mutex().unlock();                                \
   } while (0)
-

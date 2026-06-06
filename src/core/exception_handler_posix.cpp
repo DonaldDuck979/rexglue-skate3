@@ -9,12 +9,17 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
+#define _XOPEN_SOURCE 700
+#endif
+
 #include <rex/exception_handler.h>
 
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
 #include <signal.h>
 
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
@@ -30,6 +35,7 @@ namespace rex::arch {
 bool signal_handlers_installed_ = false;
 struct sigaction original_sigill_handler_;
 struct sigaction original_sigsegv_handler_;
+struct sigaction original_sigbus_handler_;
 
 // This can be as large as needed, but isn't often needed.
 // As we will be sometimes firing many exceptions we want to avoid having to
@@ -40,9 +46,45 @@ constexpr size_t kMaxHandlerCount = 8;
 // Executed in order.
 std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
 
+static void DispatchUnhandledSignal(int signal_number, siginfo_t* signal_info,
+                                    void* signal_context) {
+  struct sigaction* original_handler = nullptr;
+  if (signal_number == SIGILL) {
+    original_handler = &original_sigill_handler_;
+  } else if (signal_number == SIGSEGV) {
+    original_handler = &original_sigsegv_handler_;
+  } else if (signal_number == SIGBUS) {
+    original_handler = &original_sigbus_handler_;
+  }
+
+  if (original_handler) {
+    if ((original_handler->sa_flags & SA_SIGINFO) && original_handler->sa_sigaction) {
+      original_handler->sa_sigaction(signal_number, signal_info, signal_context);
+      return;
+    }
+    if (original_handler->sa_handler == SIG_IGN) {
+      return;
+    }
+    if (original_handler->sa_handler != SIG_DFL && original_handler->sa_handler) {
+      original_handler->sa_handler(signal_number);
+      return;
+    }
+
+    sigaction(signal_number, original_handler, nullptr);
+  } else {
+    signal(signal_number, SIG_DFL);
+  }
+  raise(signal_number);
+  std::_Exit(128 + signal_number);
+}
+
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
+#if REX_PLATFORM_MAC
+  mcontext_t mcontext = reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
+#else
   mcontext_t& mcontext = reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
+#endif
 
   HostThreadContext thread_context;
 
@@ -70,6 +112,19 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   std::memcpy(thread_context.xmm_registers, mcontext.fpregs->_xmm,
               sizeof(thread_context.xmm_registers));
 #elif REX_ARCH_ARM64
+#if REX_PLATFORM_MAC
+  auto& thread_state = mcontext->__ss;
+  auto& neon_state = mcontext->__ns;
+  std::memcpy(thread_context.x, thread_state.__x, sizeof(thread_state.__x));
+  thread_context.x[29] = thread_state.__fp;
+  thread_context.x[30] = thread_state.__lr;
+  thread_context.sp = thread_state.__sp;
+  thread_context.pc = thread_state.__pc;
+  thread_context.pstate = thread_state.__cpsr;
+  thread_context.fpsr = neon_state.__fpsr;
+  thread_context.fpcr = neon_state.__fpcr;
+  std::memcpy(thread_context.v, neon_state.__v, sizeof(thread_context.v));
+#else
   std::memcpy(thread_context.x, mcontext.regs, sizeof(thread_context.x));
   thread_context.sp = mcontext.sp;
   thread_context.pc = mcontext.pc;
@@ -98,6 +153,7 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     thread_context.fpcr = mcontext_fpsimd->fpcr;
     std::memcpy(thread_context.v, mcontext_fpsimd->vregs, sizeof(thread_context.v));
   }
+#endif  // REX_PLATFORM_MAC
 #endif  // REX_ARCH
 
   Exception ex;
@@ -105,7 +161,8 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     case SIGILL:
       ex.InitializeIllegalInstruction(&thread_context);
       break;
-    case SIGSEGV: {
+    case SIGSEGV:
+    case SIGBUS: {
       Exception::AccessViolationOperation access_violation_operation;
 #if REX_ARCH_AMD64
       // x86_pf_error_code::X86_PF_WRITE
@@ -114,6 +171,24 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                        ? Exception::AccessViolationOperation::kWrite
                                        : Exception::AccessViolationOperation::kRead;
 #elif REX_ARCH_ARM64
+#if REX_PLATFORM_MAC
+      const uint32_t esr = mcontext->__es.__esr;
+      if (((esr >> 26) & 0b111110) == 0b100100) {
+        access_violation_operation = (esr & (UINT64_C(1) << 6))
+                                         ? Exception::AccessViolationOperation::kWrite
+                                         : Exception::AccessViolationOperation::kRead;
+      } else {
+        bool instruction_is_store;
+        if (IsArm64LoadPrefetchStore(*reinterpret_cast<const uint32_t*>(thread_context.pc),
+                                     instruction_is_store)) {
+          access_violation_operation = instruction_is_store
+                                           ? Exception::AccessViolationOperation::kWrite
+                                           : Exception::AccessViolationOperation::kRead;
+        } else {
+          access_violation_operation = Exception::AccessViolationOperation::kUnknown;
+        }
+      }
+#else
       // For a Data Abort (EC - ESR_EL1 bits 31:26 - 0b100100 from a lower
       // Exception Level, 0b100101 without a change in the Exception Level),
       // bit 6 is 0 for reading from a memory location, 1 for writing to a
@@ -145,6 +220,7 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
           access_violation_operation = Exception::AccessViolationOperation::kUnknown;
         }
       }
+#endif  // REX_PLATFORM_MAC
 #else
       access_violation_operation = Exception::AccessViolationOperation::kUnknown;
 #endif  // REX_ARCH
@@ -181,6 +257,34 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                     &thread_context.xmm_registers[modified_register_index], sizeof(vec128_t));
       }
 #elif REX_ARCH_ARM64
+#if REX_PLATFORM_MAC
+      auto& thread_state = mcontext->__ss;
+      auto& neon_state = mcontext->__ns;
+      uint32_t modified_register_index;
+      uint32_t modified_x_registers_remaining = ex.modified_x_registers();
+      while (rex::bit_scan_forward(modified_x_registers_remaining, &modified_register_index)) {
+        modified_x_registers_remaining &= ~(UINT32_C(1) << modified_register_index);
+        if (modified_register_index < 29) {
+          thread_state.__x[modified_register_index] =
+              thread_context.x[modified_register_index];
+        } else if (modified_register_index == 29) {
+          thread_state.__fp = thread_context.x[29];
+        } else if (modified_register_index == 30) {
+          thread_state.__lr = thread_context.x[30];
+        }
+      }
+      thread_state.__sp = thread_context.sp;
+      thread_state.__pc = thread_context.pc;
+      thread_state.__cpsr = uint32_t(thread_context.pstate);
+      neon_state.__fpsr = thread_context.fpsr;
+      neon_state.__fpcr = thread_context.fpcr;
+      uint32_t modified_v_registers_remaining = ex.modified_v_registers();
+      while (rex::bit_scan_forward(modified_v_registers_remaining, &modified_register_index)) {
+        modified_v_registers_remaining &= ~(UINT32_C(1) << modified_register_index);
+        std::memcpy(&neon_state.__v[modified_register_index],
+                    &thread_context.v[modified_register_index], sizeof(vec128_t));
+      }
+#else
       uint32_t modified_register_index;
       uint32_t modified_x_registers_remaining = ex.modified_x_registers();
       while (rex::bit_scan_forward(modified_x_registers_remaining, &modified_register_index)) {
@@ -201,10 +305,13 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
           mcontext.regs[modified_register_index] = thread_context.x[modified_register_index];
         }
       }
+#endif  // REX_PLATFORM_MAC
 #endif  // REX_ARCH
       return;
     }
   }
+
+  DispatchUnhandledSignal(signal_number, signal_info, signal_context);
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {
@@ -220,6 +327,9 @@ void ExceptionHandler::Install(Handler fn, void* data) {
     }
     if (sigaction(SIGSEGV, &signal_handler, &original_sigsegv_handler_) != 0) {
       assert_always("Failed to install new SIGSEGV handler");
+    }
+    if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
+      assert_always("Failed to install new SIGBUS handler");
     }
     signal_handlers_installed_ = true;
   }
@@ -260,6 +370,9 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
       }
       if (sigaction(SIGSEGV, &original_sigsegv_handler_, NULL) != 0) {
         assert_always("Failed to restore original SIGSEGV handler");
+      }
+      if (sigaction(SIGBUS, &original_sigbus_handler_, NULL) != 0) {
+        assert_always("Failed to restore original SIGBUS handler");
       }
       signal_handlers_installed_ = false;
     }

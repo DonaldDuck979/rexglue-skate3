@@ -10,10 +10,13 @@
  */
 
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <iostream>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -23,12 +26,22 @@
 #include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/string.h>
 
 #include <dirent.h>
 #include <ftw.h>
 #include <libgen.h>
 #include <pwd.h>
+
+#if REX_PLATFORM_MAC
+#include <mach-o/dyld.h>
+
+using off64_t = off_t;
+#define fseeko64 fseeko
+#define ftello64 ftello
+#define ftruncate64 ftruncate
+#endif
 
 namespace rex {
 
@@ -51,10 +64,31 @@ std::filesystem::path to_path(const std::u16string_view source) {
 namespace filesystem {
 
 std::filesystem::path GetExecutablePath() {
+#if REX_PLATFORM_MAC
+  uint32_t size = PATH_MAX;
+  std::vector<char> path(size);
+  if (_NSGetExecutablePath(path.data(), &size) != 0) {
+    path.resize(size);
+    if (_NSGetExecutablePath(path.data(), &size) != 0) {
+      return {};
+    }
+  }
+
+  char resolved_path[PATH_MAX] = {};
+  if (realpath(path.data(), resolved_path)) {
+    return resolved_path;
+  }
+  return path.data();
+#else
   char buff[FILENAME_MAX] = "";
-  readlink("/proc/self/exe", buff, FILENAME_MAX);
+  ssize_t length = readlink("/proc/self/exe", buff, FILENAME_MAX - 1);
+  if (length < 0) {
+    return {};
+  }
+  buff[length] = '\0';
   std::string s(buff);
   return s;
+#endif
 }
 
 std::filesystem::path GetExecutableFolder() {

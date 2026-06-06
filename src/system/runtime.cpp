@@ -16,6 +16,7 @@
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <rex/platform.h>
 #include <rex/ppc/context.h>          // PPCFuncMapping
 #include <rex/platform/exceptions.h>  // SEH exception support
 #include <rex/kernel/crt/heap.h>
@@ -244,10 +245,22 @@ void Runtime::Shutdown() {
     input_system_.reset();
   }
   kernel_state_.reset();
+#if REX_PLATFORM_MAC
+  // macOS tears down guest threads asynchronously. During process exit, a late
+  // guest callback can still hold references into the dispatcher or mapped
+  // guest memory after the owning systems have stopped. Keep those mappings
+  // alive until the process exits; the OS reclaims them immediately afterward.
+  function_dispatcher_.release();
+#else
   function_dispatcher_.reset();
+#endif
   export_resolver_.reset();
   file_system_.reset();
+#if REX_PLATFORM_MAC
+  memory_.release();
+#else
   memory_.reset();
+#endif
 
   rex::perf::Profiler::Shutdown();
   setup_complete_ = false;

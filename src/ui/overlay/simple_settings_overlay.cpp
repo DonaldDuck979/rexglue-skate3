@@ -364,8 +364,15 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.38f, 0.08f, 0.07f, 1.00f));
   if (ImGui::Button("Close Game", ImVec2(170.0f, 40.0f))) {
     if (close_game_) {
+      Hide();
       close_game_();
     }
+    ImGui::PopStyleColor(3);
+    ImGui::End();
+    ImGui::PopStyleColor(17);
+    ImGui::PopStyleVar(7);
+    ImGui::PopFont();
+    return;
   }
   ImGui::PopStyleColor(3);
   ImGui::Spacing();

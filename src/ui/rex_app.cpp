@@ -48,6 +48,7 @@
 #include <filesystem>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 namespace rex {
 
@@ -98,9 +99,24 @@ bool ReXApp::OnInitialize() {
     return true;
   }
 
+#if REX_PLATFORM_MAC
+  // Let the platform event loop run once before runtime setup. SDL creates the
+  // Cocoa window synchronously, but the app may not visibly activate if guest
+  // initialization starts before the first event-loop pass.
+  app_context().CallInUIThreadDeferred([this, paths = std::move(*paths)]() mutable {
+    if (shutting_down_.load(std::memory_order_acquire))
+      return;
+    if (!ConstructRuntime(paths)) {
+      app_context().QuitFromUIThread();
+      return;
+    }
+    LaunchModule();
+  });
+#else
   if (!ConstructRuntime(*paths))
     return false;
   LaunchModule();
+#endif
   return true;
 }
 
@@ -432,6 +448,9 @@ void ReXApp::LaunchModule() {
       app_context().QuitFromUIThread();
       return;
     }
+#if REX_PLATFORM_MAC
+    main_thread_ = main_thread;
+#endif
 
     auto* graphics_system =
         static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
@@ -478,6 +497,11 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
+#if REX_PLATFORM_MAC
+  if (main_thread_ && main_thread_->is_running()) {
+    main_thread_->Terminate(0);
+  }
+#endif
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
@@ -487,6 +511,13 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 void ReXApp::OnDestroy() {
   // Notify subclass before cleanup
   OnShutdown();
+
+#if REX_PLATFORM_MAC
+  shutting_down_.store(true, std::memory_order_release);
+  if (main_thread_ && main_thread_->is_running()) {
+    main_thread_->Terminate(0);
+  }
+#endif
 
   // Unregister overlay keybinds before destroying dialogs
   rex::ui::UnregisterBind("bind_debug_overlay");
@@ -515,6 +546,15 @@ void ReXApp::OnDestroy() {
   }
   if (module_thread_.joinable()) {
     module_thread_.join();
+  }
+#if REX_PLATFORM_MAC
+  main_thread_ = nullptr;
+#endif
+  // Input drivers may still be registered as window listeners. Detach them
+  // before destroying the SDL window so their backend state is released in
+  // listener order.
+  if (runtime_ && runtime_->input_system()) {
+    static_cast<rex::input::InputSystem*>(runtime_->input_system())->Shutdown();
   }
   if (window_) {
     window_->RemoveInputListener(this);

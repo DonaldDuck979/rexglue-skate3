@@ -49,6 +49,17 @@ std::unordered_map<std::string, size_t>& GetRegistryIndex() {
   return index;
 }
 
+std::vector<std::pair<std::string, std::string>>& GetCommandLineOverrides() {
+  static std::vector<std::pair<std::string, std::string>> overrides;
+  return overrides;
+}
+
+void ApplyCommandLineOverrides() {
+  for (const auto& [name, value] : GetCommandLineOverrides()) {
+    SetFlagByName(name, value);
+  }
+}
+
 // Convert flag name to environment variable: gpu_vsync -> REX_GPU_VSYNC
 std::string FlagNameToEnvVar(std::string_view name) {
   std::string result = "REX_";
@@ -538,11 +549,19 @@ std::vector<std::string> Init(int argc, char** argv) {
     if (entry.type == FlagType::Boolean) {
       app.add_flag_function(
           "--" + entry.name + ",!--no-" + entry.name,
-          [&entry](int64_t count) { entry.setter(count > 0 ? "true" : "false"); },
+          [&entry](int64_t count) {
+            std::string value = count > 0 ? "true" : "false";
+            GetCommandLineOverrides().emplace_back(entry.name, value);
+            entry.setter(value);
+          },
           entry.description);
     } else {
       app.add_option_function<std::string>(
-          "--" + entry.name, [&entry](const std::string& val) { entry.setter(val); },
+          "--" + entry.name,
+          [&entry](const std::string& val) {
+            GetCommandLineOverrides().emplace_back(entry.name, val);
+            entry.setter(val);
+          },
           entry.description);
     }
   }
@@ -567,6 +586,8 @@ void LoadConfig(const std::filesystem::path& config_path) {
   try {
     auto config = toml::parse_file(config_path.string());
     ApplyTomlTable(config, "");
+    ApplyCommandLineOverrides();
+    ApplyEnvironment();
     REXLOG_INFO("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());

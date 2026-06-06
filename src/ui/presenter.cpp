@@ -425,8 +425,10 @@ void Presenter::OnSurfaceResizeFromUIThread() {
   bool request_repaint;
   UpdateSurfacePaintConnectionFromUIThread(&request_repaint, true);
 
-  // Request to repaint as soon as possible in the UI thread if needed.
-  if (request_repaint) {
+  // Request to repaint as soon as possible in the UI thread if needed. Active
+  // UI drawers need a repaint after every resize even if the connection reports
+  // unchanged, because UI-only presentation has no guest frame to kick it.
+  if (request_repaint || !ui_drawers_.empty()) {
     RequestPaintOrConnectionRecoveryViaWindow(true);
   }
 }
@@ -1453,12 +1455,12 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
   // theoretically. For safety, check whether the window exists unconditionally.
   assert_not_null(window_);
   assert_not_null(surface_);
+  if (force_ui_thread_paint_tick) {
+    ForceUIThreadPaintTick();
+  }
   if (ui_thread_paint_requested_.exchange(true, std::memory_order_relaxed)) {
     // Invalidation pending already, no need to do it twice.
     return false;
-  }
-  if (force_ui_thread_paint_tick) {
-    ForceUIThreadPaintTick();
   }
   window_->RequestPaint();
   return true;

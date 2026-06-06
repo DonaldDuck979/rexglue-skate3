@@ -150,6 +150,7 @@ void Window::AddInputListener(WindowInputListener* listener, size_t z_order) {
     // indices will result in the skipping being cancelled in the outer loop if
     // an inner one is done, a "greater than" comparison will cause the inner
     // loop to effectively terminate all outer ones).
+    break;
   }
   auto it_new = std::prev(std::make_reverse_iterator(input_listeners_.emplace(z_order, listener)));
   // If adding to layers in between the currently being processed ones (from

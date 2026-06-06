@@ -60,9 +60,18 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
   REX_EXTERN(name);            \
   REX_EXTERN(__imp__##name)
 
+#if defined(__APPLE__)
+#define DEFINE_REX_FUNC(name)             \
+  REX_EXTERN(__imp__##name);              \
+  REX_WEAK_FUNC(name) {                   \
+    __imp__##name(ctx, base);             \
+  }                                       \
+  REX_EXTERN(__imp__##name)
+#else
 #define DEFINE_REX_FUNC(name)                                  \
   __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
   REX_EXTERN(__imp__##name)
+#endif
 
 //=============================================================================
 // Function Prologue

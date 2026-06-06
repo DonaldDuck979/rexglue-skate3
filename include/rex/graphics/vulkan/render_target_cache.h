@@ -682,7 +682,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // need to be dumped). Using 8x16 since that's 128 - the minimum required
   // group size on Vulkan, and the maximum number of lanes in a subgroup on
   // Vulkan.
-  static constexpr uint32_t kDumpSamplesPerGroupX = 8;
+  static constexpr uint32_t kDumpSamplesPerGroupX = 40;
   static constexpr uint32_t kDumpSamplesPerGroupY = 16;
 
   union DumpPitches {

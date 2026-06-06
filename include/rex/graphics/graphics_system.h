@@ -122,6 +122,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;
 
+  std::atomic<bool> shutting_down_{false};
   std::atomic<bool> vsync_worker_running_;
   system::object_ref<system::XHostThread> vsync_worker_thread_;
 

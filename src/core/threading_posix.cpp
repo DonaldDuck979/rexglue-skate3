@@ -24,11 +24,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <pthread.h>
 #include <semaphore.h>
-#include <sys/eventfd.h>
-#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#if REX_PLATFORM_LINUX
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
+#endif
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
@@ -110,13 +113,37 @@ enum class SignalType {
 };
 
 int GetSystemSignal(SignalType num) {
+#if REX_PLATFORM_MAC
+  switch (num) {
+    case SignalType::kThreadSuspend:
+      return SIGUSR1;
+    case SignalType::kThreadUserCallback:
+      return SIGUSR2;
+    default:
+      assert_unhandled_case(num);
+      return SIGUSR2;
+  }
+#else
   auto result = SIGRTMIN + static_cast<int>(num);
   assert_true(result < SIGRTMAX);
   return result;
+#endif
 }
 
 SignalType GetSystemSignalType(int num) {
+#if REX_PLATFORM_MAC
+  switch (num) {
+    case SIGUSR1:
+      return SignalType::kThreadSuspend;
+    case SIGUSR2:
+      return SignalType::kThreadUserCallback;
+    default:
+      assert_unhandled_case(num);
+      return SignalType::kThreadUserCallback;
+  }
+#else
   return static_cast<SignalType>(num - SIGRTMIN);
+#endif
 }
 
 std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_handler_installed =
@@ -145,7 +172,13 @@ void EnableAffinityConfiguration() {}
 // uint64_t ticks() { return mach_absolute_time(); }
 
 uint32_t current_thread_system_id() {
+#if REX_PLATFORM_MAC
+  uint64_t thread_id;
+  pthread_threadid_np(nullptr, &thread_id);
+  return static_cast<uint32_t>(thread_id);
+#else
   return static_cast<uint32_t>(syscall(SYS_gettid));
+#endif
 }
 
 void MaybeYield() {
@@ -669,7 +702,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
     WaitStarted();
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
+#if REX_PLATFORM_MAC
+      if (pthread_equal(thread_, pthread_self())) {
+        pthread_setname_np(std::string(name).c_str());
+      }
+#else
       pthread_setname_np(thread_, std::string(name).c_str());
+#endif
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
 #endif
@@ -687,9 +726,22 @@ class PosixCondition<Thread> : public PosixConditionBase {
   }
 #endif
 
-  uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
+  uint32_t system_id() const {
+#if REX_PLATFORM_MAC
+    uint64_t thread_id;
+    if (pthread_threadid_np(thread_, &thread_id) != 0) {
+      return 0;
+    }
+    return static_cast<uint32_t>(thread_id);
+#else
+    return static_cast<uint32_t>(thread_);
+#endif
+  }
 
   uint64_t affinity_mask() {
+#if REX_PLATFORM_MAC
+    return 0;
+#else
     WaitStarted();
     cpu_set_t cpu_set;
 #if REX_PLATFORM_ANDROID
@@ -708,9 +760,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
       result |= set << i;
     }
     return result;
+#endif
   }
 
   void set_affinity_mask(uint64_t mask) {
+#if REX_PLATFORM_MAC
+    (void)mask;
+#else
     WaitStarted();
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
@@ -727,6 +783,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (pthread_setaffinity_np(thread_, sizeof(cpu_set_t), &cpu_set) != 0) {
       assert_always();
     }
+#endif
 #endif
   }
 
@@ -784,6 +841,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #if REX_PLATFORM_ANDROID
     int result = sigqueue(pthread_gettid_np(thread_),
                           GetSystemSignal(SignalType::kThreadUserCallback), value);
+#elif REX_PLATFORM_MAC
+    (void)value;
+    int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
 #else
     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
 #endif
@@ -1394,7 +1454,11 @@ void Thread::Exit(int exit_code) {
 }
 
 void set_current_thread_name(const std::string_view name) {
+#if REX_PLATFORM_MAC
+  pthread_setname_np(std::string(name).c_str());
+#else
   pthread_setname_np(pthread_self(), std::string(name).c_str());
+#endif
 #if REX_PLATFORM_ANDROID
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);

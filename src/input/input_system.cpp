@@ -23,6 +23,8 @@
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/ui/ui_event.h>
+#include <rex/ui/window_listener.h>
 
 namespace {
 
@@ -50,6 +52,15 @@ X_STATUS InputSystem::Setup() {
 }
 
 void InputSystem::Shutdown() {
+  if (window_) {
+    rex::ui::UIEvent closing_event(window_);
+    for (auto& driver : drivers_) {
+      if (auto* window_listener = dynamic_cast<rex::ui::WindowListener*>(driver.get())) {
+        window_listener->OnClosing(closing_event);
+      }
+    }
+    window_ = nullptr;
+  }
   drivers_.clear();
 }
 

@@ -29,6 +29,14 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
+#if REX_PLATFORM_MAC
+#ifdef IPPROTO_TCP
+#undef IPPROTO_TCP
+#endif
+#ifdef IPPROTO_UDP
+#undef IPPROTO_UDP
+#endif
+#endif
 #endif
 
 namespace rex::system {

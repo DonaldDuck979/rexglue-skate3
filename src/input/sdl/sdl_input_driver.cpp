@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 
@@ -22,6 +23,8 @@
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+REXCVAR_DEFINE_UINT32(hid_sdl_rumble_duration_ms, 100, "Input",
+                      "SDL rumble pulse duration for nonzero XInput vibration");
 
 namespace rex::input::sdl {
 
@@ -124,6 +127,7 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
     }
     for (size_t i = 0; i < controllers_.size(); i++) {
       if (controllers_.at(i).sdl) {
+        StopRumbleLocked(controllers_.at(i));
         SDL_CloseGamepad(controllers_.at(i).sdl);
         controllers_.at(i) = {};
       }
@@ -220,16 +224,16 @@ X_RESULT SDLInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-#if SDL_VERSION_ATLEAST(2, 0, 9)
-  if (SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed, vibration->right_motor_speed,
-                        0)) {
+  const bool has_rumble = vibration->left_motor_speed || vibration->right_motor_speed;
+  const uint32_t duration_ms =
+      has_rumble ? std::clamp(REXCVAR_GET(hid_sdl_rumble_duration_ms), uint32_t(1),
+                              uint32_t(1000))
+                 : 0;
+  if (!SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
+                         vibration->right_motor_speed, duration_ms)) {
     return X_ERROR_FUNCTION_FAILED;
-  } else {
-    return X_ERROR_SUCCESS;
   }
-#else
   return X_ERROR_SUCCESS;
-#endif
 }
 
 X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
@@ -437,6 +441,12 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
   }
 }
 
+void SDLInputDriver::StopRumbleLocked(ControllerState& state) {
+  if (state.sdl) {
+    SDL_RumbleGamepad(state.sdl, 0, 0, 0);
+  }
+}
+
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   // Open the controller.
   const auto controller = SDL_OpenGamepad(event.cdevice.which);
@@ -493,6 +503,7 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
   // Find the disconnected gamecontroller and close it.
   auto idx = GetControllerIndexFromInstanceID(event.cdevice.which);
   if (idx) {
+    StopRumbleLocked(controllers_.at(*idx));
     SDL_CloseGamepad(controllers_.at(*idx).sdl);
     controllers_.at(*idx) = {};
     keystroke_states_.at(*idx) = {};

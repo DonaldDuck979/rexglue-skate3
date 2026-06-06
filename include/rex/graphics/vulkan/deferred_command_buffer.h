@@ -351,6 +351,15 @@ class DeferredCommandBuffer {
     std::memcpy(args_ptr + header_size, viewports, sizeof(VkViewport) * viewport_count);
   }
 
+  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
+                           uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
+        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    args.pipeline_stage = pipeline_stage;
+    args.query_pool = query_pool;
+    args.query = query;
+  }
+
  private:
   enum class Command {
     kVkBeginRenderPass,
@@ -381,6 +390,7 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
+    kVkWriteTimestamp,
   };
 
   struct CommandHeader {
@@ -524,6 +534,12 @@ class DeferredCommandBuffer {
     VkQueryPool query_pool;
     uint32_t first_query;
     uint32_t query_count;
+  };
+
+  struct ArgsVkWriteTimestamp {
+    VkPipelineStageFlagBits pipeline_stage;
+    VkQueryPool query_pool;
+    uint32_t query;
   };
 
   struct ArgsVkPipelineBarrier {

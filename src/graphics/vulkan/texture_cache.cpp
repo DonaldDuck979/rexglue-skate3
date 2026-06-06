@@ -29,11 +29,16 @@
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/vulkan/mem_alloc.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+REXCVAR_DEFINE_BOOL(vulkan_scaled_resolve_write_barrier_overlap_only, false, "GPU/Vulkan",
+                    "Skip consecutive scaled resolve write barriers when destination ranges do "
+                    "not overlap")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -2293,13 +2298,27 @@ void VulkanTextureCache::UseScaledResolveBufferForWrite(uint64_t written_start_s
       std::min(written_length_scaled, scaled_resolve_buffer_size_ - written_start_scaled);
 
   if (scaled_resolve_last_usage_write_ && scaled_resolve_last_written_range_.second) {
-    VkPipelineStageFlags stage_mask;
-    VkAccessFlags access_mask;
-    GetScaledResolveUsageMasks(stage_mask, access_mask, true);
-    command_processor_.PushBufferMemoryBarrier(
-        scaled_resolve_buffer_, VkDeviceSize(scaled_resolve_last_written_range_.first),
-        VkDeviceSize(scaled_resolve_last_written_range_.second), stage_mask, stage_mask,
-        access_mask, access_mask, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+    uint64_t previous_start = scaled_resolve_last_written_range_.first;
+    uint64_t previous_end = previous_start + scaled_resolve_last_written_range_.second;
+    uint64_t written_end = written_start_scaled + written_length_scaled;
+    bool ranges_overlap = previous_start < written_end && written_start_scaled < previous_end;
+    if (ranges_overlap) {
+      PERF_counter_inc(kRtScaledResolveWriteBarrierOverlaps);
+    }
+    if (ranges_overlap || !REXCVAR_GET(vulkan_scaled_resolve_write_barrier_overlap_only)) {
+      VkPipelineStageFlags stage_mask;
+      VkAccessFlags access_mask;
+      GetScaledResolveUsageMasks(stage_mask, access_mask, true);
+      command_processor_.PushBufferMemoryBarrier(
+          scaled_resolve_buffer_, VkDeviceSize(scaled_resolve_last_written_range_.first),
+          VkDeviceSize(scaled_resolve_last_written_range_.second), stage_mask, stage_mask,
+          access_mask, access_mask, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+      PERF_counter_inc(kRtScaledResolveWriteBarriers);
+      PERF_counter_add(kRtScaledResolveWriteBarrierBytes,
+                       scaled_resolve_last_written_range_.second);
+    } else {
+      PERF_counter_inc(kRtScaledResolveWriteBarrierSkipped);
+    }
   } else if (!scaled_resolve_last_usage_write_) {
     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
     VkAccessFlags src_access_mask, dst_access_mask;

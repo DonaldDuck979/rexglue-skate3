@@ -20,6 +20,13 @@
 #include <rex/memory/mapped_memory.h>
 #include <rex/platform.h>
 
+#if REX_PLATFORM_MAC
+using off64_t = off_t;
+#define stat64 stat
+#define fstat64 fstat
+#define ftruncate64 ftruncate
+#endif
+
 namespace rex::memory {
 
 class PosixMappedMemory : public MappedMemory {

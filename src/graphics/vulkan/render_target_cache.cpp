@@ -35,6 +35,8 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
+#include <rex/platform.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
@@ -387,6 +389,12 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     msaa_2x_attachments_supported_ = false;
     msaa_2x_no_attachments_supported_ = false;
   }
+  REXGPU_INFO(
+      "VulkanRenderTargetCache: Using {} render target path, native 2x MSAA attachments {}, "
+      "native 2x MSAA no-attachments {}",
+      path_ == Path::kHostRenderTargets ? "host/FBO" : "fragment shader interlock/FSI",
+      msaa_2x_attachments_supported_ ? "available" : "unavailable",
+      msaa_2x_no_attachments_supported_ ? "available" : "unavailable");
   bool integer_transfer_sample_1x_supported =
       (device_properties.framebufferColorSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0 &&
       (device_properties.sampledImageIntegerSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0;
@@ -1466,6 +1474,14 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           UseEdramBuffer(EdramBufferUsage::kComputeRead);
           command_processor_.BindExternalComputePipeline(
               resolve_copy_pipelines_[size_t(copy_shader)]);
+          rex::perf::DrawBucket resolve_timing_bucket =
+              rex::perf::DrawBucket::kCopyResolveShader;
+          if (copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA) {
+            resolve_timing_bucket = rex::perf::DrawBucket::kCopyResolveFast32;
+          } else if (copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp) {
+            resolve_timing_bucket = rex::perf::DrawBucket::kCopyResolveFull32;
+          }
+          command_processor_.BeginGpuTimestampedRegion(resolve_timing_bucket);
           VkDescriptorSet descriptor_sets[kResolveCopyDescriptorSetCount] = {};
           descriptor_sets[kResolveCopyDescriptorSetEdram] = edram_storage_buffer_descriptor_set_;
           descriptor_sets[kResolveCopyDescriptorSetDest] = descriptor_set_dest;
@@ -1487,6 +1503,44 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                 sizeof(copy_shader_constants), &copy_shader_constants);
           }
           command_processor_.SubmitBarriers(true);
+          PERF_counter_inc(kRtResolveCopyDispatches);
+          PERF_counter_add(kRtResolveCopyGroups,
+                           uint64_t(copy_group_count_x) * copy_group_count_y);
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+          static constexpr rex::perf::CounterId kResolveCopyDispatchCounters[] = {
+              rex::perf::CounterId::kRtResolveCopyFast32bpp1x2xMsaaDispatches,
+              rex::perf::CounterId::kRtResolveCopyFast32bpp4xMsaaDispatches,
+              rex::perf::CounterId::kRtResolveCopyFast64bpp1x2xMsaaDispatches,
+              rex::perf::CounterId::kRtResolveCopyFast64bpp4xMsaaDispatches,
+              rex::perf::CounterId::kRtResolveCopyFull8bppDispatches,
+              rex::perf::CounterId::kRtResolveCopyFull16bppDispatches,
+              rex::perf::CounterId::kRtResolveCopyFull32bppDispatches,
+              rex::perf::CounterId::kRtResolveCopyFull64bppDispatches,
+              rex::perf::CounterId::kRtResolveCopyFull128bppDispatches,
+          };
+          static constexpr rex::perf::CounterId kResolveCopyGroupCounters[] = {
+              rex::perf::CounterId::kRtResolveCopyFast32bpp1x2xMsaaGroups,
+              rex::perf::CounterId::kRtResolveCopyFast32bpp4xMsaaGroups,
+              rex::perf::CounterId::kRtResolveCopyFast64bpp1x2xMsaaGroups,
+              rex::perf::CounterId::kRtResolveCopyFast64bpp4xMsaaGroups,
+              rex::perf::CounterId::kRtResolveCopyFull8bppGroups,
+              rex::perf::CounterId::kRtResolveCopyFull16bppGroups,
+              rex::perf::CounterId::kRtResolveCopyFull32bppGroups,
+              rex::perf::CounterId::kRtResolveCopyFull64bppGroups,
+              rex::perf::CounterId::kRtResolveCopyFull128bppGroups,
+          };
+          static_assert(std::size(kResolveCopyDispatchCounters) ==
+                        size_t(draw_util::ResolveCopyShaderIndex::kCount));
+          static_assert(std::size(kResolveCopyGroupCounters) ==
+                        size_t(draw_util::ResolveCopyShaderIndex::kCount));
+          size_t copy_shader_index = size_t(copy_shader);
+          rex::perf::IncrementCounter(kResolveCopyDispatchCounters[copy_shader_index]);
+          rex::perf::IncrementCounter(kResolveCopyGroupCounters[copy_shader_index],
+                                      uint64_t(copy_group_count_x) * copy_group_count_y);
+#endif
+          if (draw_resolution_scaled) {
+            PERF_counter_add(kRtResolveScaledBytes, copy_dest_use_length);
+          }
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
 
           // Invalidate textures and mark the range as scaled if needed.
@@ -4558,7 +4612,11 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
   input_assembly_state.pNext = nullptr;
   input_assembly_state.flags = 0;
   input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+#if REX_PLATFORM_MAC
+  input_assembly_state.primitiveRestartEnable = VK_TRUE;
+#else
   input_assembly_state.primitiveRestartEnable = VK_FALSE;
+#endif
 
   // Dynamic, to stay within maxViewportDimensions while preferring a
   // power-of-two factor for converting from pixel coordinates to NDC for exact
@@ -6226,9 +6284,11 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
 bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                 uint32_t dump_rows, uint32_t dump_pitch) {
   assert_true(GetPath() == Path::kHostRenderTargets);
+  PERF_counter_inc(kRtDumpCalls);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  dump_rectangles_);
+  PERF_counter_add(kRtDumpRectangles, dump_rectangles_.size());
   if (dump_rectangles_.empty()) {
     return true;
   }
@@ -6270,6 +6330,7 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
 
   // Dump the render targets.
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kCopyDump);
   bool edram_buffer_bound = false;
   VkDescriptorSet last_source_descriptor_set = VK_NULL_HANDLE;
   DumpPitches last_pitches;
@@ -6340,16 +6401,19 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
                                           sizeof(last_offsets), &last_offsets);
       }
       command_processor_.SubmitBarriers(true);
-      command_buffer.CmdVkDispatch(
+      const uint32_t group_count_x =
           (draw_resolution_scale_x() *
                (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
                dispatch.width_tiles +
            (kDumpSamplesPerGroupX - 1)) /
-              kDumpSamplesPerGroupX,
+          kDumpSamplesPerGroupX;
+      const uint32_t group_count_y =
           (draw_resolution_scale_y() * xenos::kEdramTileHeightSamples * dispatch.height_tiles +
            (kDumpSamplesPerGroupY - 1)) /
-              kDumpSamplesPerGroupY,
-          1);
+          kDumpSamplesPerGroupY;
+      PERF_counter_inc(kRtDumpDispatches);
+      PERF_counter_add(kRtDumpGroups, uint64_t(group_count_x) * group_count_y);
+      command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
     }
     MarkEdramBufferModified();
   }

@@ -38,8 +38,29 @@
 // #include "xenia/base/main_android.h"
 #endif
 
+#if REX_PLATFORM_MAC
+#define ftruncate64 ftruncate
+#define mmap64 mmap
+#endif
+
 namespace rex {
 namespace memory {
+
+namespace {
+
+#if REX_PLATFORM_MAC
+void AlignHostPageRange(void*& base_address, size_t& length) {
+  const uintptr_t page_mask = uintptr_t(page_size() - 1);
+  const uintptr_t start = reinterpret_cast<uintptr_t>(base_address);
+  const uintptr_t end = start + length;
+  const uintptr_t aligned_start = start & ~page_mask;
+  const uintptr_t aligned_end = (end + page_mask) & ~page_mask;
+  base_address = reinterpret_cast<void*>(aligned_start);
+  length = static_cast<size_t>(aligned_end - aligned_start);
+}
+#endif
+
+}  // namespace
 
 // Convert filesystem path to valid shm_open name (must start with /, no other slashes)
 static std::string MakeShmName(const std::filesystem::path& path) {
@@ -222,6 +243,19 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
       break;
   }
 
+#if REX_PLATFORM_MAC
+  if (base_address &&
+      (allocation_type == AllocationType::kCommit ||
+       allocation_type == AllocationType::kReserveCommit)) {
+    void* protect_base = base_address;
+    size_t protect_length = length;
+    AlignHostPageRange(protect_base, protect_length);
+    if (mprotect(protect_base, protect_length, static_cast<int>(prot_requested)) == 0) {
+      return base_address;
+    }
+  }
+#endif
+
   // Build flags - always use MAP_FIXED_NOREPLACE for fixed addresses
   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #if defined(MAP_FIXED_NOREPLACE)
@@ -260,6 +294,9 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
   switch (deallocation_type) {
     case DeallocationType::kDecommit: {
       // Decommit: remove access first, then release physical pages
+#if REX_PLATFORM_MAC
+      AlignHostPageRange(base_address, length);
+#endif
       if (mprotect(base_address, length, PROT_NONE) != 0) {
         return false;
       }
@@ -298,6 +335,9 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
+#if REX_PLATFORM_MAC
+  AlignHostPageRange(base_address, length);
+#endif
   return mprotect(base_address, length, prot) == 0;
 }
 

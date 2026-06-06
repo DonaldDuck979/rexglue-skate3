@@ -205,7 +205,8 @@ struct FPSCRRegister {
       Platform::InitHostExceptions(fpu_csr);
       fpu_csr &= ~FlushMask;
       if (vmx_csr == 0) {
-        vmx_csr = ExceptionMask | FlushMask | Platform::GuestToHost[kRoundNearest];
+        vmx_csr = FlushMask | Platform::GuestToHost[kRoundNearest];
+        Platform::InitHostExceptions(vmx_csr);
       }
       csr = fpu_csr;
     }
@@ -216,7 +217,7 @@ struct FPSCRRegister {
     fpu_csr &= ~RoundMaskVal;
     fpu_csr |= Platform::GuestToHost[value & kRoundMask];
     fpu_csr &= ~FlushMask;
-    fpu_csr |= ExceptionMask;
+    Platform::InitHostExceptions(fpu_csr);
     csr = fpu_csr;
     vmx_mode = false;
     setcsr(csr);
@@ -254,7 +255,8 @@ struct FPSCRRegister {
     fpu_csr = getcsr();
     Platform::InitHostExceptions(fpu_csr);
     fpu_csr &= ~FlushMask;
-    vmx_csr = ExceptionMask | FlushMask | Platform::GuestToHost[kRoundNearest];
+    vmx_csr = FlushMask | Platform::GuestToHost[kRoundNearest];
+    Platform::InitHostExceptions(vmx_csr);
     csr = fpu_csr;
     vmx_mode = false;
     setcsr(csr);

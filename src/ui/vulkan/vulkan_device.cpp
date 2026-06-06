@@ -29,7 +29,13 @@ REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI
                     "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, true, "UI/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader,
+#if REX_PLATFORM_MAC
+                    false,
+#else
+                    true,
+#endif
+                    "UI/Vulkan",
                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
                     "fallback primitive emulation paths)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -621,6 +627,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(optimalBufferCopyOffsetAlignment)
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
+  XE_UI_VULKAN_LIMIT(timestampComputeAndGraphics)
+  XE_UI_VULKAN_LIMIT(timestampPeriod)
 
   if (with_gpu_emulation) {
     XE_UI_VULKAN_FEATURE(robustBufferAccess)

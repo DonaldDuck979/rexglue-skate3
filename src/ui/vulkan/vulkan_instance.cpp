@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
@@ -31,6 +33,21 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                                                        const bool try_enable_validation) {
   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
 
+#if REX_PLATFORM_MAC
+  // The Vulkan loader does not discover MoltenVK from an executable-local SDK
+  // layout by default. Prefer user-provided loader settings, but make local
+  // command-line builds run without requiring VK_ICD_FILENAMES in the shell.
+  if (!std::getenv("VK_ICD_FILENAMES") && !std::getenv("VK_DRIVER_FILES")) {
+    auto local_icd_path =
+        rex::filesystem::GetExecutableFolder() / "share" / "vulkan" / "icd.d" / "MoltenVK_icd.json";
+    if (std::filesystem::is_regular_file(local_icd_path)) {
+      std::string local_icd_path_string = local_icd_path.string();
+      setenv("VK_ICD_FILENAMES", local_icd_path_string.c_str(), 0);
+      setenv("VK_DRIVER_FILES", local_icd_path_string.c_str(), 0);
+    }
+  }
+#endif
+
   // Load the RenderDoc API if connected.
 
   vulkan_instance->renderdoc_api_ = RenderDocAPI::CreateIfConnected();
@@ -40,7 +57,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   Functions& ifn = vulkan_instance->functions_;
 
   bool functions_loaded = true;
-  if (!vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)) {
+  if (!vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)
+#if REX_PLATFORM_MAC
+      && !vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoaderFallback)
+      && !vulkan_instance->loader_.Load(platform::lib_names::kMoltenVK)
+#endif
+  ) {
     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
     return nullptr;
   }
@@ -116,6 +138,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     // #10.
     requested_extensions.emplace("VK_KHR_win32_surface",
                                  &vulkan_instance->extensions_.ext_KHR_win32_surface);
+#endif
+#ifdef VK_USE_PLATFORM_METAL_EXT
+    // #218.
+    requested_extensions.emplace("VK_EXT_metal_surface",
+                                 &vulkan_instance->extensions_.ext_EXT_metal_surface);
 #endif
   }
 
@@ -378,6 +405,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 #ifdef VK_USE_PLATFORM_WIN32_KHR
   if (vulkan_instance->extensions_.ext_KHR_win32_surface) {
 #include <rex/ui/vulkan/functions/instance_khr_win32_surface.inc>
+  }
+#endif
+#ifdef VK_USE_PLATFORM_METAL_EXT
+  if (vulkan_instance->extensions_.ext_EXT_metal_surface) {
+#include <rex/ui/vulkan/functions/instance_ext_metal_surface.inc>
   }
 #endif
   if (vulkan_instance->extensions_.ext_KHR_surface) {

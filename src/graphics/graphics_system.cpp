@@ -330,6 +330,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 }
 
 void GraphicsSystem::Shutdown() {
+  shutting_down_.store(true, std::memory_order_release);
+
   if (command_processor_) {
     EndTracing();
     command_processor_->Shutdown();
@@ -447,7 +449,7 @@ void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data)
 }
 
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
-  if (!interrupt_callback_) {
+  if (shutting_down_.load(std::memory_order_acquire) || !interrupt_callback_) {
     return;
   }
 

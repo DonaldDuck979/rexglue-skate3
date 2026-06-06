@@ -17,6 +17,20 @@
 
 #include <rex/chrono/clock.h>
 
+#if !defined(__cpp_lib_chrono) || __cpp_lib_chrono < 201907L
+namespace std::chrono {
+
+template <typename DestClock, typename SourceClock>
+struct clock_time_conversion;
+
+template <typename DestClock, typename SourceClock, typename Duration>
+auto clock_cast(const std::chrono::time_point<SourceClock, Duration>& t) {
+  return clock_time_conversion<DestClock, SourceClock>{}(t);
+}
+
+}  // namespace std::chrono
+#endif
+
 namespace rex {
 using hundrednano = std::ratio<1, 10000000>;
 

@@ -25,6 +25,7 @@
 
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
+#include <rex/std_compat.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread/fiber.h>
 #include <rex/system/util/native_list.h>
@@ -278,7 +279,6 @@ class KernelState {
   void OnThreadExecute(XThread* thread);
   void OnThreadExit(XThread* thread);
   object_ref<XThread> GetThreadByID(uint32_t thread_id);
-
   FiberInfo* LookupFiber(uint32_t guest_addr);
   void RegisterFiber(uint32_t guest_addr, const FiberInfo& info);
   void UnregisterFiber(uint32_t guest_addr);

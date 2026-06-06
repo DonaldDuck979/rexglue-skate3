@@ -130,11 +130,10 @@ bool build_vrefp(BuilderContext& ctx) {
 }
 
 bool build_vrsqrtefp(BuilderContext& ctx) {
-  // Match Xenia's OPCODE_RSQRT lowering. The x86 estimate is not accurate
-  // enough for collision-sensitive code, so use sqrt + divide.
+  // Match the Xenon reciprocal square-root estimate semantics instead of the
+  // host's exact sqrt/divide behavior.
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr(
-      "simde_mm_div_ps(simde_mm_set1_ps(1.0f), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
+  ctx.emit_vec_fp_unary_expr("rex::ppc::simde_mm_vrsqrtefp_ps(simde_mm_load_ps({vA}.f32))");
   return true;
 }
 

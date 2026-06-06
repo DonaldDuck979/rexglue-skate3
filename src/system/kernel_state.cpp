@@ -17,6 +17,7 @@
 #include <rex/assert.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/ppc/function.h>
 #include <rex/runtime.h>
 #include <rex/stream.h>
@@ -841,6 +842,26 @@ void KernelState::TerminateTitle() {
   REXSYS_DEBUG("KernelState::TerminateTitle");
   auto global_lock = global_critical_region_.Acquire();
 
+#if REX_PLATFORM_MAC
+  // pthread_cancel is asynchronous on macOS in the host thread wrapper, but
+  // suspending a guest thread first can strand it in the suspend wait during
+  // title teardown. Terminate directly on macOS and let the thread wrapper
+  // signal waiters before requesting cancellation.
+  std::vector<object_ref<XThread>> threads_to_terminate;
+  for (auto it = threads_by_id_.begin(); it != threads_by_id_.end(); ++it) {
+    if (!XThread::IsInThread(it->second) && it->second->is_guest_thread() &&
+        it->second->is_running()) {
+      threads_to_terminate.push_back(retain_object(it->second));
+    }
+  }
+
+  global_lock.unlock();
+  for (auto& thread : threads_to_terminate) {
+    thread->Terminate(0);
+  }
+  threads_to_terminate.clear();
+  global_lock.lock();
+#else
   // Suspend all running guest threads so they stop touching shared state.
   std::vector<XThread*> suspended_threads;
   for (auto it = threads_by_id_.begin(); it != threads_by_id_.end(); ++it) {
@@ -857,6 +878,7 @@ void KernelState::TerminateTitle() {
     thread->Terminate(0);
   }
   global_lock.lock();
+#endif
 
   // Remove all guest threads from the map.
   for (auto it = threads_by_id_.begin(); it != threads_by_id_.end();) {

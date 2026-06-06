@@ -14,22 +14,30 @@
 # runtime DLL staging is the host's job (see rexglue_configure_target).
 #==========================================================
 function(rexglue_apply_target_settings target_name)
+    set(_rexglue_target_processor "${CMAKE_SYSTEM_PROCESSOR}")
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+        list(LENGTH CMAKE_OSX_ARCHITECTURES _rexglue_osx_arch_count)
+        if(_rexglue_osx_arch_count EQUAL 1)
+            set(_rexglue_target_processor "${CMAKE_OSX_ARCHITECTURES}")
+        endif()
+    endif()
+
     if(UNIX AND NOT APPLE)
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
         target_include_directories(${target_name} PRIVATE ${GTK3_INCLUDE_DIRS})
         target_link_libraries(${target_name} PRIVATE ${GTK3_LIBRARIES})
         # Large executable support
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        if(_rexglue_target_processor MATCHES "x86_64|AMD64")
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
             target_compile_options(${target_name} PRIVATE -mcmodel=large)
-        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+        elseif(_rexglue_target_processor MATCHES "aarch64|ARM64")
             target_compile_options(${target_name} PRIVATE -march=armv8-a)
         endif()
     endif()
 
-    if(NOT MSVC)
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    if(NOT MSVC AND NOT APPLE)
+        if(_rexglue_target_processor MATCHES "x86_64|AMD64")
             target_compile_options(${target_name} PRIVATE -msse4.1)
         endif()
     endif()
@@ -51,6 +59,9 @@ function(rexglue_configure_target target_name)
     if(WIN32)
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
+    elseif(APPLE)
+        target_sources(${target_name} PRIVATE
+            ${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp)
     else()
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_posix.cpp)
@@ -68,7 +79,12 @@ function(rexglue_configure_target target_name)
     target_include_directories(${target_name} PRIVATE
         ${CMAKE_CURRENT_BINARY_DIR}/rexglue-sdk/include)
 
-    if(UNIX AND NOT APPLE)
+    if(APPLE)
+        set_target_properties(${target_name} PROPERTIES
+            INSTALL_RPATH "@loader_path"
+            BUILD_WITH_INSTALL_RPATH ON
+        )
+    elseif(UNIX AND NOT APPLE)
         set_target_properties(${target_name} PROPERTIES
             INSTALL_RPATH "$ORIGIN"
             BUILD_WITH_INSTALL_RPATH ON
@@ -95,6 +111,56 @@ function(rexglue_configure_target target_name)
                         $<TARGET_FILE_DIR:${target_name}>
                     VERBATIM
                 )
+            endif()
+        endforeach()
+    elseif(APPLE)
+        set(_rexglue_macos_vulkan_lib_dirs)
+        set(_rexglue_macos_vulkan_roots)
+        if(DEFINED ENV{VULKAN_SDK})
+            list(APPEND _rexglue_macos_vulkan_lib_dirs "$ENV{VULKAN_SDK}/lib")
+            list(APPEND _rexglue_macos_vulkan_roots "$ENV{VULKAN_SDK}")
+        endif()
+        list(APPEND _rexglue_macos_vulkan_lib_dirs /opt/homebrew/lib /usr/local/lib)
+
+        foreach(_vk_lib libvulkan.1.dylib libvulkan.dylib libMoltenVK.dylib)
+            foreach(_vk_lib_dir ${_rexglue_macos_vulkan_lib_dirs})
+                if(EXISTS "${_vk_lib_dir}/${_vk_lib}")
+                    add_custom_command(TARGET ${target_name} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${_vk_lib_dir}/${_vk_lib}"
+                            $<TARGET_FILE_DIR:${target_name}>
+                        VERBATIM
+                    )
+                    break()
+                endif()
+            endforeach()
+        endforeach()
+
+        foreach(_vk_lib_dir ${_rexglue_macos_vulkan_lib_dirs})
+            if(EXISTS "${_vk_lib_dir}/libMoltenVK.dylib")
+                add_custom_command(TARGET ${target_name} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                        $<TARGET_FILE_DIR:${target_name}>/lib
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_vk_lib_dir}/libMoltenVK.dylib"
+                        $<TARGET_FILE_DIR:${target_name}>/lib
+                    VERBATIM
+                )
+                break()
+            endif()
+        endforeach()
+
+        foreach(_vk_root ${_rexglue_macos_vulkan_roots})
+            if(EXISTS "${_vk_root}/share/vulkan/icd.d/MoltenVK_icd.json")
+                add_custom_command(TARGET ${target_name} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                        $<TARGET_FILE_DIR:${target_name}>/share/vulkan/icd.d
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_vk_root}/share/vulkan/icd.d/MoltenVK_icd.json"
+                        $<TARGET_FILE_DIR:${target_name}>/share/vulkan/icd.d
+                    VERBATIM
+                )
+                break()
             endif()
         endforeach()
     endif()
@@ -131,7 +197,12 @@ function(rexglue_configure_module_target target_name)
         )
     endif()
 
-    if(UNIX AND NOT APPLE)
+    if(APPLE)
+        set_target_properties(${target_name} PROPERTIES
+            INSTALL_RPATH "@loader_path"
+            BUILD_WITH_INSTALL_RPATH ON
+        )
+    elseif(UNIX AND NOT APPLE)
         set_target_properties(${target_name} PROPERTIES
             INSTALL_RPATH "$ORIGIN"
             BUILD_WITH_INSTALL_RPATH ON

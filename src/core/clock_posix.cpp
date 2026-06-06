@@ -16,19 +16,27 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 namespace rex::chrono {
 
+#if REX_PLATFORM_MAC
+constexpr clockid_t kHostClock = CLOCK_MONOTONIC;
+#else
+constexpr clockid_t kHostClock = CLOCK_MONOTONIC_RAW;
+#endif
+
 uint64_t Clock::host_tick_frequency_platform() {
   timespec res;
-  int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
+  int error = clock_getres(kHostClock, &res);
   assert_zero(error);
   assert_zero(res.tv_sec);  // Sub second resolution is required.
+  assert_true(res.tv_nsec > 0);
 
-  // Convert nano seconds to hertz. Resolution is 1ns on most systems.
-  return 1000000000ull / res.tv_nsec;
+  // host_tick_count_platform returns elapsed nanoseconds, not ticks in units of
+  // clock_getres. Report the frequency for those returned units.
+  return 1000000000ull;
 }
 
 uint64_t Clock::host_tick_count_platform() {
   timespec tp;
-  int error = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
+  int error = clock_gettime(kHostClock, &tp);
   assert_zero(error);
 
   return tp.tv_nsec + tp.tv_sec * 1000000000ull;

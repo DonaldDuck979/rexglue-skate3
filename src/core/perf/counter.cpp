@@ -112,6 +112,12 @@ bool IsDelayedGpuTimingCounter(size_t counter_index) {
   return id == CounterId::kGpuMainUs || id == CounterId::kGpuDepthUs ||
          id == CounterId::kGpuCopyUs || id == CounterId::kGpuMemexportUs ||
          id == CounterId::kGpuNoPixelShaderUs ||
+         id == CounterId::kGpuCopyDumpUs ||
+         id == CounterId::kGpuCopyResolveUs ||
+         id == CounterId::kGpuCopyResolveFast32Us ||
+         id == CounterId::kGpuCopyResolveFull32Us ||
+         id == CounterId::kGpuResolveDownscaleUs ||
+         id == CounterId::kGpuTimestampedDraws ||
          id == CounterId::kGpuCommandProcessorFrameUs ||
          id == CounterId::kGpuTimestampedFrames ||
          id == CounterId::kGpuBarrierUs || id == CounterId::kGpuClearUs ||
@@ -158,6 +164,11 @@ constexpr const char* kCounterNames[] = {
     "gpu_copy_us",
     "gpu_memexport_us",
     "gpu_no_pixel_shader_us",
+    "gpu_copy_dump_us",
+    "gpu_copy_resolve_us",
+    "gpu_copy_resolve_fast32_us",
+    "gpu_copy_resolve_full32_us",
+    "gpu_resolve_downscale_us",
     "gpu_timestamped_draws",
     "gpu_command_processor_frame_us",
     "gpu_timestamped_frames",
@@ -245,6 +256,37 @@ constexpr const char* kCounterNames[] = {
     "rt_resolve_transfer_clear_us",
     "rt_resolve_readback_calls",
     "rt_resolve_readback_us",
+    "rt_dump_calls",
+    "rt_dump_rectangles",
+    "rt_dump_dispatches",
+    "rt_dump_groups",
+    "rt_resolve_copy_dispatches",
+    "rt_resolve_copy_groups",
+    "rt_resolve_scaled_bytes",
+    "rt_scaled_resolve_write_barriers",
+    "rt_scaled_resolve_write_barrier_overlaps",
+    "rt_scaled_resolve_write_barrier_skipped",
+    "rt_scaled_resolve_write_barrier_bytes",
+    "rt_resolve_copy_fast32_1x2x_dispatches",
+    "rt_resolve_copy_fast32_1x2x_groups",
+    "rt_resolve_copy_fast32_4x_dispatches",
+    "rt_resolve_copy_fast32_4x_groups",
+    "rt_resolve_copy_fast64_1x2x_dispatches",
+    "rt_resolve_copy_fast64_1x2x_groups",
+    "rt_resolve_copy_fast64_4x_dispatches",
+    "rt_resolve_copy_fast64_4x_groups",
+    "rt_resolve_copy_full8_dispatches",
+    "rt_resolve_copy_full8_groups",
+    "rt_resolve_copy_full16_dispatches",
+    "rt_resolve_copy_full16_groups",
+    "rt_resolve_copy_full32_dispatches",
+    "rt_resolve_copy_full32_groups",
+    "rt_resolve_copy_full64_dispatches",
+    "rt_resolve_copy_full64_groups",
+    "rt_resolve_copy_full128_dispatches",
+    "rt_resolve_copy_full128_groups",
+    "draw_no_pixel_depth_test_calls",
+    "draw_no_pixel_depth_write_calls",
     "xma_frames_decoded",
     "audio_frame_latency_us",
     "buffer_queue_depth",
@@ -300,6 +342,11 @@ constexpr bool kIsGauge[] = {
     false,  // kGpuCopyUs
     false,  // kGpuMemexportUs
     false,  // kGpuNoPixelShaderUs
+    false,  // kGpuCopyDumpUs
+    false,  // kGpuCopyResolveUs
+    false,  // kGpuCopyResolveFast32Us
+    false,  // kGpuCopyResolveFull32Us
+    false,  // kGpuResolveDownscaleUs
     false,  // kGpuTimestampedDraws
     false,  // kGpuCommandProcessorFrameUs
     false,  // kGpuTimestampedFrames
@@ -387,6 +434,37 @@ constexpr bool kIsGauge[] = {
     false,  // kRtResolveTransferClearUs
     false,  // kRtResolveReadbackCalls
     false,  // kRtResolveReadbackUs
+    false,  // kRtDumpCalls
+    false,  // kRtDumpRectangles
+    false,  // kRtDumpDispatches
+    false,  // kRtDumpGroups
+    false,  // kRtResolveCopyDispatches
+    false,  // kRtResolveCopyGroups
+    false,  // kRtResolveScaledBytes
+    false,  // kRtScaledResolveWriteBarriers
+    false,  // kRtScaledResolveWriteBarrierOverlaps
+    false,  // kRtScaledResolveWriteBarrierSkipped
+    false,  // kRtScaledResolveWriteBarrierBytes
+    false,  // kRtResolveCopyFast32bpp1x2xMsaaDispatches
+    false,  // kRtResolveCopyFast32bpp1x2xMsaaGroups
+    false,  // kRtResolveCopyFast32bpp4xMsaaDispatches
+    false,  // kRtResolveCopyFast32bpp4xMsaaGroups
+    false,  // kRtResolveCopyFast64bpp1x2xMsaaDispatches
+    false,  // kRtResolveCopyFast64bpp1x2xMsaaGroups
+    false,  // kRtResolveCopyFast64bpp4xMsaaDispatches
+    false,  // kRtResolveCopyFast64bpp4xMsaaGroups
+    false,  // kRtResolveCopyFull8bppDispatches
+    false,  // kRtResolveCopyFull8bppGroups
+    false,  // kRtResolveCopyFull16bppDispatches
+    false,  // kRtResolveCopyFull16bppGroups
+    false,  // kRtResolveCopyFull32bppDispatches
+    false,  // kRtResolveCopyFull32bppGroups
+    false,  // kRtResolveCopyFull64bppDispatches
+    false,  // kRtResolveCopyFull64bppGroups
+    false,  // kRtResolveCopyFull128bppDispatches
+    false,  // kRtResolveCopyFull128bppGroups
+    false,  // kDrawNoPixelDepthTestCalls
+    false,  // kDrawNoPixelDepthWriteCalls
     false,  // kXmaFramesDecoded
     false,  // kAudioFrameLatencyUs
     false,  // kBufferQueueDepth  (set each frame)
@@ -421,6 +499,16 @@ const char* DrawBucketName(DrawBucket bucket) {
       return "MemExp";
     case DrawBucket::kNoPixelShader:
       return "NoPS";
+    case DrawBucket::kCopyDump:
+      return "CopyDump";
+    case DrawBucket::kCopyResolveShader:
+      return "CopyResolve";
+    case DrawBucket::kCopyResolveFast32:
+      return "CopyResolveFast32";
+    case DrawBucket::kCopyResolveFull32:
+      return "CopyResolveFull32";
+    case DrawBucket::kResolveDownscale:
+      return "ResolveDownscale";
     default:
       return "Unknown";
   }

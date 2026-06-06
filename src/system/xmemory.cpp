@@ -29,6 +29,10 @@
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
 
+#if REX_PLATFORM_MAC
+#include <sys/mman.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(protect_zero, false, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -76,6 +80,22 @@ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_s
  */
 
 static memory::Memory* active_memory_ = nullptr;
+
+namespace {
+
+constexpr size_t kGuestBackingLength = 0x120001000ull;
+
+bool ShouldSkipHostCommit(const BaseHeap& heap) {
+#if REX_PLATFORM_MAC
+  return heap.heap_type() == HeapType::kGuestPhysical && heap.heap_base() == 0x00000000 &&
+         rex::memory::page_size() > 0x1000;
+#else
+  (void)heap;
+  return false;
+#endif
+}
+
+}  // namespace
 
 void CrashDump() {
   static std::atomic<int> in_crash_dump(0);
@@ -135,7 +155,8 @@ bool Memory::Initialize() {
   mapping_ =
       rex::memory::CreateFileMappingHandle(file_name_,
                                            // entire 4gb space + 512mb physical:
-                                           0x11FFFFFFF, rex::memory::PageAccess::kReadWrite, false);
+                                           kGuestBackingLength,
+                                           rex::memory::PageAccess::kReadWrite, false);
   if (mapping_ == rex::memory::kFileMappingHandleInvalid) {
     REXSYS_ERROR("Unable to reserve the 4gb guest address space.");
     assert_always();
@@ -148,10 +169,17 @@ bool Memory::Initialize() {
   for (size_t n = 32; n < 64; n++) {
     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
     if (!MapViews(mapping_base)) {
-      mapping_base_ = mapping_base;
+      mapping_base_ = views_.all_views[0];
       break;
     }
   }
+#if REX_PLATFORM_MAC
+  if (!mapping_base_) {
+    if (!MapViews(nullptr)) {
+      mapping_base_ = views_.all_views[0];
+    }
+  }
+#endif
   if (!mapping_base_) {
     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
     assert_always();
@@ -209,6 +237,12 @@ bool Memory::Initialize() {
   rex::memory::AllocFixed(heaps_.physical.TranslateRelative(0), heaps_.physical.heap_size(),
                           rex::memory::AllocationType::kCommit,
                           rex::memory::PageAccess::kReadWrite);
+#if REX_PLATFORM_MAC
+  // The 0x7F000000-0x7FFFFFFF view aliases the start of physical memory. Touch
+  // it explicitly on macOS so raw generated loads through this alias don't SIGBUS
+  // before any guest write has materialized the shared-memory pages.
+  std::memset(virtual_membase_ + 0x7F000000, 0, 0x01000000);
+#endif
 
   // Install MMIO handler for physical address translation and MMIO ranges
   mmio_handler_ = runtime::MMIOHandler::Install(
@@ -300,8 +334,34 @@ static const struct {
         0x0000000100000000ull,
     },
 };
+
+namespace {
+
+constexpr size_t kGuestMappingLength = 0x120000000ull;
+
+}  // namespace
+
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
+
+#if REX_PLATFORM_MAC
+  // macOS doesn't provide MAP_FIXED_NOREPLACE. Direct MAP_FIXED probing can
+  // overwrite unrelated host mappings, so first reserve the entire range as a
+  // hint and only proceed with a fixed base we own.
+  void* reservation =
+      mmap(mapping_base, kGuestMappingLength, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (reservation == MAP_FAILED) {
+    return 1;
+  }
+  if (mapping_base && reservation != mapping_base) {
+    if (reservation != MAP_FAILED) {
+      munmap(reservation, kGuestMappingLength);
+    }
+    return 1;
+  }
+  mapping_base = reinterpret_cast<uint8_t*>(reservation);
+#endif
+
   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
   // side if system allocation granularity is bigger than 4 KB.
   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
@@ -312,7 +372,12 @@ int Memory::MapViews(uint8_t* mapping_base) {
         rex::memory::PageAccess::kReadWrite, map_info[n].target_address & granularity_mask));
     if (!views_.all_views[n]) {
       // Failed, so bail and try again.
+#if REX_PLATFORM_MAC
+      munmap(mapping_base, kGuestMappingLength);
+      std::fill(std::begin(views_.all_views), std::end(views_.all_views), nullptr);
+#else
       UnmapViews();
+#endif
       return 1;
     }
   }
@@ -1111,7 +1176,7 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
   // Allocate from host.
   if (allocation_type == memory::kMemoryAllocationReserve) {
     // Reserve is not needed, as we are mapped already.
-  } else {
+  } else if (!ShouldSkipHostCommit(*this)) {
     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
                           ? rex::memory::AllocationType::kCommit
                           : rex::memory::AllocationType::kReserve;
@@ -1265,7 +1330,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   // Allocate from host.
   if (allocation_type == memory::kMemoryAllocationReserve) {
     // Reserve is not needed, as we are mapped already.
-  } else {
+  } else if (!ShouldSkipHostCommit(*this)) {
     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
                           ? rex::memory::AllocationType::kCommit
                           : rex::memory::AllocationType::kReserve;
