@@ -11,13 +11,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,6 +46,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
+#include <rex/system/kernel_state.h>
 #include <rex/types.h>
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
@@ -62,6 +67,80 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "used placeholder pipelines to avoid visible flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(vulkan_async_placeholder_max_consecutive_skips, 120, "GPU/Vulkan",
+                     "Maximum consecutive frames to skip because they used async placeholder "
+                     "pipelines before presenting incomplete output anyway (0 for unlimited)")
+    .range(0, 3600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_debug_log_frame_summaries_remaining, 0, "GPU/Vulkan",
+                     "Track Vulkan per-frame draw summaries for this many frames")
+    .range(0, 36000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_frame_summary_interval_frames, 30, "GPU/Vulkan",
+                     "Frame interval for Vulkan debug frame summary logging")
+    .range(1, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_log_resolve_decisions_remaining, 0, "GPU/Vulkan",
+                     "Log Vulkan render-target resolve/readback decisions for this many copy "
+                     "commands")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_candidates_remaining, 0,
+                     "GPU/Vulkan",
+                     "Log texture lifecycle events matching team_profile_background_0.rx2")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_bindings_remaining, 0,
+                     "GPU/Vulkan",
+                     "Log texture binding events matching team_profile_background_0.rx2")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_draws_remaining, 0,
+                     "GPU/Vulkan",
+                     "Log draws sampling the exact team_profile_background_0.rx2 texture")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_BOOL(vulkan_sync_after_resolve, false, "GPU/Vulkan",
+                    "Synchronously wait for Vulkan render-target resolves without CPU readback")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_BOOL(vulkan_barrier_after_scaled_resolve, true, "GPU/Vulkan",
+                    "Submit a GPU memory barrier after scaled Vulkan render-target resolves so "
+                    "follow-up texture loads can read the scaled resolve buffer without CPU "
+                    "readback")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_readback_resolve_max_length, 0, "GPU/Vulkan",
+                     "Maximum resolve byte length eligible for Vulkan CPU readback "
+                     "(0 disables the length filter)")
+    .range(0, 0x7FFFFFFF)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_readback_resolve_min_address, 0, "GPU/Vulkan",
+                     "Minimum guest address eligible for Vulkan CPU resolve readback")
+    .range(0, 0x7FFFFFFF)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_readback_resolve_max_address, 0, "GPU/Vulkan",
+                     "Maximum exclusive guest address eligible for Vulkan CPU resolve readback "
+                     "(0 disables the address filter)")
+    .range(0, 0x7FFFFFFF)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -78,6 +157,58 @@ REXCVAR_DEFINE_BOOL(vulkan_skip_inert_no_pixel_draws, false, "GPU/Vulkan",
 namespace rex::graphics::vulkan {
 
 namespace {
+
+const char* ReadbackResolveModeName(ReadbackResolveMode mode) {
+  switch (mode) {
+    case ReadbackResolveMode::kDisabled:
+      return "none";
+    case ReadbackResolveMode::kFast:
+      return "fast";
+    case ReadbackResolveMode::kSome:
+      return "some";
+    case ReadbackResolveMode::kFull:
+      return "full";
+    case ReadbackResolveMode::kAuto:
+      return "auto";
+  }
+  return "unknown";
+}
+
+bool IsGameplayStateActive(const system::KernelState* kernel_state) {
+  if (!kernel_state) {
+    return false;
+  }
+  auto gameplay_context = kernel_state->GetUserContext(0, 0x8001);
+  return gameplay_context && *gameplay_context == 1;
+}
+
+bool IsInGameContextActive(const system::KernelState* kernel_state) {
+  if (!kernel_state) {
+    return false;
+  }
+  auto title_context = kernel_state->GetUserContext(0, 0x0);
+  return title_context && *title_context != 0;
+}
+
+ReadbackResolveMode ResolveAutoReadbackMode(ReadbackResolveMode mode,
+                                            const system::KernelState* kernel_state) {
+  if (mode != ReadbackResolveMode::kAuto) {
+    return mode;
+  }
+
+  return (!IsGameplayStateActive(kernel_state) && !IsInGameContextActive(kernel_state))
+             ? ReadbackResolveMode::kFull
+             : ReadbackResolveMode::kDisabled;
+}
+
+bool ConsumeResolveDecisionLogBudget() {
+  const int32_t remaining = REXCVAR_GET(vulkan_debug_log_resolve_decisions_remaining);
+  if (remaining <= 0) {
+    return false;
+  }
+  REXCVAR_SET(vulkan_debug_log_resolve_decisions_remaining, remaining - 1);
+  return true;
+}
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -187,6 +318,60 @@ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
         /* .generalConstantMatrixVectorIndexing = */ 1,
     },
 };
+
+void DebugDumpResolveReadback(uint32_t address, uint32_t length, bool scaled, const void* data) {
+  if (!data || !length || REXCVAR_GET(vulkan_debug_log_frame_summaries_remaining) <= 0) {
+    return;
+  }
+
+  constexpr uint32_t kMaxDumps = 96;
+  static std::mutex dump_mutex;
+  static std::unordered_set<uint64_t> dumped_ranges;
+  static uint32_t dump_count = 0;
+
+  const uint64_t key = (uint64_t(address) << 32) | length;
+  std::lock_guard lock(dump_mutex);
+  if (dump_count >= kMaxDumps || !dumped_ranges.insert(key).second) {
+    return;
+  }
+
+  std::error_code ec;
+  const std::filesystem::path dump_dir = std::filesystem::path("logs") / "texture_dumps" / "raw";
+  std::filesystem::create_directories(dump_dir, ec);
+  if (ec) {
+    REXGPU_WARN("Failed to create Vulkan resolve readback dump directory: {}", ec.message());
+    return;
+  }
+
+  char filename[160];
+  std::snprintf(filename, sizeof(filename), "resolve_%03u_addr_%08X_len_%X_%s.bin", dump_count,
+                address, length, scaled ? "scaled" : "unscaled");
+  const std::filesystem::path dump_path = dump_dir / filename;
+
+  std::ofstream dump_file(dump_path, std::ios::binary | std::ios::trunc);
+  if (!dump_file) {
+    REXGPU_WARN("Failed to open Vulkan resolve readback dump '{}'", dump_path.string());
+    return;
+  }
+  dump_file.write(reinterpret_cast<const char*>(data), length);
+  if (!dump_file) {
+    REXGPU_WARN("Failed to write Vulkan resolve readback dump '{}'", dump_path.string());
+    return;
+  }
+
+  const std::filesystem::path manifest_path =
+      std::filesystem::path("logs") / "texture_dumps" / "manifest.csv";
+  std::ofstream manifest_file(manifest_path, std::ios::app);
+  if (manifest_file) {
+    manifest_file << dump_count << ",0x" << std::hex << std::uppercase << address << ",0x"
+                  << length << "," << (scaled ? "scaled" : "unscaled") << "," << filename
+                  << "\n";
+  }
+
+  REXGPU_INFO("Dumped Vulkan resolve readback texture {}: address={:08X}, length={:X}, scaled={}",
+              dump_path.string(), address, length, scaled);
+  ++dump_count;
+}
 
 const char* GetSwapFxaaComputeSource(bool extreme_quality) {
   return extreme_quality ? R"(#version 450
@@ -2313,16 +2498,75 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
-  if (skip_present_due_async_placeholder) {
-    static bool skipped_incomplete_frame_logged = false;
-    if (!skipped_incomplete_frame_logged) {
-      skipped_incomplete_frame_logged = true;
-      REXGPU_WARN(
-          "Skipping Vulkan frame presentation due to async placeholder draw "
-          "usage in this frame");
+  auto log_debug_frame_summary = [&]() {
+    int32_t remaining = REXCVAR_GET(vulkan_debug_log_frame_summaries_remaining);
+    if (remaining <= 0) {
+      return;
     }
-    EndSubmission(true);
-    return;
+    const int32_t interval =
+        std::max(1, REXCVAR_GET(vulkan_debug_frame_summary_interval_frames));
+    const bool should_log = remaining == 36000 || remaining == 3600 ||
+                            (remaining % interval) == 0 ||
+                            skip_present_due_async_placeholder ||
+                            debug_frame_placeholder_draws_ != 0;
+    if (should_log) {
+      REXGPU_WARN(
+          "Vulkan debug frame summary: frame={}, remaining={}, frontbuffer={:08X} {}x{}, "
+          "draws={}, copy_resolves={}, raster={}, color={}, depth_stencil={}, textured={}, "
+          "memexport={}, no_effect={}, placeholder={}, resolve_ranges={}, "
+          "scaled_resolve_ranges={}, resolve_bytes={}, "
+          "resolve0={:08X}+{:X}{}, resolve1={:08X}+{:X}{}, resolve2={:08X}+{:X}{}, "
+          "resolve3={:08X}+{:X}{}, resolve4={:08X}+{:X}{}, resolve5={:08X}+{:X}{}, "
+          "skip_present={}",
+          frame_current_, remaining, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+          debug_frame_draws_, debug_frame_copy_resolves_, debug_frame_raster_draws_,
+          debug_frame_color_draws_, debug_frame_depth_stencil_draws_, debug_frame_texture_draws_,
+          debug_frame_memexport_draws_, debug_frame_no_effect_draws_,
+          debug_frame_placeholder_draws_, debug_frame_resolve_ranges_,
+          debug_frame_scaled_resolve_ranges_, debug_frame_resolve_bytes_,
+          debug_frame_resolve_addresses_[0], debug_frame_resolve_lengths_[0],
+          debug_frame_resolve_scaled_[0] ? "s" : "",
+          debug_frame_resolve_addresses_[1], debug_frame_resolve_lengths_[1],
+          debug_frame_resolve_scaled_[1] ? "s" : "",
+          debug_frame_resolve_addresses_[2], debug_frame_resolve_lengths_[2],
+          debug_frame_resolve_scaled_[2] ? "s" : "",
+          debug_frame_resolve_addresses_[3], debug_frame_resolve_lengths_[3],
+          debug_frame_resolve_scaled_[3] ? "s" : "",
+          debug_frame_resolve_addresses_[4], debug_frame_resolve_lengths_[4],
+          debug_frame_resolve_scaled_[4] ? "s" : "",
+          debug_frame_resolve_addresses_[5], debug_frame_resolve_lengths_[5],
+          debug_frame_resolve_scaled_[5] ? "s" : "", skip_present_due_async_placeholder);
+    }
+    REXCVAR_SET(vulkan_debug_log_frame_summaries_remaining, remaining - 1);
+  };
+  log_debug_frame_summary();
+  if (skip_present_due_async_placeholder) {
+    const uint32_t max_consecutive_skips = uint32_t(std::max(
+        0, REXCVAR_GET(vulkan_async_placeholder_max_consecutive_skips)));
+    if (!max_consecutive_skips ||
+        async_placeholder_consecutive_frame_skips_ < max_consecutive_skips) {
+      ++async_placeholder_consecutive_frame_skips_;
+      static bool skipped_incomplete_frame_logged = false;
+      if (!skipped_incomplete_frame_logged) {
+        skipped_incomplete_frame_logged = true;
+        REXGPU_WARN(
+            "Skipping Vulkan frame presentation due to async placeholder draw "
+            "usage in this frame");
+      }
+      EndSubmission(true);
+      return;
+    }
+
+    if (!async_placeholder_skip_fallback_logged_) {
+      async_placeholder_skip_fallback_logged_ = true;
+      REXGPU_WARN(
+          "Presenting Vulkan frames with async placeholder draws after {} consecutive "
+          "skips to avoid a persistent black screen",
+          async_placeholder_consecutive_frame_skips_);
+    }
+  } else {
+    async_placeholder_consecutive_frame_skips_ = 0;
+    async_placeholder_skip_fallback_logged_ = false;
   }
 
   SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
@@ -3619,6 +3863,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
+  const bool debug_log_frame = REXCVAR_GET(vulkan_debug_log_frame_summaries_remaining) > 0;
+  if (debug_log_frame) {
+    ++debug_frame_draws_;
+  }
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
@@ -3636,6 +3884,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
+    if (debug_log_frame) {
+      ++debug_frame_copy_resolves_;
+    }
     rex::perf::ScopedCounterTimer resolve_timer(rex::perf::CounterId::kRtResolveUs);
     const uint32_t primitive_count = draw_util::EstimatePrimitiveCount(prim_type, index_count);
     PROFILE_DRAW_BUCKET(rex::perf::DrawBucket::kCopyResolve, index_count, primitive_count);
@@ -3688,6 +3939,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
+    if (debug_log_frame) {
+      ++debug_frame_no_effect_draws_;
+    }
     return true;
   }
   VulkanShader* pixel_shader = nullptr;
@@ -3708,6 +3962,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      if (debug_log_frame) {
+        ++debug_frame_no_effect_draws_;
+      }
       return true;
     }
   }
@@ -3758,6 +4015,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
+      if (debug_log_frame) {
+        ++debug_frame_no_effect_draws_;
+      }
       return true;
     }
     if (primitive_processing_result.host_primitive_type == xenos::PrimitiveType::kTriangleFan) {
@@ -3876,6 +4136,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (REXCVAR_GET(vulkan_skip_inert_no_pixel_draws) && pixel_shader == nullptr &&
       normalized_color_mask == 0 && !normalized_depth_control.z_enable &&
       !normalized_depth_control.stencil_enable && !active_occlusion_query_.valid) {
+    if (debug_log_frame) {
+      ++debug_frame_no_effect_draws_;
+    }
     return true;
   }
 
@@ -3885,10 +4148,34 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  uint32_t debug_team_profile_bg_fetch_index = UINT32_MAX;
+  bool debug_team_profile_bg_signed_view = false;
+  uint32_t debug_team_profile_bg_texture_base = 0;
+  uint32_t debug_team_profile_bg_texture_length = 0;
+  if (debug_log_frame) {
+    if (is_rasterization_done) {
+      ++debug_frame_raster_draws_;
+    }
+    if (normalized_color_mask) {
+      ++debug_frame_color_draws_;
+    }
+    if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
+      ++debug_frame_depth_stencil_draws_;
+    }
+    if (used_texture_mask) {
+      ++debug_frame_texture_draws_;
+    }
+    if (!memexport_ranges_.empty()) {
+      ++debug_frame_memexport_draws_;
+    }
+  }
   {
     rex::perf::ScopedCounterTimer stage_timer(rex::perf::CounterId::kDrawStageTextureUs);
     texture_cache_->RequestTextures(used_texture_mask);
   }
+  const bool debug_team_profile_bg_draw = texture_cache_->DebugFindTeamProfileBackgroundBinding(
+      used_texture_mask, debug_team_profile_bg_fetch_index, debug_team_profile_bg_signed_view,
+      &debug_team_profile_bg_texture_base, &debug_team_profile_bg_texture_length);
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
@@ -3922,6 +4209,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                   &pipeline_is_placeholder);
     if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
       frame_used_async_placeholder_pipeline_ = true;
+      if (debug_log_frame) {
+        ++debug_frame_placeholder_draws_;
+      }
       return true;
     }
     if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
@@ -3996,6 +4286,35 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
     // Update dynamic graphics pipeline state.
     UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
+  }
+
+  if (debug_team_profile_bg_draw) {
+    int32_t remaining = REXCVAR_GET(vulkan_debug_log_team_profile_background_draws_remaining);
+    if (remaining > 0) {
+      REXCVAR_SET(vulkan_debug_log_team_profile_background_draws_remaining, remaining - 1);
+      render_target_cache_->DebugLogLastUpdateRenderTargetsForTeamProfileBackgroundDraw(
+          frame_current_);
+      const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+      const auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+      REXGPU_WARN(
+          "Team profile BG Vulkan draw trace: frame={}, fetch={}, signed_view={}, "
+          "prim={}, index_count={}, host_vertices={}, used_mask={:08X}, vs={:016X}, "
+          "ps={:016X}, color_mask={:X}, depth={}, stencil={}, edram_mode={}, "
+          "surface_pitch={}, viewport={}x{}+{},{} z={}..{}, scissor={}..{},{}..{}, "
+          "texture_base={:08X}+{:X}",
+          frame_current_, debug_team_profile_bg_fetch_index, debug_team_profile_bg_signed_view,
+          uint32_t(prim_type), index_count, primitive_processing_result.host_draw_vertex_count,
+          used_texture_mask, vertex_shader->ucode_data_hash(),
+          pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0, normalized_color_mask,
+          bool(normalized_depth_control.z_enable), bool(normalized_depth_control.stencil_enable),
+          uint32_t(edram_mode), rb_surface_info.surface_pitch, viewport_info.xy_extent[0],
+          viewport_info.xy_extent[1], viewport_info.xy_offset[0], viewport_info.xy_offset[1],
+          viewport_info.z_min, viewport_info.z_max, pa_sc_window_scissor_tl.tl_x,
+          pa_sc_window_scissor_tl.tl_y, pa_sc_window_scissor_br.br_x,
+          pa_sc_window_scissor_br.br_y, debug_team_profile_bg_texture_base,
+          debug_team_profile_bg_texture_length);
+    }
   }
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
@@ -4527,14 +4846,292 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
-    uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+  ReadbackResolveMode readback_mode =
+      ResolveAutoReadbackMode(GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve)),
+                              kernel_state_);
+  const bool gameplay_state_active = IsGameplayStateActive(kernel_state_);
+  if (readback_mode == ReadbackResolveMode::kDisabled &&
+      (!texture_cache_->IsDrawResolutionScaled() || gameplay_state_active)) {
+    uint32_t written_address = 0;
+    uint32_t written_length = 0;
+    bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                  written_address, written_length);
+    const bool scaled = texture_cache_->IsDrawResolutionScaled();
+    if (ConsumeResolveDecisionLogBudget()) {
+      REXGPU_WARN(
+          "Vulkan resolve diagnostic: frame={}, mode={}, path=resolve-only, result={}, "
+          "address={:08X}, length={:X}, scaled={}",
+          frame_current_, ReadbackResolveModeName(readback_mode), resolved, written_address,
+          written_length, scaled);
+    }
+    if (resolved) {
+      DebugRecordResolve(written_address, written_length, scaled);
+    }
+    return resolved;
   }
 
   return IssueCopy_ReadbackResolvePath();
+}
+
+bool VulkanCommandProcessor::DownscaleScaledResolveToSharedMemory(uint32_t start_unscaled,
+                                                                  uint32_t length_unscaled,
+                                                                  uint32_t pixel_size_log2) {
+  if (!texture_cache_ || !shared_memory_ || !resolve_downscale_pipeline_ ||
+      !resolve_downscale_pipeline_layout_ || !length_unscaled || pixel_size_log2 > 3) {
+    return false;
+  }
+
+  uint32_t pixel_size = uint32_t(1) << pixel_size_log2;
+  uint32_t tile_size_1x = 32 * 32 * pixel_size;
+  uint32_t tile_count = length_unscaled / tile_size_1x;
+  if (!tile_count || tile_count * tile_size_1x != length_unscaled) {
+    return false;
+  }
+
+  if (!texture_cache_->CommitScaledResolveRange(start_unscaled, length_unscaled, 0)) {
+    return false;
+  }
+
+  uint64_t scaled_start = 0;
+  uint64_t scaled_length = 0;
+  if (!texture_cache_->GetScaledResolveRange(start_unscaled, length_unscaled, 0, scaled_start,
+                                             scaled_length) ||
+      !scaled_length || scaled_start > uint64_t(UINT32_MAX)) {
+    return false;
+  }
+
+  VkBuffer scaled_resolve_buffer = texture_cache_->scaled_resolve_buffer();
+  if (scaled_resolve_buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+
+  const bool update_guest_memory = false;
+  const uint32_t downscale_buffer_size = AlignReadbackBufferSize(length_unscaled);
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (downscale_buffer_size > resolve_downscale_buffer_size_) {
+    VkBuffer new_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory new_memory = VK_NULL_HANDLE;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, downscale_buffer_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, new_buffer, new_memory)) {
+      REXGPU_ERROR("Failed to create a {} MB Vulkan resolve downscale buffer",
+                   downscale_buffer_size >> 20);
+      return false;
+    }
+    if (resolve_downscale_buffer_ != VK_NULL_HANDLE ||
+        resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) {
+      if (!AwaitAllQueueOperationsCompletion()) {
+        dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+        dfn.vkFreeMemory(device, new_memory, nullptr);
+        return false;
+      }
+      if (resolve_downscale_buffer_ != VK_NULL_HANDLE) {
+        dfn.vkDestroyBuffer(device, resolve_downscale_buffer_, nullptr);
+      }
+      if (resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) {
+        dfn.vkFreeMemory(device, resolve_downscale_buffer_memory_, nullptr);
+      }
+    }
+    resolve_downscale_buffer_ = new_buffer;
+    resolve_downscale_buffer_memory_ = new_memory;
+    resolve_downscale_buffer_size_ = downscale_buffer_size;
+  }
+  if (resolve_downscale_buffer_ == VK_NULL_HANDLE) {
+    return false;
+  }
+
+  ReadbackBuffer* readback = nullptr;
+  uint32_t readback_write_index = 0;
+  if (update_guest_memory) {
+    auto ensure_readback_slot = [&](ReadbackBuffer& readback_buffer, uint32_t index,
+                                    uint32_t size) -> bool {
+      if (readback_buffer.buffers[index] != VK_NULL_HANDLE &&
+          size <= readback_buffer.sizes[index] && readback_buffer.mapped_data[index] != nullptr) {
+        return true;
+      }
+
+      VkBuffer new_buffer = VK_NULL_HANDLE;
+      VkDeviceMemory new_memory = VK_NULL_HANDLE;
+      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+              vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+              ui::vulkan::util::MemoryPurpose::kReadback, new_buffer, new_memory)) {
+        REXGPU_ERROR("Failed to create a {} MB Vulkan materialized resolve readback buffer",
+                     size >> 20);
+        return false;
+      }
+
+      void* new_mapping = nullptr;
+      if (dfn.vkMapMemory(device, new_memory, 0, VK_WHOLE_SIZE, 0, &new_mapping) != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to map a Vulkan materialized resolve readback buffer");
+        dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+        dfn.vkFreeMemory(device, new_memory, nullptr);
+        return false;
+      }
+
+      if (readback_buffer.buffers[index] != VK_NULL_HANDLE ||
+          readback_buffer.memories[index] != VK_NULL_HANDLE) {
+        if (!AwaitAllQueueOperationsCompletion()) {
+          dfn.vkUnmapMemory(device, new_memory);
+          dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+          dfn.vkFreeMemory(device, new_memory, nullptr);
+          return false;
+        }
+        if (readback_buffer.mapped_data[index] != nullptr &&
+            readback_buffer.memories[index] != VK_NULL_HANDLE) {
+          dfn.vkUnmapMemory(device, readback_buffer.memories[index]);
+        }
+        if (readback_buffer.buffers[index] != VK_NULL_HANDLE) {
+          dfn.vkDestroyBuffer(device, readback_buffer.buffers[index], nullptr);
+        }
+        if (readback_buffer.memories[index] != VK_NULL_HANDLE) {
+          dfn.vkFreeMemory(device, readback_buffer.memories[index], nullptr);
+        }
+      }
+
+      readback_buffer.buffers[index] = new_buffer;
+      readback_buffer.memories[index] = new_memory;
+      readback_buffer.mapped_data[index] = new_mapping;
+      readback_buffer.sizes[index] = size;
+      return true;
+    };
+
+    uint64_t readback_key =
+        MakeReadbackResolveKey(start_unscaled, length_unscaled) ^ UINT64_C(0x8000000000000000);
+    readback = &readback_buffers_[readback_key];
+    readback->last_used_frame = frame_current_;
+    readback_write_index = readback->current_index;
+    if (!ensure_readback_slot(*readback, readback_write_index, downscale_buffer_size)) {
+      readback = nullptr;
+    }
+  }
+
+  VkDescriptorSet descriptor_set = AllocateSingleTransientDescriptor(
+      SingleTransientDescriptorLayout::kStorageBufferPairCompute);
+  if (descriptor_set == VK_NULL_HANDLE) {
+    return false;
+  }
+
+  VkDescriptorBufferInfo buffer_infos[2] = {};
+  buffer_infos[0].buffer = scaled_resolve_buffer;
+  buffer_infos[0].offset = 0;
+  buffer_infos[0].range = VK_WHOLE_SIZE;
+  buffer_infos[1].buffer = resolve_downscale_buffer_;
+  buffer_infos[1].offset = 0;
+  buffer_infos[1].range = length_unscaled;
+
+  VkWriteDescriptorSet descriptor_writes[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    descriptor_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptor_writes[i].dstSet = descriptor_set;
+    descriptor_writes[i].dstBinding = i;
+    descriptor_writes[i].descriptorCount = 1;
+    descriptor_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptor_writes[i].pBufferInfo = &buffer_infos[i];
+  }
+  dfn.vkUpdateDescriptorSets(device, 2, descriptor_writes, 0, nullptr);
+
+  texture_cache_->UseScaledResolveBufferForRead();
+  SubmitBarriers(true);
+
+  uint32_t resolve_downscale_timestamp_start =
+      BeginGpuTimestampedRegion(rex::perf::DrawBucket::kResolveDownscale);
+
+  VkBufferMemoryBarrier pre_barrier = {};
+  pre_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  pre_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  pre_barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  pre_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  pre_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  pre_barrier.buffer = resolve_downscale_buffer_;
+  pre_barrier.offset = 0;
+  pre_barrier.size = length_unscaled;
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &pre_barrier, 0, nullptr);
+
+  BindExternalComputePipeline(resolve_downscale_pipeline_);
+
+  ResolveDownscaleConstants constants;
+  constants.scale_x = texture_cache_->draw_resolution_scale_x();
+  constants.scale_y = texture_cache_->draw_resolution_scale_y();
+  constants.pixel_size_log2 = pixel_size_log2;
+  constants.tile_count = tile_count;
+  constants.source_offset_bytes = uint32_t(scaled_start);
+  constants.half_pixel_offset =
+      (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
+       (constants.scale_x > 1 || constants.scale_y > 1))
+          ? 1u
+          : 0u;
+  deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
+                                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                                              &constants);
+  deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                   resolve_downscale_pipeline_layout_, 0, 1,
+                                                   &descriptor_set, 0, nullptr);
+  deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
+
+  VkBufferMemoryBarrier downscale_barrier = {};
+  downscale_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  downscale_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  downscale_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  downscale_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  downscale_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  downscale_barrier.buffer = resolve_downscale_buffer_;
+  downscale_barrier.offset = 0;
+  downscale_barrier.size = length_unscaled;
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
+                                                &downscale_barrier, 0, nullptr);
+
+  shared_memory_->Use(VulkanSharedMemory::Usage::kTransferDestination,
+                      std::make_pair(start_unscaled, length_unscaled));
+  SubmitBarriers(true);
+
+  VkBufferCopy shared_memory_copy = {};
+  shared_memory_copy.srcOffset = 0;
+  shared_memory_copy.dstOffset = start_unscaled;
+  shared_memory_copy.size = length_unscaled;
+  deferred_command_buffer_.CmdVkCopyBuffer(resolve_downscale_buffer_, shared_memory_->buffer(), 1,
+                                           &shared_memory_copy);
+
+  if (readback != nullptr && readback->buffers[readback_write_index] != VK_NULL_HANDLE) {
+    VkBufferCopy readback_copy = {};
+    readback_copy.srcOffset = 0;
+    readback_copy.dstOffset = 0;
+    readback_copy.size = length_unscaled;
+    deferred_command_buffer_.CmdVkCopyBuffer(resolve_downscale_buffer_,
+                                             readback->buffers[readback_write_index], 1,
+                                             &readback_copy);
+    PushBufferMemoryBarrier(readback->buffers[readback_write_index], 0, length_unscaled,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  }
+
+  EndGpuTimestampedDraw(resolve_downscale_timestamp_start);
+  if (readback != nullptr && readback->buffers[readback_write_index] != VK_NULL_HANDLE &&
+      readback->mapped_data[readback_write_index] != nullptr) {
+    if (!AwaitAllQueueOperationsCompletion()) {
+      return false;
+    }
+    VkMappedMemoryRange readback_memory_range = {};
+    readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    readback_memory_range.memory = readback->memories[readback_write_index];
+    readback_memory_range.offset = 0;
+    readback_memory_range.size = VK_WHOLE_SIZE;
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
+
+    if (uint8_t* destination = memory_->TranslatePhysical(start_unscaled)) {
+      std::memcpy(destination, readback->mapped_data[readback_write_index], length_unscaled);
+    }
+    readback->current_index = 1 - readback->current_index;
+  } else if (!AwaitAllQueueOperationsCompletion()) {
+    return false;
+  }
+  shared_memory_->RangeWrittenByGpu(start_unscaled, length_unscaled);
+  return true;
 }
 
 bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -4545,20 +5142,91 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
                                      written_length)) {
+    if (ConsumeResolveDecisionLogBudget()) {
+      REXGPU_WARN("Vulkan resolve diagnostic: frame={}, mode=readback, path=readback, result=false",
+                  frame_current_);
+    }
     return false;
   }
+  bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+  DebugRecordResolve(written_address, written_length, is_scaled);
+
+  auto log_readback_decision = [&](const char* decision, ReadbackResolveMode mode,
+                                   bool cache_miss = false, bool should_copy = false,
+                                   uint32_t extra = 0) {
+    if (!ConsumeResolveDecisionLogBudget()) {
+      return;
+    }
+    REXGPU_WARN(
+        "Vulkan resolve diagnostic: frame={}, mode={}, path=readback, decision={}, "
+        "address={:08X}, length={:X}, scaled={}, cache_miss={}, should_copy={}, extra={:X}",
+        frame_current_, ReadbackResolveModeName(mode), decision, written_address, written_length,
+        is_scaled, cache_miss, should_copy, extra);
+  };
 
   if (!written_length) {
+    log_readback_decision("empty-range", ReadbackResolveMode::kDisabled);
     return true;
   }
 
   if (!memory_->TranslatePhysical(written_address)) {
+    log_readback_decision("unmapped-destination", ReadbackResolveMode::kDisabled);
     return true;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  ReadbackResolveMode readback_mode =
+      ResolveAutoReadbackMode(GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve)),
+                              kernel_state_);
+  bool force_scaled_resolve_sync_only = false;
+  bool force_scaled_resolve_cpu_copy = false;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
+    constexpr uint32_t kImportSkaterPreviewResolveAddress = UINT32_C(0x04911000);
+    constexpr uint32_t kImportSkaterPreviewResolveLength = UINT32_C(0x2D0000);
+    force_scaled_resolve_cpu_copy =
+        !IsGameplayStateActive(kernel_state_) && is_scaled &&
+        written_address == kImportSkaterPreviewResolveAddress &&
+        written_length == kImportSkaterPreviewResolveLength;
+    if (!force_scaled_resolve_cpu_copy) {
+      log_readback_decision("disabled-after-resolve", readback_mode);
+      return true;
+    }
+    readback_mode = ReadbackResolveMode::kFull;
+    force_scaled_resolve_sync_only = true;
+    log_readback_decision("targeted-scaled-resolve-full", readback_mode, false, true,
+                          kImportSkaterPreviewResolveLength);
+  }
+
+  const int32_t max_readback_length = REXCVAR_GET(vulkan_readback_resolve_max_length);
+  if (max_readback_length > 0 && written_length > uint32_t(max_readback_length)) {
+    log_readback_decision("length-filter", readback_mode, false, false,
+                          uint32_t(max_readback_length));
+    if (REXCVAR_GET(vulkan_debug_log_frame_summaries_remaining) > 0) {
+      REXGPU_WARN(
+          "Vulkan resolve readback skipped by length filter: address={:08X}, length={:X}, "
+          "max={:X}",
+          written_address, written_length, uint32_t(max_readback_length));
+    }
     return true;
+  }
+
+  const int32_t max_readback_address = REXCVAR_GET(vulkan_readback_resolve_max_address);
+  if (max_readback_address > 0) {
+    const uint32_t min_readback_address =
+        uint32_t(std::max(0, REXCVAR_GET(vulkan_readback_resolve_min_address)));
+    const uint64_t readback_end = uint64_t(written_address) + written_length;
+    if (written_address < min_readback_address ||
+        readback_end > uint32_t(max_readback_address)) {
+      log_readback_decision("address-filter", readback_mode, false, false,
+                            uint32_t(max_readback_address));
+      if (REXCVAR_GET(vulkan_debug_log_frame_summaries_remaining) > 0) {
+        REXGPU_WARN(
+            "Vulkan resolve readback skipped by address filter: address={:08X}, length={:X}, "
+            "window={:08X}-{:08X}",
+            written_address, written_length, min_readback_address,
+            uint32_t(max_readback_address));
+      }
+      return true;
+    }
   }
 
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
@@ -4609,7 +5277,6 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   };
 
-  bool is_scaled = texture_cache_->IsDrawResolutionScaled();
   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
   readback.last_used_frame = frame_current_;
@@ -4810,7 +5477,11 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
   }
 
-  bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
+  bool should_copy =
+      (!force_scaled_resolve_sync_only || force_scaled_resolve_cpu_copy) &&
+      ((readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true);
+  log_readback_decision(should_copy ? "copy-guest-memory" : "cache-hit-skip", readback_mode,
+                        is_cache_miss, should_copy, uint32_t(resolve_key));
   if (should_copy && readback.buffers[read_index] != VK_NULL_HANDLE &&
       written_length <= readback.sizes[read_index] && readback.mapped_data[read_index] != nullptr) {
     VkMappedMemoryRange readback_memory_range = {};
@@ -4823,6 +5494,11 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
       std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      if (readback_mode == ReadbackResolveMode::kFull) {
+        texture_cache_->DebugRecordResolveReadback(written_address, written_length, is_scaled);
+        DebugDumpResolveReadback(written_address, written_length, is_scaled,
+                                 readback.mapped_data[read_index]);
+      }
     }
   }
 
@@ -5594,6 +6270,23 @@ bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
   return !submission_open_ || (!scratch_buffer_used_ && !pipeline_cache_->IsCreatingPipelines());
 }
 
+void VulkanCommandProcessor::DebugRecordResolve(uint32_t address, uint32_t length, bool scaled) {
+  if (REXCVAR_GET(vulkan_debug_log_frame_summaries_remaining) <= 0 || !length) {
+    return;
+  }
+  const uint32_t sample_index = debug_frame_resolve_ranges_;
+  if (sample_index < kDebugFrameResolveRangeSamples) {
+    debug_frame_resolve_addresses_[sample_index] = address;
+    debug_frame_resolve_lengths_[sample_index] = length;
+    debug_frame_resolve_scaled_[sample_index] = scaled;
+  }
+  ++debug_frame_resolve_ranges_;
+  if (scaled) {
+    ++debug_frame_scaled_resolve_ranges_;
+  }
+  debug_frame_resolve_bytes_ += length;
+}
+
 bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -5680,6 +6373,21 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
+    debug_frame_draws_ = 0;
+    debug_frame_copy_resolves_ = 0;
+    debug_frame_raster_draws_ = 0;
+    debug_frame_color_draws_ = 0;
+    debug_frame_depth_stencil_draws_ = 0;
+    debug_frame_texture_draws_ = 0;
+    debug_frame_placeholder_draws_ = 0;
+    debug_frame_no_effect_draws_ = 0;
+    debug_frame_memexport_draws_ = 0;
+    debug_frame_resolve_ranges_ = 0;
+    debug_frame_scaled_resolve_ranges_ = 0;
+    debug_frame_resolve_bytes_ = 0;
+    debug_frame_resolve_addresses_.fill(0);
+    debug_frame_resolve_lengths_.fill(0);
+    debug_frame_resolve_scaled_.fill(false);
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));

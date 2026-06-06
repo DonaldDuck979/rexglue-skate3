@@ -1336,10 +1336,40 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
   }
 }
 
+void VulkanRenderTargetCache::DebugLogLastUpdateRenderTargetsForTeamProfileBackgroundDraw(
+    uint64_t frame) const {
+  REXGPU_WARN(
+      "Team profile BG Vulkan RT trace: frame={}, path={}, render_pass_key={:08X}, "
+      "pitch_tiles_32bpp={}, framebuffer={}x{}",
+      frame, uint32_t(GetPath()), last_update_render_pass_key_.key,
+      last_update_framebuffer_pitch_tiles_at_32bpp_,
+      last_update_framebuffer_ ? last_update_framebuffer_->host_extent.width : 0,
+      last_update_framebuffer_ ? last_update_framebuffer_->host_extent.height : 0);
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    const RenderTarget* rt =
+        reinterpret_cast<const RenderTarget*>(last_update_framebuffer_attachments_[i]);
+    if (rt == nullptr) {
+      continue;
+    }
+    const RenderTargetKey key = rt->key();
+    const VulkanRenderTarget* vulkan_rt = static_cast<const VulkanRenderTarget*>(rt);
+    REXGPU_WARN(
+        "Team profile BG Vulkan RT attachment: slot={}, kind={}, base_tiles={}, pitch_tiles={}, "
+        "pitch_tiles_32bpp={}, width={}, format={}, msaa={}, image={:016X}, stage={:X}, "
+        "access={:X}, layout={}",
+        i, key.is_depth ? "depth" : "color", key.base_tiles, key.GetPitchTiles(),
+        key.pitch_tiles_at_32bpp, key.GetWidth(), key.GetFormatName(), uint32_t(key.msaa_samples),
+        uint64_t(uintptr_t(vulkan_rt->image())), uint32_t(vulkan_rt->current_stage_mask()),
+        uint32_t(vulkan_rt->current_access_mask()), uint32_t(vulkan_rt->current_layout()));
+  }
+}
+
 bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                       VulkanSharedMemory& shared_memory,
                                       VulkanTextureCache& texture_cache,
-                                      uint32_t& written_address_out, uint32_t& written_length_out) {
+                                      uint32_t& written_address_out,
+                                      uint32_t& written_length_out,
+                                      bool debug_log_team_profile_background_trace) {
   written_address_out = 0;
   written_length_out = 0;
 
@@ -1422,6 +1452,21 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         }
       }
 
+      if (debug_log_team_profile_background_trace) {
+        REXGPU_WARN(
+            "Team profile BG Vulkan resolve trace: scaled={}, copy_shader={}, dest_base={:08X}, "
+            "dest_extent={:08X}+{:X}, dest_range_unscaled={:X}, buffer_offset={:X}, "
+            "buffer_range={:X}, use_range={:X}+{:X}, groups={}x{}, dest_bpe_log2={}",
+            draw_resolution_scaled, uint32_t(copy_shader), resolve_info.copy_dest_base,
+            resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+            copy_dest_range_unscaled, copy_dest_base, copy_dest_range_length,
+            copy_dest_use_start, copy_dest_use_length, copy_group_count_x, copy_group_count_y,
+            copy_shader_info.dest_bpe_log2);
+        texture_cache.DebugRecordTeamProfileBackgroundResolveRange(
+            resolve_info.copy_dest_base, copy_dest_range_unscaled, draw_resolution_scaled,
+            copy_dest_base, copy_dest_range_length);
+      }
+
       // Make sure there is memory to write to.
       bool copy_dest_committed;
       if (draw_resolution_scaled) {
@@ -1465,7 +1510,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
           // Submit the resolve.
           if (draw_resolution_scaled) {
-            texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start, copy_dest_use_length);
+            texture_cache.UseScaledResolveBufferForWrite(copy_dest_base, copy_dest_range_length);
           } else {
             shared_memory.Use(VulkanSharedMemory::Usage::kComputeWrite,
                               std::pair<uint32_t, uint32_t>(uint32_t(copy_dest_use_start),

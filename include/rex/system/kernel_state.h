@@ -290,6 +290,9 @@ class KernelState {
   void UnregisterNotifyListener(XNotifyListener* listener);
   void BroadcastNotification(XNotificationID id, uint32_t data);
 
+  void SetUserContext(uint32_t user_index, uint32_t context_id, uint32_t value);
+  std::optional<uint32_t> GetUserContext(uint32_t user_index, uint32_t context_id) const;
+
   util::NativeList* dpc_list() { return &dpc_list_; }
 
   void CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result);
@@ -345,6 +348,9 @@ class KernelState {
   std::unordered_map<uint32_t, XThread*> threads_by_id_;
   std::vector<object_ref<XNotifyListener>> notify_listeners_;
   bool has_notified_startup_ = false;
+
+  mutable std::mutex user_contexts_mutex_;
+  std::unordered_map<uint64_t, uint32_t> user_contexts_;
 
   // Protected by global_critical_region_.
   std::unordered_map<uint32_t, FiberInfo> fiber_map_;

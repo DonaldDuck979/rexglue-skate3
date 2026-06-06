@@ -24,9 +24,6 @@
 #include <rex/math.h>
 #include <rex/string.h>
 
-REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
-                    "Scale texture offsets with draw resolution");
-
 namespace rex::graphics {
 using namespace ucode;
 

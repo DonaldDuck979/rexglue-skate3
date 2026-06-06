@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <string_view>
 #include <utility>
 
 #include <rex/assert.h>
@@ -128,6 +129,8 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+constexpr uint64_t kDebugTeamProfileBackgroundHash = UINT64_C(0x2C31D77D35F4EC6F);
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -464,6 +467,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
   texture.LogAction("Loaded");
+  DebugLogTeamProfileBackgroundTextureCandidate("loaded", UINT32_MAX, texture);
 
   return true;
 }
@@ -490,6 +494,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 
   uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
   if (!textures_remaining) {
+    DebugLogScaledTextureBindings(used_texture_mask);
     return;
   }
 
@@ -633,6 +638,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 
   if (batched_shared_memory_request_succeeded) {
     for (size_t i = 0; i < pending_texture_load_count; ++i) {
+      if (pending_texture_loads[i].texture != nullptr) {
+        DebugLogTeamProfileBackgroundTextureCandidate("commit-load", UINT32_MAX,
+                                                      *pending_texture_loads[i].texture);
+      }
       CommitPreparedTextureLoad(pending_texture_loads[i]);
     }
   } else {
@@ -652,6 +661,390 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     PERF_counter_add(kTextureBindingsChanged, changed_binding_count);
 #endif
     UpdateTextureBindingsImpl(bindings_changed);
+  }
+  DebugLogScaledTextureBindings(used_texture_mask);
+}
+
+void TextureCache::DebugRecordResolveReadback(uint32_t start, uint32_t length, bool scaled) {
+  if (!length) {
+    return;
+  }
+
+  DebugResolveReadbackRange& range =
+      debug_recent_resolve_readbacks_[debug_recent_resolve_readback_next_];
+  range.start = start;
+  range.length = length;
+  range.serial = ++debug_resolve_readback_serial_;
+  range.scaled = scaled;
+  debug_recent_resolve_readback_next_ =
+      (debug_recent_resolve_readback_next_ + 1) % debug_recent_resolve_readbacks_.size();
+  debug_recent_resolve_readback_count_ =
+      std::min<uint32_t>(debug_recent_resolve_readback_count_ + 1,
+                         uint32_t(debug_recent_resolve_readbacks_.size()));
+
+  int32_t remaining = REXCVAR_GET(vulkan_debug_log_frame_summaries_remaining);
+  int32_t interval = std::max(1, REXCVAR_GET(vulkan_debug_frame_summary_interval_frames));
+  bool log_this_sample = remaining == 36000 || remaining == 3600 || (remaining % interval) == 0;
+  if (remaining > 0 && log_this_sample) {
+    REXGPU_WARN("Vulkan debug resolve readback full copy: serial={}, scaled={}, range={:08X}+{:X}",
+                range.serial, scaled, start, length);
+  }
+}
+
+void TextureCache::DebugClearRecentResolveReadbacks() {
+  for (DebugResolveReadbackRange& range : debug_recent_resolve_readbacks_) {
+    range = {};
+  }
+  debug_recent_resolve_readback_next_ = 0;
+  debug_recent_resolve_readback_count_ = 0;
+}
+
+void TextureCache::DebugRecordTeamProfileBackgroundResolveRange(uint32_t start, uint32_t length,
+                                                                bool scaled,
+                                                                uint64_t scaled_start,
+                                                                uint64_t scaled_length) {
+  if (!length) {
+    return;
+  }
+
+  DebugTeamProfileResolveRange& range =
+      debug_recent_team_profile_resolves_[debug_recent_team_profile_resolve_next_];
+  range.start = start;
+  range.length = length;
+  range.serial = ++debug_team_profile_resolve_serial_;
+  range.scaled = scaled;
+  range.scaled_start = scaled_start;
+  range.scaled_length = scaled_length;
+  debug_recent_team_profile_resolve_next_ =
+      (debug_recent_team_profile_resolve_next_ + 1) %
+      debug_recent_team_profile_resolves_.size();
+  debug_recent_team_profile_resolve_count_ =
+      std::min<uint32_t>(debug_recent_team_profile_resolve_count_ + 1,
+                         uint32_t(debug_recent_team_profile_resolves_.size()));
+  if (!debug_team_profile_resolve_texture_logs_remaining_) {
+    debug_team_profile_resolve_texture_logs_remaining_ = 32;
+  }
+
+  REXGPU_WARN(
+      "Team profile BG resolve range recorded: serial={}, scaled={}, range={:08X}+{:X}, "
+      "scaled_range={:X}+{:X}",
+      range.serial, scaled, start, length, scaled_start, scaled_length);
+}
+
+bool TextureCache::DebugIsTeamProfileBackgroundCandidateKey(const TextureKey& key) {
+  return key.dimension == xenos::DataDimension::k2DOrStacked && key.GetWidth() == 128 &&
+         key.GetHeight() == 256 && key.GetDepthOrArraySize() == 1 &&
+         key.format == xenos::TextureFormat::k_DXT4_5;
+}
+
+bool TextureCache::DebugIsTeamProfileBackgroundTexture(const Texture& texture) const {
+  const TextureKey& key = texture.key();
+  if (!DebugIsTeamProfileBackgroundCandidateKey(key) || key.scaled_resolve) {
+    return false;
+  }
+  const uint8_t* data = shared_memory().DebugTranslatePhysical(key.base_page << 12);
+  const uint32_t sample_length = std::min<uint32_t>(texture.GetGuestBaseSize(), UINT32_C(0x8000));
+  if (data == nullptr || sample_length == 0) {
+    return false;
+  }
+  uint64_t fnv1a = UINT64_C(14695981039346656037);
+  for (uint32_t i = 0; i < sample_length; ++i) {
+    fnv1a ^= data[i];
+    fnv1a *= UINT64_C(1099511628211);
+  }
+  return fnv1a == kDebugTeamProfileBackgroundHash;
+}
+
+bool TextureCache::DebugFindTeamProfileBackgroundBinding(uint32_t used_texture_mask,
+                                                         uint32_t& fetch_index_out,
+                                                         bool& signed_view_out,
+                                                         uint32_t* texture_base_out,
+                                                         uint32_t* texture_length_out) const {
+  uint32_t textures_remaining = used_texture_mask;
+  uint32_t index = 0;
+  while (rex::bit_scan_forward(textures_remaining, &index)) {
+    textures_remaining &= ~(UINT32_C(1) << index);
+    const TextureBinding* binding = GetValidTextureBinding(index);
+    if (binding == nullptr) {
+      continue;
+    }
+    if (binding->texture != nullptr && DebugIsTeamProfileBackgroundTexture(*binding->texture)) {
+      fetch_index_out = index;
+      signed_view_out = false;
+      if (texture_base_out != nullptr) {
+        *texture_base_out = binding->texture->key().base_page << 12;
+      }
+      if (texture_length_out != nullptr) {
+        *texture_length_out = binding->texture->GetGuestBaseSize();
+      }
+      return true;
+    }
+    if (binding->texture_signed != nullptr &&
+        DebugIsTeamProfileBackgroundTexture(*binding->texture_signed)) {
+      fetch_index_out = index;
+      signed_view_out = true;
+      if (texture_base_out != nullptr) {
+        *texture_base_out = binding->texture_signed->key().base_page << 12;
+      }
+      if (texture_length_out != nullptr) {
+        *texture_length_out = binding->texture_signed->GetGuestBaseSize();
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+void TextureCache::DebugLogTeamProfileBackgroundTextureCandidate(const char* action,
+                                                                 uint32_t fetch_index,
+                                                                 const Texture& texture) {
+  const TextureKey& key = texture.key();
+  if (!DebugIsTeamProfileBackgroundCandidateKey(key)) {
+    return;
+  }
+  const bool is_bind_action = std::string_view(action).starts_with("bind");
+  const int32_t remaining = is_bind_action
+                                ? REXCVAR_GET(
+                                      vulkan_debug_log_team_profile_background_bindings_remaining)
+                                : REXCVAR_GET(
+                                      vulkan_debug_log_team_profile_background_candidates_remaining);
+  if (remaining <= 0) {
+    return;
+  }
+  if (is_bind_action) {
+    REXCVAR_SET(vulkan_debug_log_team_profile_background_bindings_remaining, remaining - 1);
+  } else {
+    REXCVAR_SET(vulkan_debug_log_team_profile_background_candidates_remaining, remaining - 1);
+  }
+
+  uint32_t sample_length = 0;
+  uint32_t nonzero_count = 0;
+  uint64_t fnv1a = UINT64_C(14695981039346656037);
+  uint8_t head[8] = {};
+  if (!is_bind_action) {
+    const uint8_t* data = shared_memory().DebugTranslatePhysical(key.base_page << 12);
+    sample_length = std::min<uint32_t>(texture.GetGuestBaseSize(), UINT32_C(0x8000));
+    if (data != nullptr && sample_length != 0) {
+      for (uint32_t i = 0; i < sample_length; ++i) {
+        uint8_t value = data[i];
+        nonzero_count += value != 0;
+        fnv1a ^= value;
+        fnv1a *= UINT64_C(1099511628211);
+      }
+      std::memcpy(head, data, std::min<size_t>(sizeof(head), sample_length));
+    }
+  }
+
+  REXGPU_WARN(
+      "Team profile BG texture candidate: action={}, fetch={}, scaled={}, {} {}x{}x{} {}, "
+      "base={:08X}+{:X}, mips={:08X}+{:X}, pitch={}, mip_max={}, packed_mips={}, "
+      "sample_len={:X}, nonzero={}, hash={:016X}, head={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+      action, fetch_index, bool(key.scaled_resolve), key.tiled ? "tiled" : "linear",
+      key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
+      FormatInfo::Get(key.format)->name, key.base_page << 12, texture.GetGuestBaseSize(),
+      key.mip_page << 12, texture.GetGuestMipsSize(), key.pitch << 5, key.mip_max_level,
+      bool(key.packed_mips), sample_length, nonzero_count, fnv1a, head[0], head[1], head[2],
+      head[3], head[4], head[5], head[6], head[7]);
+}
+
+bool TextureCache::DebugTextureOverlapsRecentResolveReadback(
+    const Texture& texture, bool mips, uint32_t& readback_serial_out,
+    bool& readback_scaled_out) const {
+  const TextureKey& key = texture.key();
+  uint32_t texture_start = (mips ? key.mip_page : key.base_page) << 12;
+  uint32_t texture_length = mips ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+  if (!texture_length) {
+    return false;
+  }
+  uint64_t texture_end = uint64_t(texture_start) + texture_length;
+  for (uint32_t i = 0; i < debug_recent_resolve_readback_count_; ++i) {
+    const DebugResolveReadbackRange& readback = debug_recent_resolve_readbacks_[i];
+    if (!readback.length) {
+      continue;
+    }
+    uint64_t readback_end = uint64_t(readback.start) + readback.length;
+    if (uint64_t(texture_start) < readback_end && uint64_t(readback.start) < texture_end) {
+      readback_serial_out = readback.serial;
+      readback_scaled_out = readback.scaled;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool TextureCache::DebugRangeOverlapsRecentScaledResolveReadback(uint32_t start,
+                                                                 uint32_t length) const {
+  if (!length) {
+    return false;
+  }
+  uint64_t end = uint64_t(start) + length;
+  for (uint32_t i = 0; i < debug_recent_resolve_readback_count_; ++i) {
+    const DebugResolveReadbackRange& readback = debug_recent_resolve_readbacks_[i];
+    if (!readback.length || !readback.scaled) {
+      continue;
+    }
+    uint64_t readback_end = uint64_t(readback.start) + readback.length;
+    if (uint64_t(start) < readback_end && uint64_t(readback.start) < end) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool TextureCache::DebugTextureOverlapsRecentTeamProfileBackgroundResolve(
+    const Texture& texture, bool mips, uint32_t& resolve_serial_out, bool& resolve_scaled_out,
+    uint64_t& resolve_scaled_start_out, uint64_t& resolve_scaled_length_out) const {
+  const TextureKey& key = texture.key();
+  uint32_t texture_start = (mips ? key.mip_page : key.base_page) << 12;
+  uint32_t texture_length = mips ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+  if (!texture_length) {
+    return false;
+  }
+  uint64_t texture_end = uint64_t(texture_start) + texture_length;
+  bool found = false;
+  for (uint32_t i = 0; i < debug_recent_team_profile_resolve_count_; ++i) {
+    const DebugTeamProfileResolveRange& resolve = debug_recent_team_profile_resolves_[i];
+    if (!resolve.length) {
+      continue;
+    }
+    uint64_t resolve_end = uint64_t(resolve.start) + resolve.length;
+    if (uint64_t(texture_start) < resolve_end && uint64_t(resolve.start) < texture_end) {
+      if (found && resolve.serial <= resolve_serial_out) {
+        continue;
+      }
+      resolve_serial_out = resolve.serial;
+      resolve_scaled_out = resolve.scaled;
+      resolve_scaled_start_out = resolve.scaled_start;
+      resolve_scaled_length_out = resolve.scaled_length;
+      found = true;
+    }
+  }
+  return found;
+}
+
+void TextureCache::DebugLogScaledTextureBindings(uint32_t used_texture_mask) {
+  if (used_texture_mask == 0) {
+    return;
+  }
+
+  if (REXCVAR_GET(vulkan_debug_log_team_profile_background_candidates_remaining) > 0 ||
+      REXCVAR_GET(vulkan_debug_log_team_profile_background_bindings_remaining) > 0) {
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t index = 0;
+    while (rex::bit_scan_forward(textures_remaining, &index)) {
+      textures_remaining &= ~(UINT32_C(1) << index);
+      const TextureBinding* binding = GetValidTextureBinding(index);
+      if (binding == nullptr) {
+        continue;
+      }
+      if (binding->texture) {
+        DebugLogTeamProfileBackgroundTextureCandidate("bind", index, *binding->texture);
+      }
+      if (binding->texture_signed) {
+        DebugLogTeamProfileBackgroundTextureCandidate("bind-signed", index,
+                                                      *binding->texture_signed);
+      }
+    }
+  }
+
+  int32_t remaining = REXCVAR_GET(vulkan_debug_log_frame_summaries_remaining);
+  bool log_team_profile_overlaps = debug_team_profile_resolve_texture_logs_remaining_ != 0;
+  if (remaining <= 0 && !log_team_profile_overlaps) {
+    return;
+  }
+
+  int32_t interval = std::max(1, REXCVAR_GET(vulkan_debug_frame_summary_interval_frames));
+  bool log_this_sample = remaining == 36000 || remaining == 3600 || (remaining % interval) == 0;
+  if (remaining <= 0) {
+    log_this_sample = false;
+  }
+  if (!log_this_sample && !log_team_profile_overlaps) {
+    return;
+  }
+
+  if (remaining != debug_scaled_texture_bindings_remaining_seen_) {
+    debug_scaled_texture_bindings_remaining_seen_ = remaining;
+    debug_scaled_texture_binding_logs_this_sample_ = 0;
+  }
+  constexpr uint32_t kMaxScaledTextureBindingLogsPerSample = 64;
+  if (debug_scaled_texture_binding_logs_this_sample_ >= kMaxScaledTextureBindingLogsPerSample) {
+    return;
+  }
+
+  auto log_texture = [&](uint32_t fetch_index, const char* view_name, const Texture* texture) {
+    if (texture == nullptr ||
+        debug_scaled_texture_binding_logs_this_sample_ >= kMaxScaledTextureBindingLogsPerSample ||
+        (!log_this_sample && debug_team_profile_resolve_texture_logs_remaining_ == 0)) {
+      return;
+    }
+    const TextureKey& key = texture->key();
+    uint32_t base_readback_serial = 0;
+    uint32_t mips_readback_serial = 0;
+    bool base_readback_scaled = false;
+    bool mips_readback_scaled = false;
+    bool overlaps_base_readback = DebugTextureOverlapsRecentResolveReadback(
+        *texture, false, base_readback_serial, base_readback_scaled);
+    bool overlaps_mips_readback = DebugTextureOverlapsRecentResolveReadback(
+        *texture, true, mips_readback_serial, mips_readback_scaled);
+    uint32_t base_team_profile_serial = 0;
+    uint32_t mips_team_profile_serial = 0;
+    bool base_team_profile_scaled = false;
+    bool mips_team_profile_scaled = false;
+    uint64_t base_team_profile_scaled_start = 0;
+    uint64_t base_team_profile_scaled_length = 0;
+    uint64_t mips_team_profile_scaled_start = 0;
+    uint64_t mips_team_profile_scaled_length = 0;
+    bool overlaps_base_team_profile = DebugTextureOverlapsRecentTeamProfileBackgroundResolve(
+        *texture, false, base_team_profile_serial, base_team_profile_scaled,
+        base_team_profile_scaled_start, base_team_profile_scaled_length);
+    bool overlaps_mips_team_profile = DebugTextureOverlapsRecentTeamProfileBackgroundResolve(
+        *texture, true, mips_team_profile_serial, mips_team_profile_scaled,
+        mips_team_profile_scaled_start, mips_team_profile_scaled_length);
+    if (!key.scaled_resolve && !overlaps_base_readback && !overlaps_mips_readback &&
+        !overlaps_base_team_profile && !overlaps_mips_team_profile) {
+      return;
+    }
+    if (!log_this_sample && !(overlaps_base_team_profile || overlaps_mips_team_profile)) {
+      return;
+    }
+    ++debug_scaled_texture_binding_logs_this_sample_;
+    if (overlaps_base_team_profile || overlaps_mips_team_profile) {
+      --debug_team_profile_resolve_texture_logs_remaining_;
+    }
+    REXGPU_WARN(
+        "Vulkan debug texture binding: remaining={}, fetch={}, view={}, scaled={}, {} {}x{}x{} "
+        "{}, base={:08X}+{:X}, mips={:08X}+{:X}, pitch={}, host={}x{}, readback_base=#{} {}, "
+        "readback_mips=#{} {}, team_profile_base=#{} {} {:X}+{:X}, "
+        "team_profile_mips=#{} {} {:X}+{:X}",
+        remaining, fetch_index, view_name, bool(key.scaled_resolve),
+        key.tiled ? "tiled" : "linear", key.GetWidth(), key.GetHeight(),
+        key.GetDepthOrArraySize(), FormatInfo::Get(key.format)->name,
+        key.base_page << 12, texture->GetGuestBaseSize(), key.mip_page << 12,
+        texture->GetGuestMipsSize(), key.pitch << 5,
+        key.GetWidth() * (key.scaled_resolve ? draw_resolution_scale_x_ : 1),
+        key.GetHeight() * (key.scaled_resolve ? draw_resolution_scale_y_ : 1),
+        base_readback_serial, overlaps_base_readback ? (base_readback_scaled ? "scaled" : "1x")
+                                                     : "none",
+        mips_readback_serial, overlaps_mips_readback ? (mips_readback_scaled ? "scaled" : "1x")
+                                                     : "none",
+        base_team_profile_serial,
+        overlaps_base_team_profile ? (base_team_profile_scaled ? "scaled" : "1x") : "none",
+        base_team_profile_scaled_start, base_team_profile_scaled_length,
+        mips_team_profile_serial,
+        overlaps_mips_team_profile ? (mips_team_profile_scaled ? "scaled" : "1x") : "none",
+        mips_team_profile_scaled_start, mips_team_profile_scaled_length);
+  };
+
+  uint32_t textures_remaining = used_texture_mask;
+  uint32_t index = 0;
+  while (rex::bit_scan_forward(textures_remaining, &index)) {
+    textures_remaining &= ~(UINT32_C(1) << index);
+    const TextureBinding* binding = GetValidTextureBinding(index);
+    if (binding == nullptr) {
+      continue;
+    }
+    log_texture(index, "unsigned", binding->texture);
+    log_texture(index, "signed", binding->texture_signed);
   }
 }
 
@@ -795,7 +1188,12 @@ void TextureCache::Texture::MarkAsUsed() {
 }
 
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+    bool invalidated_by_gpu) {
+  texture_cache().DebugLogTeamProfileBackgroundTextureCandidate(
+      invalidated_by_gpu ? (is_mip ? "invalidate-gpu-mips" : "invalidate-gpu-base")
+                         : (is_mip ? "invalidate-cpu-mips" : "invalidate-cpu-base"),
+      UINT32_MAX, *this);
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -813,7 +1211,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
-  texture.WatchCallback(global_lock, argument != 0);
+  texture.WatchCallback(global_lock, argument != 0, invalidated_by_gpu);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
 }
 
@@ -923,6 +1321,8 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // previously 0, now not 0, to save memory - common case in streaming.
   auto found_texture_it = textures_.find(key);
   if (found_texture_it != textures_.end()) {
+    DebugLogTeamProfileBackgroundTextureCandidate("reuse", UINT32_MAX,
+                                                  *found_texture_it->second);
     return found_texture_it->second.get();
   }
 
@@ -939,6 +1339,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
+  DebugLogTeamProfileBackgroundTextureCandidate("create", UINT32_MAX, *texture);
   return texture;
 }
 
@@ -958,6 +1359,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     return false;
   }
 
+  DebugLogTeamProfileBackgroundTextureCandidate("load", UINT32_MAX, texture);
   return CommitPreparedTextureLoad(pending_load);
 }
 
@@ -1123,6 +1525,37 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
     }
   }
   return false;
+}
+
+bool TextureCache::IsRangeFullyScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+  if (!IsDrawResolutionScaled()) {
+    return false;
+  }
+
+  start_unscaled = std::min(start_unscaled, SharedMemory::kBufferSize);
+  length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
+  if (!length_unscaled) {
+    return false;
+  }
+
+  uint32_t page_first = start_unscaled >> 12;
+  uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
+  uint32_t block_first = page_first >> 5;
+  uint32_t block_last = page_last >> 5;
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t block_index = block_first; block_index <= block_last; ++block_index) {
+    uint32_t check_bits = UINT32_MAX;
+    if (block_index == block_first) {
+      check_bits &= ~((UINT32_C(1) << (page_first & 31)) - 1);
+    }
+    if (block_index == block_last && (page_last & 31) != 31) {
+      check_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
+    }
+    if ((scaled_resolve_pages_[block_index] & check_bits) != check_bits) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void TextureCache::ScaledResolveGlobalWatchCallbackThunk(

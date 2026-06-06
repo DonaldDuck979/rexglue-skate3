@@ -43,6 +43,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   ~ImGuiDrawer();
 
   ImGuiIO& GetIO();
+  bool HasDialogs() const { return !dialogs_.empty(); }
 
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);

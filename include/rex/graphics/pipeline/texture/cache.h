@@ -88,6 +88,11 @@ class TextureCache {
                                                   uint32_t /*length_scaled_alignment_log2*/ = 0) {
     return false;
   }
+  virtual bool MaterializeScaledResolveToSharedMemory(uint32_t /*start_unscaled*/,
+                                                      uint32_t /*length_unscaled*/,
+                                                      uint32_t /*pixel_size_log2*/) {
+    return false;
+  }
 
   static uint32_t GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle);
 
@@ -110,6 +115,16 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
+  void DebugRecordResolveReadback(uint32_t start, uint32_t length, bool scaled);
+  void DebugClearRecentResolveReadbacks();
+  void DebugRecordTeamProfileBackgroundResolveRange(uint32_t start, uint32_t length, bool scaled,
+                                                    uint64_t scaled_start,
+                                                    uint64_t scaled_length);
+  bool DebugFindTeamProfileBackgroundBinding(uint32_t used_texture_mask,
+                                             uint32_t& fetch_index_out,
+                                             bool& signed_view_out,
+                                             uint32_t* texture_base_out = nullptr,
+                                             uint32_t* texture_length_out = nullptr) const;
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -228,7 +243,8 @@ class TextureCache {
     }
     void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
 
-    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+                       bool invalidated_by_gpu);
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -525,6 +541,10 @@ class TextureCache {
   // into the texture object.
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                      bool load_mips) = 0;
+  bool DebugTextureOverlapsRecentTeamProfileBackgroundResolve(
+      const Texture& texture, bool mips, uint32_t& resolve_serial_out,
+      bool& resolve_scaled_out, uint64_t& resolve_scaled_start_out,
+      uint64_t& resolve_scaled_length_out) const;
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -544,6 +564,7 @@ class TextureCache {
   // Called when something in a texture binding is changed for the
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
+  bool DebugIsTeamProfileBackgroundTexture(const Texture& texture) const;
 
  private:
   struct PendingTextureLoad {
@@ -554,11 +575,21 @@ class TextureCache {
   struct PendingSharedMemoryRange {
     uint32_t start = 0;
     uint32_t length = 0;
+    bool materialize_scaled_resolve = false;
+    uint32_t pixel_size_log2 = 0;
   };
   bool PrepareTextureLoad(Texture& texture, PendingTextureLoad& pending_load_out,
                           PendingSharedMemoryRange* pending_ranges_out,
                           size_t& pending_range_count_out);
   bool CommitPreparedTextureLoad(const PendingTextureLoad& pending_load);
+  void DebugLogScaledTextureBindings(uint32_t used_texture_mask);
+  bool DebugRangeOverlapsRecentScaledResolveReadback(uint32_t start, uint32_t length) const;
+  bool DebugTextureOverlapsRecentResolveReadback(const Texture& texture, bool mips,
+                                                 uint32_t& readback_serial_out,
+                                                 bool& readback_scaled_out) const;
+  static bool DebugIsTeamProfileBackgroundCandidateKey(const TextureKey& key);
+  void DebugLogTeamProfileBackgroundTextureCandidate(const char* action, uint32_t fetch_index,
+                                                     const Texture& texture);
 
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 
@@ -569,6 +600,8 @@ class TextureCache {
   // Checks if there are any pages that contain scaled resolve data within the
   // range.
   bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // Checks if every page touched by the range contains scaled resolve data.
+  bool IsRangeFullyScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(
@@ -617,6 +650,32 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+
+  int32_t debug_scaled_texture_bindings_remaining_seen_ = 0;
+  uint32_t debug_scaled_texture_binding_logs_this_sample_ = 0;
+  struct DebugResolveReadbackRange {
+    uint32_t start = 0;
+    uint32_t length = 0;
+    uint32_t serial = 0;
+    bool scaled = false;
+  };
+  std::array<DebugResolveReadbackRange, 32> debug_recent_resolve_readbacks_;
+  uint32_t debug_recent_resolve_readback_next_ = 0;
+  uint32_t debug_recent_resolve_readback_count_ = 0;
+  uint32_t debug_resolve_readback_serial_ = 0;
+  struct DebugTeamProfileResolveRange {
+    uint32_t start = 0;
+    uint32_t length = 0;
+    uint32_t serial = 0;
+    bool scaled = false;
+    uint64_t scaled_start = 0;
+    uint64_t scaled_length = 0;
+  };
+  std::array<DebugTeamProfileResolveRange, 64> debug_recent_team_profile_resolves_;
+  uint32_t debug_recent_team_profile_resolve_next_ = 0;
+  uint32_t debug_recent_team_profile_resolve_count_ = 0;
+  uint32_t debug_team_profile_resolve_serial_ = 0;
+  uint32_t debug_team_profile_resolve_texture_logs_remaining_ = 0;
 };
 
 }  // namespace rex::graphics

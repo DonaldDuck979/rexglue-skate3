@@ -12,7 +12,62 @@
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
 
+#include <algorithm>
+#include <string>
+#include <string_view>
+
+#include <rex/cvar.h>
+#include <rex/filesystem/entry.h>
+#include <rex/filesystem/flags.h>
+#include <rex/logging.h>
+
 namespace rex::filesystem {
+
+namespace {
+
+bool LooksLikeSkaterPreviewAssetPath(std::string_view path) {
+  std::string lower(path);
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  static constexpr std::string_view kNeedles[] = {
+      "import_skater",    "team_management", "preset",          "skater",
+      "preview",          "fedynamic",       "fedata",          "fetexture",
+      "createacharacter", "db.big",          "data/fe",         "data\\fe",
+  };
+  for (std::string_view needle : kNeedles) {
+    if (lower.find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool LooksLikeTeamProfileBackgroundPath(std::string_view path) {
+  std::string lower(path);
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lower.find("team_profile_background_0") != std::string::npos;
+}
+
+bool ConsumeFeAssetLogBudget() {
+  const int32_t remaining = REXCVAR_GET(filesystem_debug_log_fe_asset_ops_remaining);
+  if (remaining <= 0) {
+    return false;
+  }
+  REXCVAR_SET(filesystem_debug_log_fe_asset_ops_remaining, remaining - 1);
+  return true;
+}
+
+bool ConsumeTeamProfileBackgroundLogBudget() {
+  const int32_t remaining = REXCVAR_GET(filesystem_debug_log_team_profile_background_remaining);
+  if (remaining <= 0) {
+    return false;
+  }
+  REXCVAR_SET(filesystem_debug_log_team_profile_background_remaining, remaining - 1);
+  return true;
+}
+
+}  // namespace
 
 HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
                            std::unique_ptr<rex::filesystem::FileHandle> file_handle)
@@ -31,6 +86,20 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
   }
 
   if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read)) {
+    if (entry_ && LooksLikeTeamProfileBackgroundPath(entry_->absolute_path()) &&
+        ConsumeTeamProfileBackgroundLogBudget()) {
+      REXFS_WARN(
+          "Team profile BG diagnostic: op=read, path='{}', offset={:X}, requested={:X}, read={:X}",
+          entry_->absolute_path(), byte_offset, buffer.size(),
+          out_bytes_read ? *out_bytes_read : 0);
+    }
+    if (entry_ && LooksLikeSkaterPreviewAssetPath(entry_->absolute_path()) &&
+        ConsumeFeAssetLogBudget()) {
+      REXFS_WARN(
+          "FE asset diagnostic: op=read, path='{}', offset={:X}, requested={:X}, read={:X}",
+          entry_->absolute_path(), byte_offset, buffer.size(),
+          out_bytes_read ? *out_bytes_read : 0);
+    }
     return X_STATUS_SUCCESS;
   } else {
     return X_STATUS_END_OF_FILE;

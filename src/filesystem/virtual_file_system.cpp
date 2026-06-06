@@ -9,6 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <string>
+#include <string_view>
+
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/string.h>
@@ -20,7 +24,66 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
                     "relative to game://. Used for "
                     "generating test data to compare with original hardware.");
 
+REXCVAR_DEFINE_INT32(filesystem_debug_log_fe_asset_ops_remaining, 0, "Filesystem",
+                     "Log FE/import-skater-related file opens and reads for this many operations")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(filesystem_debug_log_team_profile_background_remaining, 200, "Filesystem",
+                     "Log team_profile_background_0.rx2 file opens and reads for this many "
+                     "operations")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
 namespace rex::filesystem {
+
+namespace {
+
+bool LooksLikeSkaterPreviewAssetPath(std::string_view path) {
+  std::string lower(path);
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  static constexpr std::string_view kNeedles[] = {
+      "import_skater",    "team_management", "preset",          "skater",
+      "preview",          "fedynamic",       "fedata",          "fetexture",
+      "createacharacter", "db.big",          "data/fe",         "data\\fe",
+  };
+  for (std::string_view needle : kNeedles) {
+    if (lower.find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool LooksLikeTeamProfileBackgroundPath(std::string_view path) {
+  std::string lower(path);
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lower.find("team_profile_background_0") != std::string::npos;
+}
+
+bool ConsumeFeAssetLogBudget() {
+  const int32_t remaining = REXCVAR_GET(filesystem_debug_log_fe_asset_ops_remaining);
+  if (remaining <= 0) {
+    return false;
+  }
+  REXCVAR_SET(filesystem_debug_log_fe_asset_ops_remaining, remaining - 1);
+  return true;
+}
+
+bool ConsumeTeamProfileBackgroundLogBudget() {
+  const int32_t remaining = REXCVAR_GET(filesystem_debug_log_team_profile_background_remaining);
+  if (remaining <= 0) {
+    return false;
+  }
+  REXCVAR_SET(filesystem_debug_log_team_profile_background_remaining, remaining - 1);
+  return true;
+}
+
+}  // namespace
 
 VirtualFileSystem::VirtualFileSystem() {}
 
@@ -225,6 +288,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
 
     auto file_name = rex::string::utf8_find_name_from_guest_path(path);
     entry = parent_entry->GetChild(file_name);
+    if (!entry && !root_entry) {
+      // Some virtual overlays are registered for a full path that doesn't exist
+      // under the real parent device. Resolve the full path too so those
+      // symlinks can satisfy opens like d:\data\scene\.
+      entry = ResolvePath(path);
+      if (entry) {
+        parent_entry = entry->parent();
+      }
+    }
   } else {
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
@@ -279,10 +351,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     desired_access = FileAccess::kGenericRead | FileAccess::kFileReadData;
   }
 
-  bool created = false;
   if (!entry) {
-    // Remember that we are creating this new, instead of replacing.
-    created = true;
     *out_action = FileAction::kCreated;
   } else {
     // May need to delete, if it exists.
@@ -327,6 +396,20 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
 
   // Open.
   auto result = entry->Open(desired_access, out_file);
+  if (LooksLikeTeamProfileBackgroundPath(path) && ConsumeTeamProfileBackgroundLogBudget()) {
+    REXFS_WARN(
+        "Team profile BG diagnostic: op=open, path='{}', access={:#x}, disposition={}, action={}, "
+        "status={:#x}, entry='{}'",
+        path, desired_access, static_cast<int>(creation_disposition), static_cast<int>(*out_action),
+        result, entry ? entry->absolute_path() : std::string_view("<null>"));
+  }
+  if (LooksLikeSkaterPreviewAssetPath(path) && ConsumeFeAssetLogBudget()) {
+    REXFS_WARN(
+        "FE asset diagnostic: op=open, path='{}', access={:#x}, disposition={}, action={}, "
+        "status={:#x}, entry='{}'",
+        path, desired_access, static_cast<int>(creation_disposition), static_cast<int>(*out_action),
+        result, entry ? entry->absolute_path() : std::string_view("<null>"));
+  }
   if (XFAILED(result)) {
     *out_action = FileAction::kDoesNotExist;
   }

@@ -145,11 +145,18 @@ class VulkanTextureCache final : public TextureCache {
 
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
+  bool MaterializeScaledResolveToSharedMemory(uint32_t start_unscaled, uint32_t length_unscaled,
+                                              uint32_t pixel_size_log2) override;
 
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
+
+  void DebugLogTeamProfileBackgroundGpuEvent(const char* action, uint32_t fetch_index,
+                                             const Texture& texture, bool signed_view = false,
+                                             uint32_t host_swizzle = 0,
+                                             VkImageView image_view = VK_NULL_HANDLE) const;
 
  private:
   enum LoadDescriptorSetIndex {
@@ -201,6 +208,7 @@ class VulkanTextureCache final : public TextureCache {
     ~VulkanTexture();
 
     VkImage image() const { return image_; }
+    Usage usage() const { return usage_; }
 
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
@@ -270,6 +278,8 @@ class VulkanTextureCache final : public TextureCache {
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
   };
+
+  static const char* DebugVulkanTextureUsageName(VulkanTexture::Usage usage);
 
   struct VulkanTextureBinding {
     VkImageView image_view_unsigned;

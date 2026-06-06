@@ -80,6 +80,10 @@ class SharedMemory {
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
 
+  const uint8_t* DebugTranslatePhysical(uint32_t address) const {
+    return memory_.TranslatePhysical<const uint8_t*>(address);
+  }
+
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
   // count optimization) as modified by the CPU, also invalidating GPU-written

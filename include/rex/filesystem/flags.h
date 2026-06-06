@@ -15,3 +15,5 @@
 
 REXCVAR_DECLARE(std::string, dump_source);
 REXCVAR_DECLARE(std::string, dump_path);
+REXCVAR_DECLARE(int32_t, filesystem_debug_log_fe_asset_ops_remaining);
+REXCVAR_DECLARE(int32_t, filesystem_debug_log_team_profile_background_remaining);

@@ -40,14 +40,23 @@
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
 
+#if REX_PLATFORM_LINUX
+#include <gnu/libc-version.h>
+#include <sys/utsname.h>
+#endif
+
 #include <fmt/format.h>
 #include <imgui.h>
 #include <toml++/toml.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace rex {
@@ -59,6 +68,139 @@ constexpr bool kBlockShaderStorageStartup =
     true;
 #else
     false;
+#endif
+
+#if REX_PLATFORM_LINUX
+std::string Trim(std::string value) {
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return "";
+  }
+  const auto last = value.find_last_not_of(" \t\r\n");
+  return value.substr(first, last - first + 1);
+}
+
+std::string UnquoteOsReleaseValue(std::string value) {
+  value = Trim(std::move(value));
+  if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+    std::string unquoted;
+    unquoted.reserve(value.size() - 2);
+    bool escaped = false;
+    for (size_t i = 1; i + 1 < value.size(); ++i) {
+      const char ch = value[i];
+      if (escaped) {
+        unquoted.push_back(ch);
+        escaped = false;
+      } else if (ch == '\\') {
+        escaped = true;
+      } else {
+        unquoted.push_back(ch);
+      }
+    }
+    return unquoted;
+  }
+  return value;
+}
+
+std::optional<std::string> ReadOsReleaseValue(std::string_view key) {
+  std::ifstream file("/etc/os-release");
+  std::string line;
+  while (std::getline(file, line)) {
+    const auto equals = line.find('=');
+    if (equals == std::string::npos) {
+      continue;
+    }
+    if (std::string_view(line.data(), equals) == key) {
+      return UnquoteOsReleaseValue(line.substr(equals + 1));
+    }
+  }
+  return std::nullopt;
+}
+
+std::string TruncateForLog(std::string value) {
+  constexpr size_t kMaxLength = 512;
+  if (value.size() <= kMaxLength) {
+    return value;
+  }
+  value.resize(kMaxLength);
+  value += "...";
+  return value;
+}
+
+void LogEnvIfSet(const char* name) {
+  const char* value = std::getenv(name);
+  if (value && *value) {
+    REXLOG_INFO("  {}={}", name, TruncateForLog(value));
+  }
+}
+
+void LogLinuxRuntimeDiagnostics() {
+  REXLOG_INFO("Linux runtime diagnostics:");
+
+  const auto pretty_name = ReadOsReleaseValue("PRETTY_NAME");
+  const auto id = ReadOsReleaseValue("ID");
+  const auto version_id = ReadOsReleaseValue("VERSION_ID");
+  if (pretty_name) {
+    REXLOG_INFO("  OS: {}", *pretty_name);
+  }
+  if (id || version_id) {
+    REXLOG_INFO("  OS ID: {} {}", id.value_or("unknown"), version_id.value_or(""));
+  }
+
+  utsname uts = {};
+  if (uname(&uts) == 0) {
+    REXLOG_INFO("  Kernel: {} {} {}", uts.sysname, uts.release, uts.machine);
+  }
+  REXLOG_INFO("  glibc: {}", gnu_get_libc_version());
+
+#if defined(__clang__)
+  REXLOG_INFO("  Compiler: clang {}", __clang_version__);
+#elif defined(__GNUC__)
+  REXLOG_INFO("  Compiler: GCC {}.{}.{}", __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+#endif
+
+  REXLOG_INFO("Linux session environment:");
+  LogEnvIfSet("XDG_SESSION_TYPE");
+  LogEnvIfSet("XDG_CURRENT_DESKTOP");
+  LogEnvIfSet("DESKTOP_SESSION");
+  LogEnvIfSet("DISPLAY");
+  LogEnvIfSet("WAYLAND_DISPLAY");
+  LogEnvIfSet("GDK_BACKEND");
+  LogEnvIfSet("SDL_VIDEODRIVER");
+  LogEnvIfSet("LD_LIBRARY_PATH");
+
+  REXLOG_INFO("Steam runtime environment:");
+  LogEnvIfSet("SteamAppId");
+  LogEnvIfSet("SteamGameId");
+  LogEnvIfSet("STEAM_COMPAT_APP_ID");
+  LogEnvIfSet("STEAM_COMPAT_CLIENT_INSTALL_PATH");
+  LogEnvIfSet("STEAM_COMPAT_DATA_PATH");
+  LogEnvIfSet("STEAM_RUNTIME");
+  LogEnvIfSet("STEAM_RUNTIME_LIBRARY_PATH");
+  LogEnvIfSet("STEAM_RUNTIME_HEAVY");
+  LogEnvIfSet("PRESSURE_VESSEL_RUNTIME");
+  LogEnvIfSet("PRESSURE_VESSEL_APP_ID");
+  LogEnvIfSet("container");
+
+  REXLOG_INFO("Steam Deck / gamescope environment:");
+  LogEnvIfSet("SteamDeck");
+  LogEnvIfSet("STEAMOS");
+  LogEnvIfSet("GAMESCOPE_WAYLAND_DISPLAY");
+  LogEnvIfSet("GAMESCOPE_EXTERNAL_OVERLAY");
+  LogEnvIfSet("ENABLE_GAMESCOPE_WSI");
+  LogEnvIfSet("MESA_VK_WSI_PRESENT_MODE");
+  LogEnvIfSet("RADV_PERFTEST");
+  LogEnvIfSet("VK_ICD_FILENAMES");
+  LogEnvIfSet("VK_DRIVER_FILES");
+}
+
+void StartForcedExitWatchdog(const char* reason) {
+  std::thread([reason]() {
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    REXLOG_WARN("{} watchdog exiting process after shutdown timeout", reason);
+    std::_Exit(EXIT_SUCCESS);
+  }).detach();
+}
 #endif
 
 }  // namespace
@@ -239,6 +381,9 @@ bool ReXApp::SetupEnvironment() {
     REXLOG_INFO("  Update data:    {}", update_data_root_.string());
   }
   REXLOG_INFO("  Cache root:     {}", cache_root_.string());
+#if REX_PLATFORM_LINUX
+  LogLinuxRuntimeDiagnostics();
+#endif
 
   return true;
 }
@@ -300,8 +445,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_)
+        if (!imgui_drawer_->HasDialogs()) {
           return true;
+        }
         const auto& io = imgui_drawer_->GetIO();
         return !io.WantCaptureMouse && !io.WantCaptureKeyboard;
       });
@@ -496,6 +642,9 @@ void ReXApp::OnKeyDown(ui::KeyEvent& e) {
 void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
+#if REX_PLATFORM_LINUX
+  StartForcedExitWatchdog("Linux window close");
+#endif
   shutting_down_.store(true, std::memory_order_release);
 #if REX_PLATFORM_MAC
   if (main_thread_ && main_thread_->is_running()) {

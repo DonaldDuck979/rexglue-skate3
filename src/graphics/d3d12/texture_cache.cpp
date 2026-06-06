@@ -1333,6 +1333,9 @@ bool D3D12TextureCache::MakeScaledResolveRangeCurrent(uint32_t start_unscaled,
 void D3D12TextureCache::TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATES new_state) {
   assert_true(IsDrawResolutionScaled());
   ScaledResolveVirtualBuffer& buffer = GetCurrentScaledResolveBuffer();
+  if (buffer.ConsumeUAVBarrierPending()) {
+    command_processor_.PushUAVBarrier(buffer.resource());
+  }
   command_processor_.PushTransitionBarrier(buffer.resource(), buffer.SetResourceState(new_state),
                                            new_state);
 }

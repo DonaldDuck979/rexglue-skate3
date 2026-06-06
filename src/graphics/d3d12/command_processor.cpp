@@ -30,6 +30,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
@@ -51,6 +52,14 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
 namespace rex::graphics::d3d12 {
 
 namespace {
+
+bool IsGameplayStateActive(const system::KernelState* kernel_state) {
+  if (!kernel_state) {
+    return false;
+  }
+  auto gameplay_context = kernel_state->GetUserContext(0, 0x8001);
+  return gameplay_context && *gameplay_context == 1;
+}
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 class ScopedDrawStageTimer {
@@ -3134,7 +3143,9 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  const bool gameplay_state_active = IsGameplayStateActive(kernel_state_);
+  if (readback_mode == ReadbackResolveMode::kDisabled &&
+      (!texture_cache_->IsDrawResolutionScaled() || gameplay_state_active)) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
@@ -3160,6 +3171,20 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  if (readback_mode == ReadbackResolveMode::kDisabled) {
+    constexpr uint32_t kImportSkaterPreviewResolveAddress = UINT32_C(0x04911000);
+    constexpr uint32_t kImportSkaterPreviewResolveLength = UINT32_C(0x2D0000);
+    const bool force_scaled_resolve_cpu_copy =
+        !IsGameplayStateActive(kernel_state_) && is_scaled &&
+        written_address == kImportSkaterPreviewResolveAddress &&
+        written_length == kImportSkaterPreviewResolveLength;
+    if (!force_scaled_resolve_cpu_copy) {
+      return true;
+    }
+    readback_mode = ReadbackResolveMode::kFull;
+  }
+
   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
@@ -3327,7 +3352,6 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                                written_address, written_length);
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;

@@ -995,6 +995,23 @@ void KernelState::BroadcastNotification(XNotificationID id, uint32_t data) {
   }
 }
 
+void KernelState::SetUserContext(uint32_t user_index, uint32_t context_id, uint32_t value) {
+  const uint64_t key = (uint64_t(user_index) << 32) | context_id;
+  std::lock_guard lock(user_contexts_mutex_);
+  user_contexts_[key] = value;
+}
+
+std::optional<uint32_t> KernelState::GetUserContext(uint32_t user_index,
+                                                    uint32_t context_id) const {
+  const uint64_t key = (uint64_t(user_index) << 32) | context_id;
+  std::lock_guard lock(user_contexts_mutex_);
+  auto it = user_contexts_.find(key);
+  if (it == user_contexts_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
 void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
   CompleteOverlappedEx(overlapped_ptr, result, result, 0);
 }

@@ -45,6 +45,7 @@ enum class ReadbackResolveMode {
   kFast,
   kSome,
   kFull,
+  kAuto,
 };
 
 struct SwapState {

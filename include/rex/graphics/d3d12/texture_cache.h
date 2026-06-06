@@ -328,9 +328,6 @@ class D3D12TextureCache final : public TextureCache {
     ID3D12Resource* resource() const { return resource_.Get(); }
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
       D3D12_RESOURCE_STATES old_state = resource_state_;
-      if (old_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
-        uav_barrier_pending_ = false;
-      }
       resource_state_ = new_state;
       return old_state;
     }
@@ -342,6 +339,11 @@ class D3D12TextureCache final : public TextureCache {
     }
     // After an aliasing barrier (which is even stronger than an UAV barrier).
     void ClearUAVBarrierPending() { uav_barrier_pending_ = false; }
+    bool ConsumeUAVBarrierPending() {
+      bool pending = uav_barrier_pending_;
+      uav_barrier_pending_ = false;
+      return pending;
+    }
 
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;

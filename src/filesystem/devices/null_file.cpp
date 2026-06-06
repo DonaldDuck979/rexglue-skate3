@@ -14,7 +14,7 @@
 
 namespace rex::filesystem {
 
-NullFile::NullFile(uint32_t file_access, NullEntry* entry) : File(file_access, entry) {}
+NullFile::NullFile(uint32_t file_access, Entry* entry) : File(file_access, entry) {}
 
 NullFile::~NullFile() = default;
 
@@ -23,6 +23,9 @@ void NullFile::Destroy() {
 }
 
 X_STATUS NullFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read) {
+  (void)buffer;
+  (void)byte_offset;
+  (void)out_bytes_read;
   if (!(file_access_ & FileAccess::kFileReadData)) {
     return X_STATUS_ACCESS_DENIED;
   }
@@ -32,6 +35,9 @@ X_STATUS NullFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset, size_
 
 X_STATUS NullFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_offset,
                              size_t* out_bytes_written) {
+  (void)buffer;
+  (void)byte_offset;
+  (void)out_bytes_written;
   if (!(file_access_ & (FileAccess::kFileWriteData | FileAccess::kFileAppendData))) {
     return X_STATUS_ACCESS_DENIED;
   }
@@ -40,6 +46,7 @@ X_STATUS NullFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_offset
 }
 
 X_STATUS NullFile::SetLength(size_t length) {
+  (void)length;
   if (!(file_access_ & FileAccess::kFileWriteData)) {
     return X_STATUS_ACCESS_DENIED;
   }

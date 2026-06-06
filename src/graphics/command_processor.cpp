@@ -42,6 +42,21 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
+                    "Scale texture offsets with draw resolution");
+
+REXCVAR_DEFINE_BOOL(scaled_resolve_texture_loads_from_shared_memory, false, "GPU/Texture",
+                    "Materialize scaled render-to-texture resolves into guest memory on the GPU "
+                    "before loading them as regular textures")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(scaled_resolve_texture_loads_from_shared_memory_max_pixels, 1152 * 640,
+                     "GPU/Texture",
+                     "Maximum unscaled pixel count for GPU materialization of scaled "
+                     "render-to-texture resolves into guest memory")
+    .range(1, 8192 * 8192)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
@@ -50,13 +65,27 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       " none: Disable readback (default)\n"
                       " fast: Read previous frame (delayed, copy every frame)\n"
                       " some: Read previous frame (delayed, copy on cache miss)\n"
-                      " full: Immediate sync readback (accurate but stalls)")
-    .allowed({"none", "fast", "some", "full"})
+                      " full: Immediate sync readback (accurate but stalls)\n"
+                      " auto: Backend-specific adaptive policy")
+    .allowed({"none", "fast", "some", "full", "auto"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
                     "When draw resolution scaling is active, sample from the center of each "
                     "scaled block during resolve readback downscale")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(scaled_resolve_texture_loads_update_guest_memory, true, "GPU",
+                    "When scaled resolve texture loads are materialized into shared memory, also "
+                    "mirror the downscaled data into guest memory for CPU-visible coherency")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(scaled_resolve_small_texture_readback_max_length, 0x2D0000, "GPU/Texture",
+                     "Maximum unscaled byte length of a scaled render-to-texture resolve that "
+                     "will be immediately read back even when readback_resolve is disabled. "
+                     "This is intended for small UI thumbnails that depend on CPU-visible "
+                     "resolved data without forcing full-screen resolve readbacks.")
+    .range(0, 16 * 1024 * 1024)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_memexport, false, "GPU",
@@ -95,6 +124,9 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   }
   if (value == "full") {
     return ReadbackResolveMode::kFull;
+  }
+  if (value == "auto") {
+    return ReadbackResolveMode::kAuto;
   }
   return ReadbackResolveMode::kDisabled;
 }

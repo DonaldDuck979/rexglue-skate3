@@ -19,11 +19,11 @@
 
 namespace rex::filesystem {
 
-class NullEntry;
+class Entry;
 
 class NullFile : public File {
  public:
-  NullFile(uint32_t file_access, NullEntry* entry);
+  NullFile(uint32_t file_access, Entry* entry);
   ~NullFile() override;
 
   void Destroy() override;

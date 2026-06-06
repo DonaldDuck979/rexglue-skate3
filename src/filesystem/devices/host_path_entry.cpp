@@ -11,6 +11,7 @@
 
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
+#include <rex/filesystem/devices/null_file.h>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
@@ -55,6 +56,10 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
       (desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData))) {
     REXFS_ERROR("Attempting to open file for write access on read-only device");
     return X_STATUS_ACCESS_DENIED;
+  }
+  if (attributes_ & kFileAttributeDirectory) {
+    *out_file = new NullFile(desired_access, this);
+    return X_STATUS_SUCCESS;
   }
   auto file_handle = rex::filesystem::FileHandle::OpenExisting(host_path_, desired_access);
   if (!file_handle) {

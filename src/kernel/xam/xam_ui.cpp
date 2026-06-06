@@ -363,17 +363,16 @@ class KeyboardInputDialog : public XamDialog {
   bool cancelled() const { return cancelled_; }
 
   void OnDraw(ImGuiIO& io) override {
-    bool first_draw = false;
     if (!has_opened_) {
       ImGui::OpenPopup(title_.c_str());
       has_opened_ = true;
-      first_draw = true;
+      focus_request_frames_ = 10;
     }
     if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
       if (description_.size()) {
         ImGui::TextWrapped("%s", description_.c_str());
       }
-      if (first_draw) {
+      if (focus_request_frames_) {
         ImGui::SetKeyboardFocusHere();
       }
       if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
@@ -382,6 +381,13 @@ class KeyboardInputDialog : public XamDialog {
         cancelled_ = false;
         ImGui::CloseCurrentPopup();
         Close();
+      }
+      if (focus_request_frames_) {
+        if (ImGui::IsItemActive()) {
+          focus_request_frames_ = 0;
+        } else {
+          --focus_request_frames_;
+        }
       }
       if (ImGui::Button("OK")) {
         text_ = std::string(text_buffer_.data(), text_buffer_.size());
@@ -405,6 +411,7 @@ class KeyboardInputDialog : public XamDialog {
 
  private:
   bool has_opened_ = false;
+  uint32_t focus_request_frames_ = 0;
   std::string title_;
   std::string description_;
   std::string default_text_;

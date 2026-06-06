@@ -278,6 +278,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeTrace() override;
 
  private:
+  friend class VulkanTextureCache;
+
   struct CommandBuffer {
     VkCommandPool pool;
     VkCommandBuffer buffer;
@@ -433,9 +435,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
+  void DebugRecordResolve(uint32_t address, uint32_t length, bool scaled);
 
   void ClearTransientDescriptorPools();
   bool IssueCopy_ReadbackResolvePath();
+  bool DownscaleScaledResolveToSharedMemory(uint32_t start_unscaled, uint32_t length_unscaled,
+                                            uint32_t pixel_size_log2);
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
@@ -553,6 +558,24 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
+  uint32_t async_placeholder_consecutive_frame_skips_ = 0;
+  bool async_placeholder_skip_fallback_logged_ = false;
+  uint32_t debug_frame_draws_ = 0;
+  uint32_t debug_frame_copy_resolves_ = 0;
+  uint32_t debug_frame_raster_draws_ = 0;
+  uint32_t debug_frame_color_draws_ = 0;
+  uint32_t debug_frame_depth_stencil_draws_ = 0;
+  uint32_t debug_frame_texture_draws_ = 0;
+  uint32_t debug_frame_placeholder_draws_ = 0;
+  uint32_t debug_frame_no_effect_draws_ = 0;
+  uint32_t debug_frame_memexport_draws_ = 0;
+  uint32_t debug_frame_resolve_ranges_ = 0;
+  uint32_t debug_frame_scaled_resolve_ranges_ = 0;
+  uint64_t debug_frame_resolve_bytes_ = 0;
+  static constexpr uint32_t kDebugFrameResolveRangeSamples = 6;
+  std::array<uint32_t, kDebugFrameResolveRangeSamples> debug_frame_resolve_addresses_ = {};
+  std::array<uint32_t, kDebugFrameResolveRangeSamples> debug_frame_resolve_lengths_ = {};
+  std::array<bool, kDebugFrameResolveRangeSamples> debug_frame_resolve_scaled_ = {};
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
