@@ -37,6 +37,21 @@ REXCVAR_DEFINE_INT32(audio_worker_thread_priority, 0, "Audio",
 
 namespace {
 
+class SilentAudioDriver final : public rex::audio::AudioDriver {
+ public:
+  SilentAudioDriver(rex::memory::Memory* memory, rex::thread::Semaphore* semaphore)
+      : AudioDriver(memory), semaphore_(semaphore) {}
+
+  void SubmitFrame(uint32_t /*samples_ptr*/) override {
+    if (semaphore_) {
+      semaphore_->Release(1, nullptr);
+    }
+  }
+
+ private:
+  rex::thread::Semaphore* semaphore_;
+};
+
 int32_t AudioWorkerNativePriority() {
   switch (std::clamp(REXCVAR_GET(audio_worker_thread_priority), -2, 2)) {
     case -2:
@@ -262,7 +277,11 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   AudioDriver* driver;
   auto result = CreateDriver(index, client_semaphore, &driver);
   if (XFAILED(result)) {
-    return result;
+    REXAPU_WARN(
+        "AudioSystem::RegisterClient: audio driver creation failed with status {:08X}; "
+        "using silent audio fallback",
+        result);
+    driver = new SilentAudioDriver(memory_, client_semaphore);
   }
   assert_not_null(driver);
 
@@ -371,11 +390,11 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
     AudioDriver* driver = nullptr;
     auto status = CreateDriver(id, client_semaphore, &driver);
     if (XFAILED(status)) {
-      REXAPU_ERROR(
+      REXAPU_WARN(
           "AudioSystem::Restore - Call to CreateDriver failed with status "
-          "{:08X}",
+          "{:08X}; using silent audio fallback",
           status);
-      return false;
+      driver = new SilentAudioDriver(memory_, client_semaphore);
     }
 
     assert_not_null(driver);

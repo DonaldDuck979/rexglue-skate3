@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <map>
 #include <string>
 
@@ -21,8 +22,10 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/kernel/init.h>
 #include <rex/logging.h>
 #include <rex/result.h>
+#include <rex/runtime.h>
 #include <rex/version.h>
 
 #ifdef _WIN32
@@ -86,6 +89,53 @@ int main(int argc, char** argv) {
   rexglue::cli::RegisterCodegen(app, ctx, pending);
   rexglue::cli::RegisterInit(app, ctx, pending);
   rexglue::cli::RegisterRecompileTests(app, ctx, pending);
+
+  std::string dump_xex_path;
+  std::string dump_output_dir;
+  auto* dump_xex =
+      app.add_subcommand("dump-xex", "Load, decrypt/decompress and dump a XEX image");
+  dump_xex->add_option("xex", dump_xex_path, "Path to the XEX file")->required();
+  dump_xex->add_option("output", dump_output_dir, "Directory for decoded image dumps")->required();
+  dump_xex->callback([&] {
+    pending = [&]() -> rex::Result<void> {
+      namespace fs = std::filesystem;
+      std::error_code ec;
+      fs::path xex_path = fs::weakly_canonical(fs::absolute(dump_xex_path), ec);
+      if (ec || !fs::is_regular_file(xex_path)) {
+        return rex::Err<void>(rex::ErrorCategory::IO,
+                              fmt::format("XEX file not found: {}", dump_xex_path));
+      }
+      fs::path output_dir = fs::weakly_canonical(fs::absolute(dump_output_dir), ec);
+      if (ec) {
+        output_dir = fs::absolute(dump_output_dir);
+      }
+
+#ifdef _WIN32
+      _putenv_s("REXGLUE_DUMP_XEX_IMAGE_DIR", output_dir.string().c_str());
+#else
+      setenv("REXGLUE_DUMP_XEX_IMAGE_DIR", output_dir.string().c_str(), 1);
+#endif
+
+      rex::Runtime runtime(xex_path.parent_path(), {}, {}, output_dir);
+      rex::X_STATUS status = runtime.Setup(rex::RuntimeConfig{
+          .kernel_init = rex::kernel::InitializeKernel,
+          .tool_mode = true,
+      });
+      if (status != 0) {
+        return rex::Err<void>(rex::ErrorCategory::IO,
+                              fmt::format("Failed to initialize runtime: {:#x}", status));
+      }
+
+      const std::string guest_path = "game:\\" + xex_path.filename().string();
+      status = runtime.LoadXexImage(guest_path);
+      runtime.Shutdown();
+      if (status != 0) {
+        return rex::Err<void>(rex::ErrorCategory::IO,
+                              fmt::format("Failed to load XEX image: {:#x}", status));
+      }
+      return rex::Ok();
+    };
+  });
 
   CLI11_PARSE(app, argc, argv);
 

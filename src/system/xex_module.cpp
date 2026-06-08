@@ -15,6 +15,9 @@
 #include "pe/pe_image.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <unordered_map>
 
 #include <fmt/format.h>
@@ -57,6 +60,62 @@ void aes_decrypt_buffer(const uint8_t* session_key, const uint8_t* input_buffer,
 }
 
 namespace rex::runtime {
+
+namespace {
+
+std::string DumpSafeModuleName(std::string_view name) {
+  std::string safe;
+  safe.reserve(name.size());
+  for (char ch : name) {
+    const bool allowed = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                         (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.';
+    safe.push_back(allowed ? ch : '_');
+  }
+  return safe.empty() ? "module" : safe;
+}
+
+void MaybeDumpLoadedXexImage(const XexModule& module) {
+  const char* dump_dir_value = std::getenv("REXGLUE_DUMP_XEX_IMAGE_DIR");
+  if (!dump_dir_value || !*dump_dir_value) {
+    return;
+  }
+
+  std::error_code ec;
+  const std::filesystem::path dump_dir = std::filesystem::path(dump_dir_value);
+  std::filesystem::create_directories(dump_dir, ec);
+  if (ec) {
+    REXLOG_WARN("Failed to create XEX dump directory {}: {}", dump_dir.string(), ec.message());
+    return;
+  }
+
+  const std::string safe_name = DumpSafeModuleName(module.name());
+  const std::filesystem::path image_path =
+      dump_dir / fmt::format("{}_{:08X}_{:08X}.bin", safe_name, module.base_address(),
+                             module.image_size());
+  std::ofstream image_file(image_path, std::ios::binary);
+  if (!image_file) {
+    REXLOG_WARN("Failed to open XEX image dump {}", image_path.string());
+    return;
+  }
+
+  const uint8_t* image_data = module.memory()->TranslateVirtual(module.base_address());
+  image_file.write(reinterpret_cast<const char*>(image_data), module.image_size());
+  image_file.close();
+
+  const std::filesystem::path meta_path =
+      dump_dir / fmt::format("{}_{:08X}_{:08X}.txt", safe_name, module.base_address(),
+                             module.image_size());
+  std::ofstream meta_file(meta_path);
+  if (meta_file) {
+    meta_file << "name=" << module.name() << "\n";
+    meta_file << fmt::format("base=0x{:08X}\n", module.base_address());
+    meta_file << fmt::format("size=0x{:08X}\n", module.image_size());
+    meta_file << fmt::format("entry=0x{:08X}\n", module.entry_point());
+  }
+  REXLOG_INFO("Dumped loaded XEX image {} to {}", module.name(), image_path.string());
+}
+
+}  // namespace
 
 using rex::system::KernelState;
 
@@ -932,6 +991,7 @@ bool XexModule::LoadContinue() {
   }
   REXLOG_INFO("XEX image loaded at {:08X}-{:08X} (size {:08X})", base_address_,
               base_address_ + image_size(), image_size());
+  MaybeDumpLoadedXexImage(*this);
 
   // Parse any "unsafe" headers into safer variants
   xex2_opt_generic_u32* alternate_titleids;
