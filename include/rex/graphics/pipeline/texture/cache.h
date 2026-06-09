@@ -125,6 +125,21 @@ class TextureCache {
                                              bool& signed_view_out,
                                              uint32_t* texture_base_out = nullptr,
                                              uint32_t* texture_length_out = nullptr) const;
+  struct DebugActiveTextureBinding {
+    uint64_t key_hash = 0;
+    uint32_t fetch_index = 0;
+    uint32_t base_address = 0;
+    uint32_t base_length = 0;
+    uint32_t mip_address = 0;
+    uint32_t mip_length = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth_or_array_size = 0;
+    uint32_t format = 0;
+    bool scaled_resolve = false;
+  };
+  bool DebugGetActiveTextureBinding(uint32_t fetch_constant_index,
+                                    DebugActiveTextureBinding& binding_out) const;
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -590,6 +605,10 @@ class TextureCache {
   static bool DebugIsTeamProfileBackgroundCandidateKey(const TextureKey& key);
   void DebugLogTeamProfileBackgroundTextureCandidate(const char* action, uint32_t fetch_index,
                                                      const Texture& texture);
+  bool DebugConsumeSkate3UltrawideTextureTraceLog();
+  void DebugLogSkate3UltrawideTextureTrace(const char* action, uint32_t fetch_index,
+                                           const TextureKey& key,
+                                           const Texture* texture = nullptr);
 
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 

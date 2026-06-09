@@ -10,6 +10,10 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -30,12 +34,101 @@ REXCVAR_DEFINE_INT32(filesystem_debug_log_fe_asset_ops_remaining, 0, "Filesystem
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
-REXCVAR_DEFINE_INT32(filesystem_debug_log_team_profile_background_remaining, 200, "Filesystem",
+REXCVAR_DEFINE_INT32(filesystem_debug_log_team_profile_background_remaining, 0, "Filesystem",
                      "Log team_profile_background_0.rx2 file opens and reads for this many "
                      "operations")
     .range(0, 10000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
+
+REXCVAR_DEFINE_BOOL(filesystem_debug_log_chan_center_stream_files, false, "Filesystem",
+                    "Log focused Chan Center world chunk file opens to disk")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+namespace {
+
+bool IsSkate3ChanCenterStreamPath(std::string_view path) {
+  constexpr std::string_view kNeedles[] = {
+      "DIST_University",       "cTex_500_-300_high",  "cTex_500_-200_high",
+      "cTex_100_200_high",     "cPres_350_-50_high",  "cPres_350_-350_high",
+      "cPres_550_-150_high",   "cSim_150_-350_high",
+  };
+  for (std::string_view needle : kNeedles) {
+    if (path.find(needle) != std::string_view::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::filesystem::path Skate3ChanCenterCacheLogPath(const char* filename) {
+#if defined(_WIN32)
+  char* appdata_raw = nullptr;
+  size_t appdata_length = 0;
+  if (_dupenv_s(&appdata_raw, &appdata_length, "APPDATA") == 0 && appdata_raw &&
+      appdata_length > 0) {
+    std::filesystem::path appdata_path(appdata_raw);
+    std::free(appdata_raw);
+    return appdata_path / "skate3" / "cache" / filename;
+  }
+  std::free(appdata_raw);
+#else
+  if (const char* appdata = std::getenv("APPDATA")) {
+    return std::filesystem::path(appdata) / "skate3" / "cache" / filename;
+  }
+#endif
+  return filename;
+}
+
+void LogSkate3ChanCenterStreamFileOpen(std::string_view stage, std::string_view path,
+                                       std::string_view absolute_path, uint32_t result,
+                                       uint32_t action, uint32_t desired_access,
+                                       uint32_t creation_disposition) {
+  if (!REXCVAR_GET(filesystem_debug_log_chan_center_stream_files) ||
+      !IsSkate3ChanCenterStreamPath(path)) {
+    return;
+  }
+
+  static std::mutex log_mutex;
+  static std::ofstream log_file;
+  static uint64_t sequence = 0;
+  std::lock_guard lock(log_mutex);
+  if (!log_file.is_open()) {
+    std::filesystem::path log_path =
+        Skate3ChanCenterCacheLogPath("skate3_chan_center_file_trace.log");
+    std::error_code ec;
+    if (log_path.has_parent_path()) {
+      std::filesystem::create_directories(log_path.parent_path(), ec);
+    }
+    log_file.open(log_path, std::ios::out | std::ios::trunc);
+    if (log_file.is_open()) {
+      log_file << "seq,stage,result,action,access,disposition,path,absolute\n";
+    }
+  }
+  if (!log_file.is_open()) {
+    return;
+  }
+
+  auto write_escaped = [&](std::string_view text) {
+    for (char ch : text) {
+      log_file << (ch == ',' ? ';' : ch);
+    }
+  };
+
+  log_file << std::dec << sequence++ << ',' << stage << ",0x" << std::hex << result << ",0x"
+           << action << ",0x" << desired_access << ",0x" << creation_disposition << ',';
+  write_escaped(path);
+  log_file << ',';
+  write_escaped(absolute_path);
+  log_file << '\n';
+  log_file.flush();
+
+  REXFS_WARN("Skate3 Chan stream file: stage={} result={:#x} action={:#x} path='{}' absolute='{}'",
+             stage, result, action, path, absolute_path);
+}
+
+}  // namespace
 
 namespace rex::filesystem {
 
@@ -283,6 +376,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
       *out_action = FileAction::kDoesNotExist;
+      LogSkate3ChanCenterStreamFileOpen("missing-parent", path, {}, X_STATUS_NO_SUCH_FILE,
+                                        static_cast<uint32_t>(*out_action), desired_access,
+                                        static_cast<uint32_t>(creation_disposition));
       return X_STATUS_NO_SUCH_FILE;
     }
 
@@ -303,6 +399,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
 
   if (entry) {
     if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
+      LogSkate3ChanCenterStreamFileOpen("is-directory", path, entry->absolute_path(),
+                                        X_STATUS_FILE_IS_A_DIRECTORY,
+                                        static_cast<uint32_t>(FileAction::kOpened), desired_access,
+                                        static_cast<uint32_t>(creation_disposition));
       return X_STATUS_FILE_IS_A_DIRECTORY;
     }
 
@@ -326,6 +426,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       // Must exist.
       if (!entry) {
         *out_action = FileAction::kDoesNotExist;
+        LogSkate3ChanCenterStreamFileOpen("missing-entry", path, {}, X_STATUS_NO_SUCH_FILE,
+                                          static_cast<uint32_t>(*out_action), desired_access,
+                                          static_cast<uint32_t>(creation_disposition));
         return X_STATUS_NO_SUCH_FILE;
       }
       break;
@@ -333,6 +436,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       // Must not exist.
       if (entry) {
         *out_action = FileAction::kExists;
+        LogSkate3ChanCenterStreamFileOpen(
+            "collision", path, entry->absolute_path(), X_STATUS_OBJECT_NAME_COLLISION,
+            static_cast<uint32_t>(*out_action), desired_access,
+            static_cast<uint32_t>(creation_disposition));
         return X_STATUS_OBJECT_NAME_COLLISION;
       }
       break;
@@ -359,10 +466,18 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       case FileDisposition::kCreate:
         // Shouldn't be possible to hit this.
         assert_always();
+        LogSkate3ChanCenterStreamFileOpen(
+            "invalid-create", path, entry->absolute_path(), X_STATUS_ACCESS_DENIED,
+            static_cast<uint32_t>(*out_action), desired_access,
+            static_cast<uint32_t>(creation_disposition));
         return X_STATUS_ACCESS_DENIED;
       case FileDisposition::kSuperscede:
         // Replace (by delete + recreate).
         if (!entry->Delete()) {
+          LogSkate3ChanCenterStreamFileOpen(
+              "delete-denied", path, entry->absolute_path(), X_STATUS_ACCESS_DENIED,
+              static_cast<uint32_t>(*out_action), desired_access,
+              static_cast<uint32_t>(creation_disposition));
           return X_STATUS_ACCESS_DENIED;
         }
         entry = nullptr;
@@ -380,6 +495,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
         if (entry->Delete()) {
           entry = nullptr;
         } else if (!entry->Truncate()) {
+          LogSkate3ChanCenterStreamFileOpen(
+              "truncate-denied", path, entry->absolute_path(), X_STATUS_ACCESS_DENIED,
+              static_cast<uint32_t>(*out_action), desired_access,
+              static_cast<uint32_t>(creation_disposition));
           return X_STATUS_ACCESS_DENIED;
         }
         *out_action = FileAction::kOverwritten;
@@ -390,6 +509,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     // Create if needed (either new or as a replacement).
     entry = CreatePath(path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
     if (!entry) {
+      LogSkate3ChanCenterStreamFileOpen("create-denied", path, {}, X_STATUS_ACCESS_DENIED,
+                                        static_cast<uint32_t>(*out_action), desired_access,
+                                        static_cast<uint32_t>(creation_disposition));
       return X_STATUS_ACCESS_DENIED;
     }
   }
@@ -410,6 +532,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
         path, desired_access, static_cast<int>(creation_disposition), static_cast<int>(*out_action),
         result, entry ? entry->absolute_path() : std::string_view("<null>"));
   }
+  LogSkate3ChanCenterStreamFileOpen("open", path, entry ? entry->absolute_path() : std::string_view{},
+                                    result, static_cast<uint32_t>(*out_action), desired_access,
+                                    static_cast<uint32_t>(creation_disposition));
   if (XFAILED(result)) {
     *out_action = FileAction::kDoesNotExist;
   }

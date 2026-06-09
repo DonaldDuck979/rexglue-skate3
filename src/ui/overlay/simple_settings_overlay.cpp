@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -18,7 +19,9 @@ namespace rex::ui {
 namespace {
 
 constexpr std::array<int32_t, 3> kResolutionScales = {1, 2, 3};
-constexpr std::array<const char*, 3> kResolutionLabels = {"720p", "1440p", "2160p"};
+constexpr std::array<const char*, 3> kResolutionLabels = {"720p (1x)", "1440p (2x)",
+                                                          "2160p (3x)"};
+constexpr std::array<const char*, 2> kAspectRatioLabels = {"16:9", "21:9 (Experimental)"};
 constexpr std::array<double, 6> kFrameCapRates = {60.0, 90.0, 120.0, 144.0, 165.0, 240.0};
 constexpr std::array<const char*, 7> kFrameCapLabels = {"Unlimited", "60 FPS", "90 FPS",
                                                         "120 FPS", "144 FPS", "165 FPS",
@@ -40,6 +43,12 @@ std::vector<std::string_view> GetSimpleSettingsCvars() {
   std::vector<std::string_view> cvars;
   cvars.reserve(14);
   cvars.insert(cvars.end(), kCoreSimpleSettingsCvars.begin(), kCoreSimpleSettingsCvars.end());
+  if (HasCvar("skate3_ultrawide")) {
+    cvars.push_back("skate3_ultrawide");
+  }
+  if (HasCvar("skate3_field_of_view")) {
+    cvars.push_back("skate3_field_of_view");
+  }
   if (HasCvar("d3d12_present_frame_limiter")) {
     cvars.push_back("d3d12_present_frame_limiter");
   }
@@ -98,6 +107,17 @@ int FrameCapIndexFromCvar() {
     }
   }
   return best;
+}
+
+bool HasFieldOfViewCvar() {
+  return HasCvar("skate3_field_of_view");
+}
+
+float FieldOfViewFromCvar() {
+  if (!HasFieldOfViewCvar()) {
+    return 60.0f;
+  }
+  return float(std::clamp(rex::cvar::Query<double>("skate3_field_of_view"), 40.0, 120.0));
 }
 
 void CopyToBuffer(char* buffer, size_t buffer_size, const std::string& value) {
@@ -215,6 +235,9 @@ void SimpleSettingsDialog::Show() {
 void SimpleSettingsDialog::LoadSettingsFromCvars() {
   resolution_scale_index_ = ResolutionIndexFromCvar();
   frame_cap_index_ = FrameCapIndexFromCvar();
+  aspect_ratio_index_ =
+      HasCvar("skate3_ultrawide") && rex::cvar::Query<bool>("skate3_ultrawide") ? 1 : 0;
+  field_of_view_ = FieldOfViewFromCvar();
   fullscreen_ = rex::cvar::Query<bool>("fullscreen");
   vsync_ = rex::cvar::Query<bool>("vsync");
   tearing_ = TearingFromCvar();
@@ -225,6 +248,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
 bool SimpleSettingsDialog::HasSettingsChanges() const {
   return resolution_scale_index_ != ResolutionIndexFromCvar() ||
          frame_cap_index_ != FrameCapIndexFromCvar() ||
+         (HasCvar("skate3_ultrawide") &&
+          (aspect_ratio_index_ != 0) != rex::cvar::Query<bool>("skate3_ultrawide")) ||
          fullscreen_ != rex::cvar::Query<bool>("fullscreen") ||
          vsync_ != rex::cvar::Query<bool>("vsync") ||
          tearing_ != TearingFromCvar() ||
@@ -269,6 +294,9 @@ void SimpleSettingsDialog::SaveVideo() {
       std::clamp(resolution_scale_index_, 0, static_cast<int>(kResolutionScales.size()) - 1);
   frame_cap_index_ =
       std::clamp(frame_cap_index_, 0, static_cast<int>(kFrameCapLabels.size()) - 1);
+  aspect_ratio_index_ =
+      std::clamp(aspect_ratio_index_, 0, static_cast<int>(kAspectRatioLabels.size()) - 1);
+  field_of_view_ = std::clamp(field_of_view_, 40.0f, 120.0f);
   const auto scale = std::to_string(kResolutionScales[resolution_scale_index_]);
   rex::cvar::SetFlagByName("resolution_scale", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_x", scale);
@@ -281,6 +309,12 @@ void SimpleSettingsDialog::SaveVideo() {
                              std::to_string(kFrameCapRates[frame_cap_index_ - 1]));
   }
   SetBoolCvar("fullscreen", fullscreen_);
+  if (HasCvar("skate3_ultrawide")) {
+    SetBoolCvar("skate3_ultrawide", aspect_ratio_index_ != 0);
+  }
+  if (HasFieldOfViewCvar()) {
+    rex::cvar::SetFlagByName("skate3_field_of_view", std::to_string(field_of_view_));
+  }
   SetBoolCvar("vsync", vsync_);
   SetTearingCvars(tearing_);
   SetBoolCvar("mnk_mode", mnk_mode_);
@@ -396,7 +430,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   if (selected_tab_ == 0) {
     SectionTitle("Video");
 
-    BeginFieldRow("Resolution scale");
+    BeginFieldRow("Resolution Scale");
     ImGui::Combo("##resolution_scale", &resolution_scale_index_, kResolutionLabels.data(),
                  static_cast<int>(kResolutionLabels.size()));
     EndFieldRow();
@@ -405,6 +439,25 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       BeginFieldRow("Framerate Cap");
       ImGui::Combo("##frame_cap", &frame_cap_index_, kFrameCapLabels.data(),
                    static_cast<int>(kFrameCapLabels.size()));
+      EndFieldRow();
+    }
+
+    if (HasCvar("skate3_ultrawide")) {
+      BeginFieldRow("Aspect Ratio");
+      ImGui::Combo("##aspect_ratio", &aspect_ratio_index_, kAspectRatioLabels.data(),
+                   static_cast<int>(kAspectRatioLabels.size()));
+      EndFieldRow();
+    }
+
+    if (HasFieldOfViewCvar()) {
+      BeginFieldRow("Field of View");
+      if (ImGui::SliderFloat("##field_of_view", &field_of_view_, 40.0f, 120.0f, "%.0f")) {
+        field_of_view_ = std::clamp(field_of_view_, 40.0f, 120.0f);
+        rex::cvar::SetFlagByName("skate3_field_of_view", std::to_string(field_of_view_));
+      }
+      if (ImGui::IsItemDeactivatedAfterEdit()) {
+        SaveSimpleSettingsConfig(config_path_);
+      }
       EndFieldRow();
     }
 

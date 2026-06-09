@@ -23,6 +23,7 @@ set(REXUI_OVERLAY_SOURCES
     overlay/install_wizard_overlay.cpp
     overlay/simple_settings_overlay.cpp
     overlay/settings_overlay.cpp
+    overlay/ultrawide_targets_overlay.cpp
 )
 
 # Vulkan UI backend

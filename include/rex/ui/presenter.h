@@ -660,6 +660,14 @@ class Presenter {
                                                uint32_t host_rt_width, uint32_t host_rt_height,
                                                uint32_t max_rt_width, uint32_t max_rt_height,
                                                const GuestOutputPaintConfig& config) const;
+ public:
+  bool GetSurfacePaintConnectionSize(uint32_t& width_out, uint32_t& height_out) const {
+    width_out = surface_width_in_paint_connection_;
+    height_out = surface_height_in_paint_connection_;
+    return width_out && height_out;
+  }
+
+ protected:
   // is_8bpc_out_ref is where to write whether the source actually has no more
   // than 8 bits of precision per channel (though the image provided by the
   // refresher may still have a higher storage precision) - if not written, it

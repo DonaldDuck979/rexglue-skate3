@@ -369,9 +369,11 @@ class D3D12CommandProcessor : public CommandProcessor {
                                 const draw_util::Scissor& scissor, bool primitive_polygonal,
                                 reg::RB_DEPTHCONTROL normalized_depth_control);
   void UpdateSystemConstantValues(bool shared_memory_is_uav, bool primitive_polygonal,
+                                  Shader::HostVertexShaderType host_vertex_shader_type,
                                   uint32_t line_loop_closing_index, xenos::Endian index_endian,
                                   const draw_util::ViewportInfo& viewport_info,
                                   uint32_t used_texture_mask,
+                                  uint64_t vertex_shader_hash, uint64_t pixel_shader_hash,
                                   reg::RB_DEPTHCONTROL normalized_depth_control,
                                   uint32_t normalized_color_mask);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,

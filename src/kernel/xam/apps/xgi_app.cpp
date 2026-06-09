@@ -10,6 +10,7 @@
  */
 
 #include <rex/kernel/xam/apps/xgi_app.h>
+#include <rex/graphics/ultrawide_debug.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -42,6 +43,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
       auto old_value = kernel_state_->GetUserContext(user_index, context_id);
       kernel_state_->SetUserContext(user_index, context_id, context_value);
+      rex::graphics::ultrawide_debug::NotifySkate3GameplayContext(user_index, context_id,
+                                                                  context_value);
       if (!old_value || *old_value != context_value) {
         REXKRNL_INFO("XGIUserSetContextEx(user={}, context={:#x}, value={:#x})", user_index,
                      context_id, context_value);

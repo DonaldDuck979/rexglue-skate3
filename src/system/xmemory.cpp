@@ -23,6 +23,7 @@
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread.h>
 
@@ -42,6 +43,12 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
 namespace rex::memory {
+
+thread_local PhysicalMemoryInvalidationDiagnostics physical_memory_invalidation_diagnostics_;
+
+const PhysicalMemoryInvalidationDiagnostics& GetPhysicalMemoryInvalidationDiagnostics() {
+  return physical_memory_invalidation_diagnostics_;
+}
 
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
   return rex::round_up(value, page_size) >> page_size_shift;
@@ -2024,6 +2031,23 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
                heap_size_ - (physical_address_start - physical_address_offset));
   uint32_t unwatch_first = 0;
   uint32_t unwatch_last = UINT32_MAX;
+
+  PhysicalMemoryInvalidationDiagnostics previous_diagnostics =
+      physical_memory_invalidation_diagnostics_;
+  physical_memory_invalidation_diagnostics_ = {};
+  physical_memory_invalidation_diagnostics_.valid = true;
+  physical_memory_invalidation_diagnostics_.virtual_address = virtual_address;
+  physical_memory_invalidation_diagnostics_.physical_address = physical_address_start;
+  physical_memory_invalidation_diagnostics_.length = physical_length;
+  physical_memory_invalidation_diagnostics_.exact_range = unwatch_exact_range;
+  physical_memory_invalidation_diagnostics_.unprotect = unprotect;
+  if (rex::runtime::ThreadState* thread_state = rex::runtime::ThreadState::Get()) {
+    physical_memory_invalidation_diagnostics_.thread_id = thread_state->thread_id();
+    if (PPCContext* ppc_context = thread_state->context()) {
+      physical_memory_invalidation_diagnostics_.lr = static_cast<uint32_t>(ppc_context->lr);
+      physical_memory_invalidation_diagnostics_.stack = ppc_context->r1.u32;
+    }
+  }
   for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
     std::pair<uint32_t, uint32_t> callback_unwatch_range =
         invalidation_callback->first(invalidation_callback->second, physical_address_start,
@@ -2035,6 +2059,7 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
                                      std::max(callback_unwatch_range.second, uint32_t(1)) - 1));
     }
   }
+  physical_memory_invalidation_diagnostics_ = previous_diagnostics;
   if (!unwatch_exact_range) {
     // Always unwatch at least the requested pages.
     unwatch_first = std::min(unwatch_first, physical_address_start);

@@ -19,6 +19,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/ultrawide_debug.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/private.h>
@@ -38,10 +39,26 @@ namespace {
 constexpr uint32_t kDisplayGammaType = 2;
 // Display gamma power (used with gamma type 3)
 constexpr double kDisplayGammaPower = 2.22222233;
+constexpr double kSkate3BaseAspect = 16.0 / 9.0;
+
+bool Skate3UltrawidePresentationActive() {
+  return rex::cvar::Query<bool>("skate3_ultrawide") &&
+         rex::graphics::ultrawide_debug::IsSkate3GameplayUltrawideActive() &&
+         rex::cvar::Query<double>("skate3_ultrawide_target_aspect") >
+             kSkate3BaseAspect + 0.01;
+}
+
+bool Skate3UltrawideConfiguredBeforeGameplay() {
+  return rex::cvar::Query<bool>("skate3_ultrawide") &&
+         !rex::graphics::ultrawide_debug::IsSkate3GameplayUltrawideActive() &&
+         rex::cvar::Query<double>("skate3_ultrawide_target_aspect") >
+             kSkate3BaseAspect + 0.01;
+}
 
 uint32_t GetConfiguredVideoModeWidth() {
   int32_t configured_width = REXCVAR_GET(video_mode_width);
-  if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
+  if (!rex::cvar::HasNonDefaultValue("video_mode_width") &&
+      !Skate3UltrawidePresentationActive() && !Skate3UltrawideConfiguredBeforeGameplay()) {
     if (rex::cvar::HasNonDefaultValue("window_width") && REXCVAR_GET(window_width) > 0) {
       configured_width = REXCVAR_GET(window_width);
     } else {
@@ -58,7 +75,8 @@ uint32_t GetConfiguredVideoModeWidth() {
 
 uint32_t GetConfiguredVideoModeHeight() {
   int32_t configured_height = REXCVAR_GET(video_mode_height);
-  if (!rex::cvar::HasNonDefaultValue("video_mode_height")) {
+  if (!rex::cvar::HasNonDefaultValue("video_mode_height") &&
+      !Skate3UltrawidePresentationActive() && !Skate3UltrawideConfiguredBeforeGameplay()) {
     if (rex::cvar::HasNonDefaultValue("window_height") && REXCVAR_GET(window_height) > 0) {
       configured_height = REXCVAR_GET(window_height);
     } else {

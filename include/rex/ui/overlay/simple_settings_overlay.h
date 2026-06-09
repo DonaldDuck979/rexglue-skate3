@@ -68,6 +68,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool visible_ = false;
   int resolution_scale_index_ = 0;
   int frame_cap_index_ = 0;
+  int aspect_ratio_index_ = 0;
+  float field_of_view_ = 60.0f;
   bool fullscreen_ = true;
   bool vsync_ = false;
   bool tearing_ = true;

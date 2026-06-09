@@ -40,6 +40,20 @@ inline u32 PhysicalHostOffset(u32 guest_addr) noexcept {
 
 namespace rex::memory {
 
+struct PhysicalMemoryInvalidationDiagnostics {
+  bool valid = false;
+  uint32_t virtual_address = 0;
+  uint32_t physical_address = 0;
+  uint32_t length = 0;
+  uint32_t thread_id = 0xFFFFFFFF;
+  uint32_t lr = 0;
+  uint32_t stack = 0;
+  bool exact_range = false;
+  bool unprotect = false;
+};
+
+const PhysicalMemoryInvalidationDiagnostics& GetPhysicalMemoryInvalidationDiagnostics();
+
 /// Lightweight guest-to-host pointer translation using the memory base.
 /// For hooks and kernel code operating with the base pointer directly.
 /// Same raw arithmetic as recompiled code; no Memory* or heap lookup needed.

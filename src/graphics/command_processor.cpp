@@ -885,11 +885,13 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     return false;
   }
 
+  current_packet_ptr_ = uint32_t(reader->read_ptr() - 4);
+
   // To handle nesting behavior when tracing we special case indirect buffers.
   if (opcode == PM4_INDIRECT_BUFFER) {
-    trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 2);
+    trace_writer_.WritePacketStart(current_packet_ptr_, 2);
   } else {
-    trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1 + count);
+    trace_writer_.WritePacketStart(current_packet_ptr_, 1 + count);
   }
 
   // & 1 == predicate - when set, we do bin check to see if we should execute
