@@ -20,6 +20,7 @@ set(REXUI_CORE_SOURCES
 set(REXUI_OVERLAY_SOURCES
     overlay/debug_overlay.cpp
     overlay/console_overlay.cpp
+    overlay/acquire_wizard_overlay.cpp
     overlay/install_wizard_overlay.cpp
     overlay/simple_settings_overlay.cpp
     overlay/settings_overlay.cpp
