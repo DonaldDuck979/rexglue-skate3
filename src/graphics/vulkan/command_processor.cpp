@@ -129,6 +129,25 @@ REXCVAR_DEFINE_BOOL(vulkan_skip_inert_no_pixel_draws, false, "GPU/Vulkan",
                     "occlusion side effects")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Skate 3 ultrawide cvars. These mirror the Direct3D 12 backend's definitions
+// so the Hor+ classifier behaves identically on Vulkan; the D3D12 translation
+// unit is not compiled on this platform, so without these the queries below
+// would resolve to an unregistered flag (empty string -> false/0) and silently
+// disable the shadow-map skip.
+REXCVAR_DEFINE_BOOL(skate3_ultrawide_skip_shadow_targets, true, "Skate 3",
+                    "Do not apply Skate 3 Hor+ NDC correction while rendering likely shadow maps")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_ultrawide_shadow_skip_mode, 2, "Skate 3",
+                     "Shadow pass skip mode: 1 = square atlases, 2 = plus large offscreen, "
+                     "3 = plus all depth-only")
+    .range(1, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_ultrawide_skip_screen_space_targets, false, "Skate 3",
+                    "Exclude screen-space/orthographic (pre-divided XY) passes from Skate 3 Hor+ "
+                    "NDC correction. Off by default so the Vulkan default classifier matches the "
+                    "Direct3D 12 build; enable if menu/HUD fragments appear in the side areas")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -160,6 +179,7 @@ bool IsGameplayStateActive(const system::KernelState* kernel_state) {
 struct Skate3UltrawideDrawState {
   bool correction_active = false;
   bool skip_shadow_targets = false;
+  bool skip_screen_space_targets = false;
   uint32_t shadow_skip_mode = 1;
   float hor_plus_scale = 1.0f;
 };
@@ -236,6 +256,8 @@ Skate3UltrawideDrawState QuerySkate3UltrawideDrawState() {
 
   state.hor_plus_scale = ComputeSkate3UltrawideHorPlusScale();
   state.skip_shadow_targets = rex::cvar::Query<bool>("skate3_ultrawide_skip_shadow_targets");
+  state.skip_screen_space_targets =
+      rex::cvar::Query<bool>("skate3_ultrawide_skip_screen_space_targets");
   state.shadow_skip_mode = uint32_t(std::clamp(
       rex::cvar::Query<int32_t>("skate3_ultrawide_shadow_skip_mode"), 1, 3));
   return state;
@@ -275,12 +297,19 @@ bool ShouldApplySkate3UltrawideHorPlus(
     return false;
   }
 
-  // Pre-divided XY is used by screen-space and orthographic passes. Widening
-  // those produces the menu/HUD fragments seen in the side areas.
+  // The base classifier matches the Direct3D 12 build exactly. Pre-divided XY
+  // (screen-space/orthographic passes), non-kVertex host shaders, and depth
+  // passes without a depth write can leak widening into the side areas as
+  // menu/HUD fragments; excluding them is gated behind
+  // skate3_ultrawide_skip_screen_space_targets (off by default) so the Vulkan
+  // default matches the D3D12-tuned target list unless opted in.
+  const bool screen_space_pass =
+      host_vertex_shader_type != Shader::HostVertexShaderType::kVertex ||
+      !normalized_depth_control.z_write_enable || pa_cl_vte_cntl.vtx_xy_fmt;
   const bool default_enabled =
-      host_vertex_shader_type == Shader::HostVertexShaderType::kVertex && primitive_polygonal &&
-      normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
-      !pa_cl_vte_cntl.vtx_xy_fmt && IsSkate3UltrawideDisplayViewport(viewport_info);
+      primitive_polygonal && normalized_depth_control.z_enable &&
+      IsSkate3UltrawideDisplayViewport(viewport_info) &&
+      !(ultrawide_state.skip_screen_space_targets && screen_space_pass);
   const bool selected = ultrawide_debug::ShouldApplyAndRecord(target_key, default_enabled);
   if (selected && ultrawide_state.skip_shadow_targets &&
       ultrawide_debug::IsShadowMapCandidate(target_key, ultrawide_state.shadow_skip_mode)) {

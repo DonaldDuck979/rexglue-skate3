@@ -141,11 +141,34 @@ struct DrawFingerprintKeyHash {
 std::mutex g_mutex;
 std::unordered_map<TargetKey, TargetEntry, TargetKeyHash> g_targets;
 std::unordered_map<uint64_t, bool> g_hash_overrides;
-std::atomic<std::shared_ptr<const std::unordered_map<uint64_t, bool>>> g_hash_overrides_snapshot =
+// std::atomic<std::shared_ptr<T>> is not available on every target toolchain
+// (libc++ gates it behind a newer macOS deployment target than we target), so
+// publish copy-on-write snapshots through a small mutex-guarded holder. The
+// expensive map rebuild happens before store(), outside this lock, so readers
+// never block on a writer's rebuild -- only the pointer swap/copy is guarded.
+template <typename T>
+class SnapshotPtr {
+ public:
+  SnapshotPtr() = default;
+  SnapshotPtr(std::shared_ptr<T> initial) : ptr_(std::move(initial)) {}
+  std::shared_ptr<T> load(std::memory_order = std::memory_order_seq_cst) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ptr_;
+  }
+  void store(std::shared_ptr<T> next, std::memory_order = std::memory_order_seq_cst) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ptr_ = std::move(next);
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::shared_ptr<T> ptr_;
+};
+
+SnapshotPtr<const std::unordered_map<uint64_t, bool>> g_hash_overrides_snapshot =
     std::make_shared<const std::unordered_map<uint64_t, bool>>();
 std::unordered_map<SemanticTargetKey, bool, SemanticTargetKeyHash> g_semantic_overrides;
-std::atomic<std::shared_ptr<const std::unordered_map<SemanticTargetKey, bool,
-                                                    SemanticTargetKeyHash>>>
+SnapshotPtr<const std::unordered_map<SemanticTargetKey, bool, SemanticTargetKeyHash>>
     g_semantic_overrides_snapshot =
         std::make_shared<const std::unordered_map<SemanticTargetKey, bool,
                                                  SemanticTargetKeyHash>>();
