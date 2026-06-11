@@ -77,7 +77,7 @@ class StfsContainerDevice : public Device {
       if (header_.metadata.volume_type == XContentVolumeType::kStfs) {
         return header_.metadata.volume_descriptor.stfs.total_block_count * kBlockSize;
       }
-      return files_total_size_ - rex::round_up(header_.header.header_size, kBlockSize);
+      return files_total_size_ - StfsBaseOffset();
     }
     return files_total_size_ - sizeof(StfsHeader);
   }
@@ -116,6 +116,7 @@ class StfsContainerDevice : public Device {
   void BlockToOffsetSVOD(size_t sector, size_t* address, size_t* file_index);
 
   Error ReadSTFS();
+  size_t StfsBaseOffset() const;
   size_t BlockToOffsetSTFS(uint64_t block_index) const;
   uint32_t BlockToHashBlockNumberSTFS(uint32_t block_index, uint32_t hash_level) const;
   size_t BlockToHashBlockOffsetSTFS(uint32_t block_index, uint32_t hash_level) const;

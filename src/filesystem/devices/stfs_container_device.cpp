@@ -568,15 +568,20 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
         break;
       }
 
+      std::string name(reinterpret_cast<const char*>(dir_entry.name),
+                       dir_entry.flags.name_length & 0x3F);
       StfsContainerEntry* parent_entry = nullptr;
       if (dir_entry.directory_index == 0xFFFF) {
         parent_entry = root_entry;
       } else {
+        if (dir_entry.directory_index >= all_entries.size()) {
+          REXFS_ERROR("STFS directory entry {} has invalid parent index {}", name,
+                      dir_entry.directory_index.get());
+          return Error::kErrorDamagedFile;
+        }
         parent_entry = all_entries[dir_entry.directory_index];
       }
 
-      std::string name(reinterpret_cast<const char*>(dir_entry.name),
-                       dir_entry.flags.name_length & 0x3F);
       auto entry = StfsContainerEntry::Create(this, parent_entry, name, &files_);
 
       if (dir_entry.flags.directory) {
@@ -609,27 +614,32 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
           entry->block_list_.push_back({0, offset, block_size});
           remaining_size -= block_size;
           auto block_hash = GetBlockHash(block_index);
+          if (!block_hash) {
+            REXFS_ERROR("STFS failed to read block hash for entry {} block {}", name,
+                        block_index);
+            return Error::kErrorReadError;
+          }
           block_index = block_hash->level0_next_block();
         }
 
         if (remaining_size) {
           // Loop above must have exited prematurely, bad hash tables?
-          REXFS_WARN(
+          REXFS_ERROR(
               "STFS file {} only found {} bytes for file, expected {} ({} "
               "bytes missing)",
               name, dir_entry.length.get() - remaining_size, dir_entry.length.get(),
               remaining_size);
-          assert_always();
+          return Error::kErrorDamagedFile;
         }
 
         // Check that the number of blocks retrieved from hash entries matches
         // the block count read from the file entry
         if (entry->block_list_.size() != dir_entry.allocated_data_blocks()) {
-          REXFS_WARN(
+          REXFS_ERROR(
               "STFS failed to read correct block-chain for entry {}, read {} "
               "blocks, expected {}",
               entry->name_, entry->block_list_.size(), dir_entry.allocated_data_blocks());
-          assert_always();
+          return Error::kErrorDamagedFile;
         }
       }
 
@@ -637,6 +647,10 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
     }
 
     auto block_hash = GetBlockHash(table_block_index);
+    if (!block_hash) {
+      REXFS_ERROR("STFS failed to read file table block hash for block {}", table_block_index);
+      return Error::kErrorReadError;
+    }
     table_block_index = block_hash->level0_next_block();
     if (table_block_index == kEndOfChain) {
       break;
@@ -644,12 +658,20 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
   }
 
   if (n + 1 != descriptor.file_table_block_count) {
-    REXFS_WARN("STFS read {} file table blocks, but STFS headers expected {}!", n + 1,
-               descriptor.file_table_block_count);
-    assert_always();
+    REXFS_ERROR("STFS read {} file table blocks, but STFS headers expected {}!", n + 1,
+                descriptor.file_table_block_count);
+    return Error::kErrorDamagedFile;
   }
 
   return Error::kSuccess;
+}
+
+size_t StfsContainerDevice::StfsBaseOffset() const {
+  // STFS packages with CON headers can report a metadata header size that
+  // rounds to 0xA000, but the hash tables still begin at the standard 0xB000
+  // backing offset. Using the smaller value makes the directory reader consume
+  // hash bytes as file-table entries.
+  return std::max<size_t>(0xB000, rex::round_up(header_.header.header_size, kBlockSize));
 }
 
 size_t StfsContainerDevice::BlockToOffsetSTFS(uint64_t block_index) const {
@@ -669,7 +691,7 @@ size_t StfsContainerDevice::BlockToOffsetSTFS(uint64_t block_index) const {
     base *= kBlocksPerHashLevel[0];
   }
 
-  return rex::round_up(header_.header.header_size, kBlockSize) + (block << 12);
+  return StfsBaseOffset() + (block << 12);
 }
 
 uint32_t StfsContainerDevice::BlockToHashBlockNumberSTFS(uint32_t block_index,
@@ -706,7 +728,7 @@ uint32_t StfsContainerDevice::BlockToHashBlockNumberSTFS(uint32_t block_index,
 size_t StfsContainerDevice::BlockToHashBlockOffsetSTFS(uint32_t block_index,
                                                        uint32_t hash_level) const {
   uint64_t block = BlockToHashBlockNumberSTFS(block_index, hash_level);
-  return rex::round_up(header_.header.header_size, kBlockSize) + (block << 12);
+  return StfsBaseOffset() + (block << 12);
 }
 
 const StfsHashEntry* StfsContainerDevice::GetBlockHash(uint32_t block_index) {
