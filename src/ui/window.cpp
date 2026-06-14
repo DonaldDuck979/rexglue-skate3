@@ -571,6 +571,12 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
 }
 
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
+  if (!e.prev_state() && e.virtual_key() == VirtualKey::kF10 &&
+      (rex::cvar::Query<bool>("skate3_demo_path") ||
+       rex::cvar::Query<bool>("skate3_demo_path_probe"))) {
+    REXLOG_WARN("Skate 3 demo path: raw F10 milestone marker");
+  }
+
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
         listener->OnKeyDown(e);

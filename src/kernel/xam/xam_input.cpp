@@ -11,6 +11,7 @@
 
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
+#include <rex/kernel/xam/input_injection.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -18,6 +19,11 @@
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <iterator>
+#include <mutex>
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -33,6 +39,122 @@ using rex::input::X_INPUT_VIBRATION;
 
 constexpr uint32_t XINPUT_FLAG_GAMEPAD = 0x01;
 constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
+
+namespace {
+
+constexpr size_t kMaxSyntheticInputSteps = 16;
+
+std::atomic<bool> g_synthetic_input_active{false};
+std::mutex g_synthetic_input_mutex;
+std::array<SyntheticInputStep, kMaxSyntheticInputSteps> g_synthetic_input_steps{};
+size_t g_synthetic_input_step_count = 0;
+size_t g_synthetic_input_step_index = 0;
+uint32_t g_synthetic_input_step_remaining = 0;
+uint16_t g_synthetic_auto_tap_buttons = 0;
+bool g_synthetic_auto_tap_enabled = false;
+
+void QueueSyntheticInputSequenceLocked(const SyntheticInputStep* steps, size_t step_count) {
+  g_synthetic_input_step_count = std::min(step_count, kMaxSyntheticInputSteps);
+  g_synthetic_input_step_index = 0;
+  for (size_t i = 0; i < g_synthetic_input_step_count; ++i) {
+    g_synthetic_input_steps[i] = steps[i];
+  }
+  while (g_synthetic_input_step_count != 0 &&
+         g_synthetic_input_steps[g_synthetic_input_step_count - 1].poll_count == 0) {
+    --g_synthetic_input_step_count;
+  }
+  g_synthetic_input_step_remaining =
+      g_synthetic_input_step_count ? g_synthetic_input_steps[0].poll_count : 0;
+  g_synthetic_input_active.store(g_synthetic_input_step_count != 0 &&
+                                     g_synthetic_input_step_remaining != 0,
+                                 std::memory_order_relaxed);
+}
+
+void EnsureSyntheticAutoTapLocked() {
+  if (!g_synthetic_auto_tap_enabled || g_synthetic_auto_tap_buttons == 0 ||
+      g_synthetic_input_active.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  const SyntheticInputStep auto_tap[] = {
+      {g_synthetic_auto_tap_buttons, 5},
+      {0, 15},
+  };
+  QueueSyntheticInputSequenceLocked(auto_tap, std::size(auto_tap));
+}
+
+void ApplySyntheticInput(X_INPUT_STATE* input_state) {
+  if (!input_state) {
+    return;
+  }
+
+  std::lock_guard lock(g_synthetic_input_mutex);
+  EnsureSyntheticAutoTapLocked();
+  if (!g_synthetic_input_active.load(std::memory_order_relaxed) ||
+      g_synthetic_input_step_index >= g_synthetic_input_step_count) {
+    g_synthetic_input_active.store(false, std::memory_order_relaxed);
+    return;
+  }
+
+  const auto& step = g_synthetic_input_steps[g_synthetic_input_step_index];
+  if (step.buttons != 0) {
+    input_state->gamepad.buttons =
+        static_cast<uint16_t>(static_cast<uint16_t>(input_state->gamepad.buttons) | step.buttons);
+    input_state->packet_number =
+        static_cast<uint32_t>(static_cast<uint32_t>(input_state->packet_number) + 1);
+  }
+
+  if (g_synthetic_input_step_remaining > 0) {
+    --g_synthetic_input_step_remaining;
+  }
+
+  while (g_synthetic_input_step_remaining == 0) {
+    ++g_synthetic_input_step_index;
+    if (g_synthetic_input_step_index >= g_synthetic_input_step_count) {
+      g_synthetic_input_active.store(false, std::memory_order_relaxed);
+      return;
+    }
+    g_synthetic_input_step_remaining =
+        g_synthetic_input_steps[g_synthetic_input_step_index].poll_count;
+  }
+}
+
+bool PopSyntheticKeystroke(X_INPUT_KEYSTROKE* out_keystroke) {
+  (void)out_keystroke;
+  return false;
+}
+
+}  // namespace
+
+void QueueSyntheticInput(uint16_t buttons, uint32_t poll_count) {
+  SyntheticInputStep step{buttons, poll_count};
+  QueueSyntheticInputSequence(&step, 1);
+}
+
+void QueueSyntheticInputSequence(const SyntheticInputStep* steps, size_t step_count) {
+  if (!steps || step_count == 0) {
+    return;
+  }
+
+  std::lock_guard lock(g_synthetic_input_mutex);
+  QueueSyntheticInputSequenceLocked(steps, step_count);
+}
+
+void SetSyntheticAutoTap(uint16_t buttons, bool enabled) {
+  std::lock_guard lock(g_synthetic_input_mutex);
+  g_synthetic_auto_tap_buttons = buttons;
+  g_synthetic_auto_tap_enabled = enabled && buttons != 0;
+}
+
+void ClearSyntheticInput() {
+  std::lock_guard lock(g_synthetic_input_mutex);
+  g_synthetic_input_step_count = 0;
+  g_synthetic_input_step_index = 0;
+  g_synthetic_input_step_remaining = 0;
+  g_synthetic_auto_tap_buttons = 0;
+  g_synthetic_auto_tap_enabled = false;
+  g_synthetic_input_active.store(false, std::memory_order_relaxed);
+}
 
 rex::input::InputSystem* input_system() {
   return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
@@ -112,7 +234,11 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  const u32 result = is->GetState(actual_user_index, input_state);
+  if (result == X_ERROR_SUCCESS) {
+    ApplySyntheticInput(input_state);
+  }
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
@@ -151,6 +277,10 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
   if ((actual_user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
     // Always pin user to 0.
     actual_user_index = 0;
+  }
+
+  if (actual_user_index == 0 && PopSyntheticKeystroke(keystroke)) {
+    return X_ERROR_SUCCESS;
   }
 
   auto* is = input_system();

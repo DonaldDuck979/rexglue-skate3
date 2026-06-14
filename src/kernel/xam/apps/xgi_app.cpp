@@ -10,7 +10,10 @@
  */
 
 #include <rex/kernel/xam/apps/xgi_app.h>
+#include <rex/cvar.h>
 #include <rex/graphics/ultrawide_debug.h>
+#include <rex/input/input.h>
+#include <rex/kernel/xam/input_injection.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -45,6 +48,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       kernel_state_->SetUserContext(user_index, context_id, context_value);
       rex::graphics::ultrawide_debug::NotifySkate3GameplayContext(user_index, context_id,
                                                                   context_value);
+      if (rex::cvar::Query<bool>("skate3_demo_path") && user_index == 0 &&
+          context_id == 0x8001) {
+        if (context_value == 0) {
+          rex::kernel::xam::SetSyntheticAutoTap(rex::input::X_INPUT_GAMEPAD_A, true);
+          REXKRNL_INFO("Skate 3 demo path: gameplay context 0; enabling dialog A auto-tap");
+        } else if (context_value == 1) {
+          rex::kernel::xam::ClearSyntheticInput();
+          REXKRNL_INFO("Skate 3 demo path: gameplay context 1; stopping synthetic input");
+        }
+      }
       if (!old_value || *old_value != context_value) {
         REXKRNL_INFO("XGIUserSetContextEx(user={}, context={:#x}, value={:#x})", user_index,
                      context_id, context_value);
