@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <string>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
@@ -24,6 +26,30 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+
+REXCVAR_DEFINE_BOOL(audio_realtime_credit_pacing, true, "Audio",
+                    "Limit the rate at which consumed audio frames release guest submission "
+                    "credits to slightly above real time. Prevents a misbehaving audio device "
+                    "(e.g. a Bluetooth headset in a broken state) from running the guest audio "
+                    "clock - and anything synchronized to it, like video playback - several "
+                    "times too fast.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(audio_device_sample_frames, 0, "Audio",
+                     "Requested audio device buffer size in sample frames (0 = backend default). "
+                     "Larger values (e.g. 1024 or 2048) add latency but tolerate scheduling "
+                     "hiccups better - try this against crackling, especially on Linux.")
+    .range(0, 8192);
+
+namespace {
+
+uint64_t AudioNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+}  // namespace
 
 namespace rex::audio::sdl {
 
@@ -44,6 +70,12 @@ bool SDLAudioDriver::Initialize() {
 
   // Set app name for audio device identification
   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
+
+  int32_t requested_sample_frames = REXCVAR_GET(audio_device_sample_frames);
+  if (requested_sample_frames > 0) {
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES,
+                std::to_string(requested_sample_frames).c_str());
+  }
 
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
     REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
@@ -167,6 +199,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     REXAPU_ERROR("SDLAudioDriver::SDLCallback failed to allocate {} samples", sample_count);
     return;
   }
+  // Grant credits deferred by the real-time pacer once enough time has passed.
+  driver->ReleasePacedCredits(0);
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     float* buffer = nullptr;
@@ -216,12 +250,44 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         break;
       }
 
-      auto ret = driver->semaphore_->Release(1, nullptr);
-      assert_true(ret);
+      driver->ReleasePacedCredits(1);
       additional_amount -= len;
     }
   }
+
   SDL_stack_free(data);
+}
+
+void SDLAudioDriver::ReleasePacedCredits(uint32_t new_credits) {
+  pace_deferred_credits_ += new_credits;
+  if (!pace_deferred_credits_) {
+    return;
+  }
+  uint64_t releasable = pace_deferred_credits_;
+  if (REXCVAR_GET(audio_realtime_credit_pacing)) {
+    const uint64_t now_ns = AudioNowNs();
+    if (pace_last_ns_) {
+      // 1% above real time so a device clock running slightly faster than the
+      // host clock can't slowly drain the pipeline; the allowance cap keeps
+      // catch-up bursts after pauses or stalls to a fraction of the guest's
+      // credit pool instead of an unbounded replay.
+      pace_allowance_frames_ += double(now_ns - pace_last_ns_) * 1e-9 *
+                                (double(frame_frequency_) / double(channel_samples_)) * 1.01;
+    }
+    pace_last_ns_ = now_ns;
+    constexpr double kMaxBankedFrames = 8.0;
+    pace_allowance_frames_ = std::min(pace_allowance_frames_, kMaxBankedFrames);
+    releasable = std::min(releasable, uint64_t(pace_allowance_frames_));
+  }
+  if (releasable) {
+    auto ret = semaphore_->Release(int(releasable), nullptr);
+    assert_true(ret);
+    pace_deferred_credits_ -= releasable;
+    pace_allowance_frames_ -= double(releasable);
+    if (pace_allowance_frames_ < 0.0) {
+      pace_allowance_frames_ = 0.0;
+    }
+  }
 }
 
 }  // namespace rex::audio::sdl

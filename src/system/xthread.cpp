@@ -823,14 +823,19 @@ void XThread::SetPriority(int32_t increment) {
   auto kthread = guest_object<X_KTHREAD>();
   kthread->priority = static_cast<uint8_t>(std::clamp(increment, 0, 31));
 
+  // KeSetBasePriorityThread increments follow SetThreadPriority semantics:
+  // +1 above-normal, +2 highest, >= +15 saturates to time-critical (Skate 3
+  // sets its RwAudioCore Dac audio thread to 16 - flattening that to host
+  // normal made it lose its ~5ms deadline against the emulation threads,
+  // which surfaced as silent-block audio crackle).
   int32_t target_priority = 0;
-  if (increment > 0x22) {
+  if (increment >= 15) {
     target_priority = rex::thread::ThreadPriority::kHighest;
-  } else if (increment > 0x11) {
+  } else if (increment >= 1) {
     target_priority = rex::thread::ThreadPriority::kAboveNormal;
-  } else if (increment < -0x22) {
+  } else if (increment <= -15) {
     target_priority = rex::thread::ThreadPriority::kLowest;
-  } else if (increment < -0x11) {
+  } else if (increment <= -1) {
     target_priority = rex::thread::ThreadPriority::kBelowNormal;
   } else {
     target_priority = rex::thread::ThreadPriority::kNormal;

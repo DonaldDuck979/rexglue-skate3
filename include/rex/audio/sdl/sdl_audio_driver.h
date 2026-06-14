@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <mutex>
 #include <queue>
 #include <stack>
@@ -35,6 +36,14 @@ class SDLAudioDriver : public AudioDriver {
   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                           int total_amount);
 
+  // Releases guest frame credits, paced to real time when
+  // audio_realtime_credit_pacing is enabled: a misbehaving audio device that
+  // drains the stream faster than real time (e.g. a Bluetooth device in a
+  // broken state) would otherwise release credits at an unbounded rate,
+  // speeding up the guest's whole audio clock and anything paced by it (such
+  // as video playback). Called only from the SDL audio thread.
+  void ReleasePacedCredits(uint32_t new_credits);
+
   rex::thread::Semaphore* semaphore_ = nullptr;
 
   SDL_AudioStream* sdl_stream_ = nullptr;
@@ -49,6 +58,13 @@ class SDLAudioDriver : public AudioDriver {
   std::queue<float*> frames_queued_ = {};
   std::stack<float*> frames_unused_ = {};
   std::mutex frames_mutex_ = {};
+
+  // Credit pacing state - only touched on the SDL audio thread. The allowance
+  // accumulates with wall time (slightly above real time to tolerate device
+  // clock drift) and is capped so pauses don't bank an unbounded burst.
+  double pace_allowance_frames_ = 4.0;
+  uint64_t pace_last_ns_ = 0;
+  uint64_t pace_deferred_credits_ = 0;
 };
 
 }  // namespace rex::audio::sdl

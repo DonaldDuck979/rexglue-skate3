@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <tuple>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -166,6 +167,12 @@ struct kPacketInfo {
   }
 };
 
+struct kPacketHandle {
+  uint32_t buffer_index_ = 0;
+  uint32_t packet_index_ = 0;
+  bool is_valid_ = false;
+};
+
 static constexpr int kIdToSampleRate[4] = {24000, 32000, 44100, 48000};
 
 class XmaContext {
@@ -230,13 +237,20 @@ class XmaContext {
 
   kPacketInfo GetPacketInfo(uint8_t* packet, uint32_t frame_offset);
   uint32_t GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint32_t frame_size);
+  kPacketHandle GetPacketHandle(XMA_CONTEXT_DATA* data, uint32_t buffer_index,
+                                uint32_t packet_index,
+                                uint32_t current_input_packet_count);
   const uint8_t* GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
                                uint32_t current_input_packet_count);
   uint32_t GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
                                    uint32_t current_input_packet_count);
+  uint32_t GetNextPacketReadOffset(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
+                                   uint32_t current_input_packet_count);
   uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
 
   void Decode(XMA_CONTEXT_DATA* data);
+  bool WorkOldFrameDecoder();
+  void DecodeOldFrame(XMA_CONTEXT_DATA* data);
   void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
   void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
   void ClearLocked(XMA_CONTEXT_DATA* data);
@@ -250,6 +264,15 @@ class XmaContext {
                           uint8_t* context_ptr);
 
   static void ConvertFrame(const uint8_t** samples, bool is_two_channel, uint8_t* output_buffer);
+
+  static bool TrySetupNextLoopOld(XMA_CONTEXT_DATA* data, bool ignore_input_buffer_offset);
+  static bool ValidFrameOffsetOld(uint8_t* block, size_t size_bytes, size_t frame_offset_bits);
+  static size_t GetNextFrameOld(uint8_t* block, size_t size_bytes, size_t bit_offset);
+  static int GetFramePacketNumberOld(uint8_t* block, size_t size_bytes, size_t bit_offset);
+  static std::tuple<int, int> GetFrameNumberOld(uint8_t* block, size_t size_bytes,
+                                                size_t bit_offset);
+  static std::tuple<int, bool> GetPacketFrameCountOld(uint8_t* packet);
+  uint32_t GetPacketFirstFrameOffsetOld(const XMA_CONTEXT_DATA* data);
 
   memory::Memory* memory_ = nullptr;
   std::unique_ptr<rex::thread::Event> work_completion_event_;
@@ -266,6 +289,10 @@ class XmaContext {
   AVCodecContext* av_context_ = nullptr;
   AVFrame* av_frame_ = nullptr;
 
+  // Snapshot of the current input packet, taken once per Decode() call so
+  // header parsing, frame slicing and the bit copy all see one consistent
+  // image even if the game refills the buffer mid-decode.
+  std::array<uint8_t, kBytesPerPacket> packet_snapshot_;
   // Packet data buffer (two packets worth for split frame handling)
   std::array<uint8_t, kBytesPerPacketData * 2> input_buffer_;
   // First byte contains bit offset information
@@ -280,6 +307,13 @@ class XmaContext {
   // Loop subframe precision state
   uint8_t loop_frame_output_limit_ = 0;
   bool loop_start_skip_pending_ = false;
+
+  // xenia-edge old XMA decoder state.
+  uint32_t old_packets_skip_ = 0;
+  bool old_is_stream_done_ = false;
+  uint32_t old_split_frame_len_ = 0;
+  uint32_t old_split_frame_len_partial_ = 0;
+  uint8_t old_split_frame_padding_start_ = 0;
 };
 
 }  // namespace rex::audio

@@ -81,10 +81,13 @@ bool build_vmulfp128(BuilderContext& ctx) {
 }
 
 bool build_vmaddfp(BuilderContext& ctx) {
+  // Xenon vmaddfp is a true fused multiply-add (single rounding). Emit a real
+  // FMA so the result is bit-identical to hardware; the previous mul+add pair
+  // double-rounded every multiply-add in guest VMX code.
   ctx.emit_set_flush_mode(true);
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_add_ps("
-      "simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), "
+      "\tsimde_mm_store_ps({}.f32, simde_mm_fmadd_ps("
+      "simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), "
       "simde_mm_load_ps({}.f32)));",
       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
       ctx.v(ctx.insn.operands[3]));
@@ -92,13 +95,17 @@ bool build_vmaddfp(BuilderContext& ctx) {
 }
 
 bool build_vnmsubfp(BuilderContext& ctx) {
+  // Xenon vnmsubfp computes -((vA*vC) - vB) fused with a single rounding.
+  // fnmadd(a, c, b) = b - a*c is the same value single-rounded (zero-sign of
+  // an exact cancellation differs, which hardware also exhibits via the
+  // negate; acceptable). The previous sub(mul(...)) pair double-rounded.
   ctx.emit_set_flush_mode(true);
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_sub_ps("
-      "simde_mm_load_ps({}.f32), "
-      "simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32))));",
-      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[3]), ctx.v(ctx.insn.operands[1]),
-      ctx.v(ctx.insn.operands[2]));
+      "\tsimde_mm_store_ps({}.f32, simde_mm_fnmadd_ps("
+      "simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
+      ctx.v(ctx.insn.operands[3]));
   return true;
 }
 

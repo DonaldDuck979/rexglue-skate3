@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
@@ -17,6 +19,7 @@
 #include <rex/perf/counter.h>
 #include <rex/math.h>
 #include <rex/memory/ring_buffer.h>
+#include <rex/platform/fpscr.h>
 #include <rex/string/buffer.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
@@ -133,6 +136,12 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   worker_thread_->set_name("XMA Decoder");
 
   worker_thread_->Create();
+  if (worker_thread_->thread()) {
+    // The decoder feeds the guest mixer - decode bursts arriving late surface
+    // as in-content audio glitches, so keep it ahead of normal-priority
+    // emulation threads (notably the spinning GPU command processor).
+    worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kAboveNormal);
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -159,8 +168,11 @@ void XmaDecoder::WorkerThreadMain() {
     if (did_work) {
       continue;
     }
-    // No work done this iteration, block until signaled.
-    rex::thread::Wait(work_event_.get(), false);
+    // No work done this iteration. Contexts stay enabled until the game
+    // disables them (hardware free-running semantics, see XmaContext::Work),
+    // so poll on a short cadence to refill output rings as the game consumes
+    // them - real hardware resumes by itself, there is no kick to wake us.
+    rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(2));
   }
 }
 
@@ -283,24 +295,50 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // Basically, this kicks the SPU and says "hey, decode that audio!"
     // XMAEnableContext
 
+    // Decode the kicked contexts inline on the kicking thread instead of
+    // waking the worker and waiting for its full context pass. The game's
+    // audio threads kick up to ~9k contexts/s and run at host-Highest
+    // priority; parking each kick behind the AboveNormal worker (which walks
+    // all 256 contexts per pass) is a priority inversion whose stalls can
+    // blow the game mixer's 5.3ms deadline - the engine then emits an
+    // all-zero block, audible as a click. Inline, a kick costs only its own
+    // contexts' decode time and the guest still sees updated context data on
+    // return, which is what the old block-on-worker arrangement was for.
+    //
+    // Guest threads execute with host FP exceptions unmasked and FTZ/DAZ
+    // possibly set (FPSCR emulation state); ffmpeg's float math would trap
+    // or diverge from worker-thread decodes, so switch to the worker's FP
+    // environment around the decode and restore the guest's after.
+    const uint32_t guest_csr = rex::platform::FPSCRPlatform::getcsr();
+    uint32_t decode_csr = guest_csr;
+    rex::platform::FPSCRPlatform::InitHostExceptions(decode_csr);
+    decode_csr &= ~uint32_t(rex::platform::FPSCRPlatform::FlushMask);
+    decode_csr &= ~uint32_t(rex::platform::FPSCRPlatform::RoundMaskVal);  // round-to-nearest
+    if (decode_csr != guest_csr) {
+      rex::platform::FPSCRPlatform::setcsr(decode_csr);
+    }
+
     // The context ID is a bit in the range of the entire context array.
     uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
-    uint32_t kicked_value = value;
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
         context.Enable();
+        if (context.Work()) {
+          PROFILE_XMA_FRAME_DECODED();
+        } else if (context.is_allocated()) {
+          // Another thread (a concurrent kick, or the worker's bounded-wait
+          // stats scan) consumed the enable between our Enable() and Work().
+          // Wait for that decode to release the context lock so the game
+          // still sees updated context data before the kick write returns.
+          context.Block(false);
+        }
       }
     }
-    // Signal the decoder thread to start processing.
-    work_event_->Set();
-    // Block until the worker finishes, so the game sees updated context data.
-    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
-      if (kicked_value & 1) {
-        uint32_t context_id = base_context_id + i;
-        contexts_[context_id].WaitForWorkDone();
-      }
+
+    if (decode_csr != guest_csr) {
+      rex::platform::FPSCRPlatform::setcsr(guest_csr);
     }
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.

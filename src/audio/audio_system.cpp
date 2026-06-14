@@ -22,17 +22,22 @@
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
 #include <rex/string/buffer.h>
+#include <rex/platform/fpscr.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread.h>
 #include <rex/cvar.h>
 
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 16, "Audio",
-    "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+    "Max buffered audio frames (range 2-64). Lower reduces latency and keeps the guest "
+    "audio engine closer to hardware-like lockstep with playback (real hardware double "
+    "buffers, ~2); may cause stuttering if too low for the machine.");
 
-REXCVAR_DEFINE_INT32(audio_worker_thread_priority, 0, "Audio",
+REXCVAR_DEFINE_INT32(audio_worker_thread_priority, 1, "Audio",
                      "Native audio worker thread priority (-2 lowest, -1 below normal, 0 normal, "
-                     "1 above normal, 2 highest)")
+                     "1 above normal, 2 highest). The worker runs the guest's audio mixing on a "
+                     "~5.3 ms deadline; above-normal keeps it scheduled ahead of the busy "
+                     "emulation threads to avoid underrun crackle.")
     .range(-2, 2);
 
 namespace {
@@ -92,7 +97,7 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
 
   queued_frames_ = std::min(
       static_cast<uint32_t>(kMaximumQueuedFrames),
-      std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)), static_cast<uint32_t>(4)));
+      std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)), static_cast<uint32_t>(2)));
 
   for (size_t i = 0; i < kMaximumClientCount; ++i) {
     client_semaphores_[i] = rex::thread::Semaphore::Create(0, queued_frames_);
@@ -189,6 +194,18 @@ void AudioSystem::WorkerThreadMain() {
         uint64_t args[] = {client_callback_arg};
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+        // Guest execution can return with host FP exceptions unmasked (the
+        // FPSCR emulation leaks MXCSR state); the first host float op on this
+        // thread then traps (seen as STATUS_FLOAT_INEXACT_RESULT in the gap
+        // logging below). Re-mask before doing any host-side work.
+        {
+          const uint32_t csr = rex::platform::FPSCRPlatform::getcsr();
+          uint32_t masked = csr;
+          rex::platform::FPSCRPlatform::InitHostExceptions(masked);
+          if (csr != masked) {
+            rex::platform::FPSCRPlatform::setcsr(masked);
+          }
+        }
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
         }
@@ -310,6 +327,7 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
   assert_true(clients_[index].driver != NULL);
+
   (clients_[index].driver)->SubmitFrame(samples_ptr);
 }
 
