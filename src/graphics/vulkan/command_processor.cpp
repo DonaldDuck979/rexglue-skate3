@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -46,6 +47,7 @@
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/xenos.h>
+#include <rex/hash.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/system/kernel_state.h>
 #include <rex/types.h>
@@ -120,6 +122,12 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(vulkan_gpu_timestamp_trace_frames, 0, "GPU/Vulkan",
+                     "Log every GPU timestamp bucket interval (start/end/duration) for this many "
+                     "frames, for auditing the time attribution")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -127,6 +135,28 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_skip_inert_no_pixel_draws, false, "GPU/Vulkan",
                     "Skip Vulkan no-pixel-shader draws that have no color, depth, stencil or "
                     "occlusion side effects")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_reuse_transient_texture_descriptors, true, "GPU/Vulkan",
+                    "Reuse texture/sampler descriptor sets within a frame when the bindings are "
+                    "unchanged instead of allocating and writing new ones for every draw")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_push_constants_descriptors, true, "GPU/Vulkan",
+                    "Use VK_KHR_push_descriptor for the guest constant buffer descriptor set "
+                    "instead of allocating and writing a transient descriptor set whenever "
+                    "constants change (requires driver support; applied at startup)");
+
+REXCVAR_DEFINE_BOOL(vulkan_reuse_unchanged_draw_bindings, true, "GPU/Vulkan",
+                    "Skip the per-draw sampler cache walks and texture descriptor "
+                    "gathering/hashing entirely when the previous draw in the same submission "
+                    "used the same shaders with identical sampler parameters and texture "
+                    "binding views")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_gpu_timestamp_buckets, false, "GPU/Vulkan",
+                    "Measure per-bucket GPU times (guest draws, resolves, render target dumps) "
+                    "with timestamp queries and report them in the FPS overlay")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Skate 3 ultrawide cvars. These mirror the Direct3D 12 backend's definitions
@@ -271,6 +301,18 @@ Skate3UltrawideDrawState SnapshotSkate3UltrawideDrawState(uint64_t frame) {
     cached_frame = frame;
   }
   return cached_state;
+}
+
+// Frame-cached read of the cross-TU draw trace flag - the registry Query is a
+// mutex + string hash, too expensive to run for every draw.
+bool QuerySkate3UltrawideTraceDraws(uint64_t frame) {
+  thread_local uint64_t cached_frame = UINT64_MAX;
+  thread_local bool cached_value = false;
+  if (cached_frame != frame) {
+    cached_value = rex::cvar::Query<bool>("skate3_ultrawide_trace_draws");
+    cached_frame = frame;
+  }
+  return cached_value;
 }
 
 bool IsSkate3UltrawideDisplayViewport(const draw_util::ViewportInfo& viewport_info) {
@@ -1162,6 +1204,17 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
   // Guest draw constants.
+  // With VK_KHR_push_descriptor, the constant buffer descriptors are pushed
+  // directly into the command buffer instead of allocating and writing a
+  // transient descriptor set whenever any constant buffer changes (which is
+  // nearly every draw due to guest float constant updates).
+  constants_push_descriptors_used_ = vulkan_device->extensions().ext_KHR_push_descriptor &&
+                                     REXCVAR_GET(vulkan_push_constants_descriptors);
+  if (constants_push_descriptors_used_) {
+    REXGPU_INFO(
+        "VulkanCommandProcessor: using push descriptors for guest constant "
+        "buffers");
+  }
   VkDescriptorSetLayoutBinding
       descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferCount] = {};
   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
@@ -1187,6 +1240,10 @@ bool VulkanCommandProcessor::SetupContext() {
   descriptor_set_layout_create_info.bindingCount =
       uint32_t(rex::countof(descriptor_set_layout_bindings_constants));
   descriptor_set_layout_create_info.pBindings = descriptor_set_layout_bindings_constants;
+  if (constants_push_descriptors_used_) {
+    descriptor_set_layout_create_info.flags |=
+        VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+  }
   if (dfn.vkCreateDescriptorSetLayout(device, &descriptor_set_layout_create_info, nullptr,
                                       &descriptor_set_layout_constants_) != VK_SUCCESS) {
     REXGPU_ERROR(
@@ -1194,6 +1251,8 @@ bool VulkanCommandProcessor::SetupContext() {
         "constant buffers");
     return false;
   }
+  descriptor_set_layout_create_info.flags &=
+      ~VkDescriptorSetLayoutCreateFlags(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
   // Transient: storage buffer for compute shaders.
   VkDescriptorSetLayoutBinding descriptor_set_layout_binding_transient;
   descriptor_set_layout_binding_transient.binding = 0;
@@ -3492,10 +3551,25 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
-  SubmitBarriers(false);
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   bool use_dynamic_rendering =
       REXCVAR_GET(vulkan_dynamic_rendering) && vulkan_device->properties().dynamicRendering;
+
+  // Time genuine render pass entries (pending barriers including image layout
+  // transitions, pass end/begin and deferred resolve clear replay) separately
+  // - reported in the FPS overlay's "other" line. Don't open a region on the
+  // no-op path (same pass, no barriers), it runs for every draw.
+  bool pass_entry_work =
+      !pending_barriers_.empty() || current_pending_barrier_.src_stage_mask ||
+      current_pending_barrier_.dst_stage_mask ||
+      !(in_render_pass_ && current_framebuffer_ == framebuffer &&
+        (use_dynamic_rendering ? current_render_pass_ == VK_NULL_HANDLE
+                               : current_render_pass_ == render_pass));
+  if (pass_entry_work) {
+    BeginGpuTimestampedRegion(rex::perf::DrawBucket::kRenderPassEntry);
+  }
+
+  SubmitBarriers(false);
 
   if (use_dynamic_rendering) {
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -3561,6 +3635,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
+
+  // Replay resolve clears deferred to the next render pass binding their
+  // render targets - they ride the render pass entered for guest draws anyway
+  // instead of requiring their own render passes during resolves.
+  render_target_cache_->FlushDeferredResolveClearsIntoEnteredRenderPass(framebuffer->host_extent);
 }
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -4050,6 +4129,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
 
+  rex::perf::ScopedCounterTimer analyze_stage_timer(rex::perf::CounterId::kDrawStageAnalyzeUs);
+
   memexport_ranges_.clear();
 
   // Vertex shader analysis.
@@ -4131,6 +4212,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  bool draw_samplers_reused = false;
+  analyze_stage_timer.Stop();
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -4168,6 +4251,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // Tessellation and rectangle expansion variants for rasterization are
     // produced by the primitive processor and are handled by the Vulkan
     // pipeline cache.
+    rex::perf::ScopedCounterTimer translate_stage_timer(
+        rex::perf::CounterId::kDrawStageTranslateUs);
     Shader::HostVertexShaderType host_vertex_shader_type =
         primitive_processing_result.host_vertex_shader_type;
     if (host_vertex_shader_type != Shader::HostVertexShaderType::kVertex &&
@@ -4199,16 +4284,53 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                   pixel_shader_translation)) {
       return draw_fail("shader_translation");
     }
+    translate_stage_timer.Stop();
+    rex::perf::ScopedCounterTimer samplers_stage_timer(
+        rex::perf::CounterId::kDrawStageSamplersUs);
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
     // modification, so if on the second iteration of this loop it becomes
     // different for some reason (like a race condition with the guest in index
     // buffer processing in the primitive processor resulting in different host
     // vertex shader types), the bindings will stay the same.
-    // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
-    // submission.
+    // Sampler reuse for adjacent draws within one submission (the upstream
+    // "TODO(Triang3l): Sampler caching and reuse" here): if the previous draw
+    // in this same submission used the same shaders and the sampler
+    // parameters derived from the fetch constants are unchanged,
+    // current_samplers_* already hold valid VkSamplers whose last-usage
+    // submission indices are current - skip the per-sampler cache lookups.
+    draw_samplers_reused = false;
+    if (!i && REXCVAR_GET(vulkan_reuse_unchanged_draw_bindings) && draw_binding_state_valid_ &&
+        draw_binding_submission_ == GetCurrentSubmission() &&
+        draw_binding_vertex_shader_ == vertex_shader &&
+        draw_binding_pixel_shader_ == pixel_shader) {
+      draw_samplers_reused = true;
+      for (uint32_t j = 0; draw_samplers_reused && j < 2; ++j) {
+        const std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>&
+            shader_samplers = j ? current_samplers_pixel_ : current_samplers_vertex_;
+        const VulkanShader* shader = j ? pixel_shader : vertex_shader;
+        if (!shader) {
+          draw_samplers_reused = shader_samplers.empty();
+          continue;
+        }
+        const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
+            shader->GetSamplerBindingsAfterTranslation();
+        if (shader_samplers.size() != shader_sampler_bindings.size()) {
+          draw_samplers_reused = false;
+          break;
+        }
+        for (size_t k = 0; k < shader_sampler_bindings.size(); ++k) {
+          if (shader_samplers[k].second == VK_NULL_HANDLE ||
+              shader_samplers[k].first !=
+                  texture_cache_->GetSamplerParameters(shader_sampler_bindings[k])) {
+            draw_samplers_reused = false;
+            break;
+          }
+        }
+      }
+    }
     uint32_t samplers_overflowed_count = 0;
-    for (uint32_t j = 0; j < 2; ++j) {
+    for (uint32_t j = 0; !draw_samplers_reused && j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
           j ? current_samplers_pixel_ : current_samplers_vertex_;
       if (!i) {
@@ -4251,6 +4373,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         }
       }
     }
+    samplers_stage_timer.Stop();
     if (!samplers_overflowed_count) {
       break;
     }
@@ -4266,6 +4389,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     assert_true(sampler_overflow_await_submission <= GetCurrentSubmission());
     CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
   }
+
+  // Record the state the binding fast path of the next draw compares against.
+  draw_binding_state_valid_ = true;
+  draw_binding_submission_ = GetCurrentSubmission();
+  draw_binding_vertex_shader_ = vertex_shader;
+  draw_binding_pixel_shader_ = pixel_shader;
 
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
@@ -4310,9 +4439,29 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     rex::perf::ScopedCounterTimer stage_timer(rex::perf::CounterId::kDrawStageTextureUs);
     texture_cache_->RequestTextures(used_texture_mask);
   }
-  const bool debug_team_profile_bg_draw = texture_cache_->DebugFindTeamProfileBackgroundBinding(
-      used_texture_mask, debug_team_profile_bg_fetch_index, debug_team_profile_bg_signed_view,
-      &debug_team_profile_bg_texture_base, &debug_team_profile_bg_texture_length);
+  // With the samplers reused and the texture cache's binding views unchanged,
+  // UpdateBindings can keep the currently recorded texture descriptor sets
+  // without regathering and rehashing the image infos.
+  {
+    uint64_t texture_bindings_generation = texture_cache_->texture_bindings_generation();
+    texture_bindings_unchanged_this_draw_ =
+        draw_samplers_reused &&
+        draw_binding_texture_generation_ == texture_bindings_generation;
+    draw_binding_texture_generation_ = texture_bindings_generation;
+    if (draw_samplers_reused) {
+      rex::perf::cpu_profile::CountEvent(rex::perf::CounterId::kDrawSamplerFastPathDraws);
+    }
+    if (texture_bindings_unchanged_this_draw_) {
+      rex::perf::cpu_profile::CountEvent(rex::perf::CounterId::kDrawTextureFastPathDraws);
+    }
+  }
+  // The binding scan hashes guest texture memory to identify the texture, so
+  // only perform it while draw logging is actually armed.
+  const bool debug_team_profile_bg_draw =
+      REXCVAR_GET(vulkan_debug_log_team_profile_background_draws_remaining) > 0 &&
+      texture_cache_->DebugFindTeamProfileBackgroundBinding(
+          used_texture_mask, debug_team_profile_bg_fetch_index, debug_team_profile_bg_signed_view,
+          &debug_team_profile_bg_texture_base, &debug_team_profile_bg_texture_length);
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
@@ -4380,6 +4529,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           pipeline_layout->descriptor_set_layout_textures_pixel_ref()) {
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+      }
+      // Sets at the first incompatible index and above are disturbed by
+      // binding a pipeline with the new layout and must be rebound. This was
+      // previously masked by the texture descriptor sets being rewritten and
+      // rebound on every draw.
+      if (descriptor_sets_kept < uint32_t(SpirvShaderTranslator::kDescriptorSetCount)) {
+        current_graphics_descriptor_sets_bound_up_to_date_ &=
+            (UINT32_C(1) << descriptor_sets_kept) - 1;
       }
     } else {
       // No or unknown pipeline layout previously bound - all bindings are in an
@@ -4486,11 +4643,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // Update system constants before uploading them.
-  UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
-                             shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
-                             vertex_shader->ucode_data_hash(),
-                             pixel_shader ? pixel_shader->ucode_data_hash() : 0,
-                             normalized_depth_control, normalized_color_mask);
+  {
+    rex::perf::ScopedCounterTimer stage_timer(rex::perf::CounterId::kDrawStageSystemConstantsUs);
+    UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
+                               shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
+                               vertex_shader->ucode_data_hash(),
+                               pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                               normalized_depth_control, normalized_color_mask);
+  }
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
@@ -4646,6 +4806,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         render_target_cache_->last_update_framebuffer());
   }
 
+  rex::perf::ScopedCounterTimer pre_draw_stage_timer(rex::perf::CounterId::kDrawStagePreDrawUs);
   const uint32_t host_draw_vertex_count = primitive_processing_result.host_draw_vertex_count;
   const uint32_t host_draw_primitive_count = draw_util::EstimatePrimitiveCount(
       primitive_processing_result.host_primitive_type, host_draw_vertex_count);
@@ -4693,7 +4854,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
   bool skate3_ultrawide_submit_draw = true;
-  if (rex::cvar::Query<bool>("skate3_ultrawide_trace_draws")) {
+  // Frame-cached: the registry Query takes the registry mutex and hashes the
+  // name, far too expensive for a per-draw debug-flag check.
+  if (QuerySkate3UltrawideTraceDraws(frame_current_)) {
     ultrawide_debug::DrawFingerprint fingerprint;
     fingerprint.bucket =
         memexport_writes_possible
@@ -4753,6 +4916,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!skate3_ultrawide_submit_draw) {
     return true;
   }
+  pre_draw_stage_timer.Stop();
 
   // Draw.
   uint32_t gpu_timestamp_start = BeginGpuTimestampedDraw(draw_bucket);
@@ -5781,7 +5945,9 @@ bool VulkanCommandProcessor::InitializeGpuTimestampResources() {
 
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
           vulkan_device,
-          sizeof(uint64_t) * kMaxGpuTimestampQueriesPerFrame * kMaxFramesInFlight,
+          // Two uint64s per query - the timestamp value and the availability
+          // word.
+          sizeof(uint64_t) * 2 * kMaxGpuTimestampQueriesPerFrame * kMaxFramesInFlight,
           VK_BUFFER_USAGE_TRANSFER_DST_BIT, ui::vulkan::util::MemoryPurpose::kReadback,
           gpu_timestamp_readback_buffer_, gpu_timestamp_readback_memory_,
           &gpu_timestamp_readback_memory_type_, &gpu_timestamp_readback_memory_size_)) {
@@ -5820,19 +5986,32 @@ void VulkanCommandProcessor::ShutdownGpuTimestampResources() {
   gpu_timestamp_readback_memory_type_ = UINT32_MAX;
   gpu_timestamp_readback_memory_size_ = 0;
   gpu_timestamp_resources_available_ = false;
+  gpu_timestamp_draws_enabled_ = false;
   for (GpuTimestampFrame& frame : gpu_timestamp_frames_) {
     frame = {};
   }
 }
 
 void VulkanCommandProcessor::BeginGpuTimestampFrame() {
+  const bool timestamp_diagnostics_enabled =
+      rex::perf::IsCaptureRecording() || REXCVAR_GET(vulkan_gpu_timestamp_buckets) ||
+      REXCVAR_GET(vulkan_gpu_timestamp_trace_frames) > 0;
+  gpu_timestamp_draws_enabled_ = timestamp_diagnostics_enabled;
   if (!gpu_timestamp_resources_available_ || gpu_timestamp_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+
+  const bool presenter_stats_enabled =
+      graphics_system_ && graphics_system_->presenter() &&
+      graphics_system_->presenter()->GuestFrameStatsEnabled();
+  if (!timestamp_diagnostics_enabled && !presenter_stats_enabled) {
     return;
   }
 
   GpuTimestampFrame& frame = gpu_timestamp_frames_[frame_current_ % kMaxFramesInFlight];
   frame.frame = frame_current_;
   frame.submission = 0;
+  frame.first_submission = GetCurrentSubmission();
   frame.query_base =
       uint32_t((frame_current_ % kMaxFramesInFlight) * kMaxGpuTimestampQueriesPerFrame);
   frame.query_count = 0;
@@ -5846,7 +6025,12 @@ void VulkanCommandProcessor::BeginGpuTimestampFrame() {
   frame.bucket_start_queries.clear();
   frame.bucket_end_queries.clear();
 
-  if (!rex::perf::IsCaptureRecording()) {
+  // The frame-level start/end pair is measured only while a visible overlay or
+  // explicit timestamp diagnostic needs it.
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      GetVulkanDevice()->properties();
+  if (!device_properties.timestampComputeAndGraphics ||
+      device_properties.timestampPeriod <= 0.0f) {
     return;
   }
 
@@ -5900,10 +6084,15 @@ void VulkanCommandProcessor::ResolveGpuTimestampFrame(VkCommandBuffer command_bu
   }
 
   const ui::vulkan::VulkanDevice::Functions& dfn = GetVulkanDevice()->functions();
+  // Copying with the availability word instead of VK_QUERY_RESULT_WAIT_BIT:
+  // waiting hangs the device forever if any query in the range never gets its
+  // timestamp written (this happened with bucket timestamps at 3x resolution
+  // scale), while an unavailable query with the availability flag simply
+  // yields availability == 0 and the sample is skipped at processing.
   dfn.vkCmdCopyQueryPoolResults(command_buffer, gpu_timestamp_query_pool_, frame.query_base,
                                 frame.query_count, gpu_timestamp_readback_buffer_,
-                                sizeof(uint64_t) * frame.query_base, sizeof(uint64_t),
-                                VK_QUERY_RESULT_64_BIT);
+                                sizeof(uint64_t) * 2 * frame.query_base, sizeof(uint64_t) * 2,
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
 }
 
 void VulkanCommandProcessor::ProcessGpuTimestampResults() {
@@ -5937,7 +6126,7 @@ void VulkanCommandProcessor::ProcessGpuTimestampResults() {
     memory_range.memory = gpu_timestamp_readback_memory_;
     memory_range.offset = 0;
     memory_range.size = std::min(
-        rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxGpuTimestampQueriesPerFrame *
+        rex::round_up(VkDeviceSize(sizeof(uint64_t) * 2 * kMaxGpuTimestampQueriesPerFrame *
                                    kMaxFramesInFlight),
                       properties.nonCoherentAtomSize),
         gpu_timestamp_readback_memory_size_);
@@ -5949,77 +6138,180 @@ void VulkanCommandProcessor::ProcessGpuTimestampResults() {
     if (!frame.pending || frame.submission == 0 || frame.submission > submission_completed_) {
       continue;
     }
-    const uint64_t* timestamps = gpu_timestamp_readback_mapping_ + frame.query_base;
+    // Two uint64s per query - the timestamp value and the availability word.
+    const uint64_t* timestamps = gpu_timestamp_readback_mapping_ + size_t(frame.query_base) * 2;
     auto timestamp_delta_us = [&](uint32_t start_query, uint32_t end_query) -> int64_t {
       if (start_query >= frame.query_count || end_query >= frame.query_count) {
         return 0;
       }
-      uint64_t start = timestamps[start_query];
-      uint64_t end = timestamps[end_query];
+      if (!timestamps[size_t(start_query) * 2 + 1] || !timestamps[size_t(end_query) * 2 + 1]) {
+        // Query results unavailable - skip the sample.
+        return 0;
+      }
+      uint64_t start = timestamps[size_t(start_query) * 2];
+      uint64_t end = timestamps[size_t(end_query) * 2];
       if (end <= start) {
         return 0;
       }
       return int64_t(double(end - start) * timestamp_period_ns / 1000.0);
     };
 
+    int64_t frame_span_us = 0;
     if (frame.frame_start_query != UINT32_MAX && frame.frame_end_query != UINT32_MAX) {
       int64_t elapsed_us = timestamp_delta_us(frame.frame_start_query, frame.frame_end_query);
       if (elapsed_us > 0) {
+        frame_span_us = elapsed_us;
         rex::perf::IncrementCounter(rex::perf::CounterId::kGpuCommandProcessorFrameUs,
                                     elapsed_us);
         rex::perf::IncrementCounter(rex::perf::CounterId::kGpuTimestampedFrames);
+        if (ui::Presenter* presenter = graphics_system_->presenter()) {
+          presenter->SetGuestFrameGpuSpanMicroseconds(uint64_t(elapsed_us));
+          static bool gpu_span_logged = false;
+          if (!gpu_span_logged) {
+            gpu_span_logged = true;
+            REXGPU_INFO("VulkanCommandProcessor: GPU frame span reporting active ({} us)",
+                        elapsed_us);
+          }
+        }
       }
     }
 
+    // Attribution audit trace - logs every bucket interval of the frame.
+    int32_t trace_remaining = REXCVAR_GET(vulkan_gpu_timestamp_trace_frames);
+    bool trace_this_frame = trace_remaining > 0 && frame_span_us > 0;
+    uint64_t trace_frame_start_ticks = 0;
+    if (trace_this_frame) {
+      REXCVAR_SET(vulkan_gpu_timestamp_trace_frames, trace_remaining - 1);
+      trace_frame_start_ticks = timestamps[size_t(frame.frame_start_query) * 2];
+      REXGPU_INFO("GPU timestamp trace: frame={} queries={}/{} span_us={} intervals={}",
+                  frame.frame, frame.query_count, kMaxGpuTimestampQueriesPerFrame, frame_span_us,
+                  frame.buckets.size());
+    }
+    auto trace_ticks_to_us = [&](uint64_t ticks) -> int64_t {
+      return int64_t(double(int64_t(ticks - trace_frame_start_ticks)) * timestamp_period_ns /
+                     1000.0);
+    };
+
+    uint64_t bucket_draw_us = 0;
+    uint64_t bucket_resolve_us = 0;
+    uint64_t bucket_dump_us = 0;
     for (uint32_t i = 0; i < frame.buckets.size() && i < frame.bucket_start_queries.size() &&
                          i < frame.bucket_end_queries.size();
          ++i) {
       uint32_t start_query = frame.bucket_start_queries[i];
       uint32_t end_query = frame.bucket_end_queries[i];
       if (end_query == UINT32_MAX) {
+        if (trace_this_frame) {
+          REXGPU_INFO("  [{}] {} START-ONLY (no end query - budget exhausted or frame end)", i,
+                      rex::perf::DrawBucketName(frame.buckets[i]));
+        }
         continue;
       }
       int64_t elapsed_us = timestamp_delta_us(start_query, end_query);
+      if (trace_this_frame && start_query < frame.query_count && end_query < frame.query_count) {
+        REXGPU_INFO("  [{}] {} start={} end={} dur={}{}", i,
+                    rex::perf::DrawBucketName(frame.buckets[i]),
+                    trace_ticks_to_us(timestamps[size_t(start_query) * 2]),
+                    trace_ticks_to_us(timestamps[size_t(end_query) * 2]), elapsed_us,
+                    (!timestamps[size_t(start_query) * 2 + 1] ||
+                     !timestamps[size_t(end_query) * 2 + 1])
+                        ? " UNAVAILABLE"
+                        : "");
+      }
       if (elapsed_us <= 0) {
         continue;
+      }
+      if (size_t(frame.buckets[i]) < size_t(rex::perf::DrawBucket::kCount)) {
+        gpu_profile_bucket_us_[size_t(frame.buckets[i])] += uint64_t(elapsed_us);
       }
       rex::perf::CounterId counter_id;
       switch (frame.buckets[i]) {
         case rex::perf::DrawBucket::kMainColorDepth:
           counter_id = rex::perf::CounterId::kGpuMainUs;
+          bucket_draw_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kDepthOnly:
           counter_id = rex::perf::CounterId::kGpuDepthUs;
+          bucket_draw_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kCopyResolve:
           counter_id = rex::perf::CounterId::kGpuCopyUs;
+          bucket_resolve_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kMemexport:
           counter_id = rex::perf::CounterId::kGpuMemexportUs;
+          bucket_draw_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kNoPixelShader:
           counter_id = rex::perf::CounterId::kGpuNoPixelShaderUs;
+          bucket_draw_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kCopyDump:
           counter_id = rex::perf::CounterId::kGpuCopyDumpUs;
+          bucket_dump_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kCopyResolveShader:
           counter_id = rex::perf::CounterId::kGpuCopyResolveUs;
+          bucket_resolve_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kCopyResolveFast32:
           counter_id = rex::perf::CounterId::kGpuCopyResolveFast32Us;
+          bucket_resolve_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kCopyResolveFull32:
           counter_id = rex::perf::CounterId::kGpuCopyResolveFull32Us;
+          bucket_resolve_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kResolveDownscale:
           counter_id = rex::perf::CounterId::kGpuResolveDownscaleUs;
+          bucket_resolve_us += uint64_t(elapsed_us);
           break;
         default:
           continue;
       }
       rex::perf::IncrementCounter(counter_id, elapsed_us);
       rex::perf::IncrementCounter(rex::perf::CounterId::kGpuTimestampedDraws);
+    }
+    if (ui::Presenter* presenter = graphics_system_->presenter()) {
+      // Zeros when bucket timestamps are disabled, which hides the breakdown
+      // in the FPS overlay.
+      presenter->SetGuestFrameGpuBreakdownMicroseconds(bucket_draw_us, bucket_resolve_us,
+                                                       bucket_dump_us);
+    }
+
+    // Periodic full attribution log - the per-bucket sums were accumulated
+    // above for every bucket including ones not shown in the FPS overlay.
+    if (frame_span_us > 0 && REXCVAR_GET(vulkan_gpu_timestamp_buckets)) {
+      gpu_profile_span_us_ += uint64_t(frame_span_us);
+      if (frame.submission >= frame.first_submission) {
+        gpu_profile_submissions_ += frame.submission - frame.first_submission + 1;
+      }
+      if (++gpu_profile_frames_ >= kGpuProfileLogFrameInterval) {
+        uint64_t buckets_sum_us = 0;
+        std::string breakdown;
+        for (size_t bucket = 0; bucket < size_t(rex::perf::DrawBucket::kCount); ++bucket) {
+          uint64_t total_us = gpu_profile_bucket_us_[bucket];
+          buckets_sum_us += total_us;
+          if (!total_us) {
+            continue;
+          }
+          breakdown += fmt::format(" {}={}", rex::perf::DrawBucketName(rex::perf::DrawBucket(bucket)),
+                                   total_us / gpu_profile_frames_);
+        }
+        uint64_t span_avg_us = gpu_profile_span_us_ / gpu_profile_frames_;
+        uint64_t sum_avg_us = buckets_sum_us / gpu_profile_frames_;
+        REXGPU_INFO(
+            "Vulkan GPU profile (avg us/frame over {} frames): span={} buckets={} untimed={} "
+            "submissions={} queries={}/{} |{}",
+            gpu_profile_frames_, span_avg_us, sum_avg_us,
+            span_avg_us > sum_avg_us ? span_avg_us - sum_avg_us : 0,
+            gpu_profile_submissions_ / gpu_profile_frames_, frame.query_count,
+            kMaxGpuTimestampQueriesPerFrame, breakdown);
+        std::memset(gpu_profile_bucket_us_, 0, sizeof(gpu_profile_bucket_us_));
+        gpu_profile_span_us_ = 0;
+        gpu_profile_submissions_ = 0;
+        gpu_profile_frames_ = 0;
+      }
     }
 
     frame.pending = false;
@@ -6033,7 +6325,7 @@ void VulkanCommandProcessor::ProcessGpuTimestampResults() {
 
 uint32_t VulkanCommandProcessor::BeginGpuTimestampedDraw(rex::perf::DrawBucket bucket) {
   if (!gpu_timestamp_resources_available_ || gpu_timestamp_query_pool_ == VK_NULL_HANDLE ||
-      !rex::perf::IsCaptureRecording() || !frame_open_) {
+      !gpu_timestamp_draws_enabled_ || !frame_open_) {
     return UINT32_MAX;
   }
 
@@ -6342,9 +6634,21 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     {
       rex::perf::ScopedCounterTimer fence_wait_timer(
           rex::perf::CounterId::kCpuD3D12FenceWaitUs);
+      rex::perf::ScopedCounterTimer gpu_thread_wait_timer(
+          rex::perf::CounterId::kGpuThreadFenceWaitUs, true);
+      // Also reported through the presenter so the FPS overlay can show the
+      // blocked time in builds without perf counters - cheap around a
+      // blocking wait.
+      const std::chrono::steady_clock::time_point wait_start = std::chrono::steady_clock::now();
       wait_result =
           dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                               submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+      if (ui::Presenter* wait_presenter = graphics_system_->presenter()) {
+        wait_presenter->AddGuestFrameWaitMicroseconds(uint64_t(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                  wait_start)
+                .count()));
+      }
     }
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
@@ -6598,6 +6902,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         shared_memory_and_edram_descriptor_set_;
     current_graphics_descriptor_set_values_up_to_date_ =
         UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+    // Sets cached for reuse belong to the previous frame and may be recycled
+    // once it completes.
+    texture_transient_descriptor_set_reuse_cache_.clear();
+    current_texture_descriptor_set_hash_valid_[0] = false;
+    current_texture_descriptor_set_hash_valid_[1] = false;
 
     // Reclaim pool pages - no need to do this every small submission since some
     // may be reused.
@@ -6952,6 +7261,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 }
 
 void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+  texture_transient_descriptor_set_reuse_cache_.clear();
+  current_texture_descriptor_set_hash_valid_[0] = false;
+  current_texture_descriptor_set_hash_valid_[1] = false;
+  draw_binding_state_valid_ = false;
+  texture_bindings_unchanged_this_draw_ = false;
   texture_transient_descriptor_sets_free_.clear();
   texture_transient_descriptor_sets_used_.clear();
   transient_descriptor_allocator_textures_.Reset();
@@ -8052,70 +8366,190 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // Fill the texture and sampler image infos. These are also the change
+  // detection key for descriptor set reuse, so they're gathered whenever the
+  // shaders use any textures or samplers, not only when writing.
+  bool have_vertex_textures = texture_count_vertex || sampler_count_vertex;
+  bool have_pixel_textures = texture_count_pixel || sampler_count_pixel;
+  // Fast path: IssueDraw established that this draw's shaders, samplers and
+  // texture binding views are identical to the previous draw's in this
+  // submission, and the recorded texture descriptor sets still hold valid
+  // values - keep them without regathering and rehashing the image infos.
+  const bool texture_descriptor_fast_path =
+      texture_bindings_unchanged_this_draw_ &&
+      REXCVAR_GET(vulkan_reuse_transient_texture_descriptors) &&
+      (!have_vertex_textures ||
+       (current_texture_descriptor_set_hash_valid_[0] &&
+        (current_graphics_descriptor_set_values_up_to_date_ &
+         (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex)))) &&
+      (!have_pixel_textures ||
+       (current_texture_descriptor_set_hash_valid_[1] &&
+        (current_graphics_descriptor_set_values_up_to_date_ &
+         (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel))));
+  size_t vertex_texture_image_info_offset = 0;
+  size_t vertex_sampler_image_info_offset = 0;
+  size_t pixel_texture_image_info_offset = 0;
+  size_t pixel_sampler_image_info_offset = 0;
+  if (!texture_descriptor_fast_path) {
+    descriptor_write_image_info_.clear();
+    descriptor_write_image_info_.reserve(
+        (have_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
+        (have_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+    vertex_texture_image_info_offset = descriptor_write_image_info_.size();
+    if (have_vertex_textures && texture_count_vertex) {
+      for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed));
+        descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
+                                                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_UNDEFINED;
+      }
+    }
+    vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
+    if (have_vertex_textures && sampler_count_vertex) {
+      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+           current_samplers_vertex_) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.sampler = sampler_pair.second;
+      }
+    }
+    pixel_texture_image_info_offset = descriptor_write_image_info_.size();
+    if (have_pixel_textures && texture_count_pixel) {
+      for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed));
+        descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
+                                                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_UNDEFINED;
+      }
+    }
+    pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
+    if (have_pixel_textures && sampler_count_pixel) {
+      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+           current_samplers_pixel_) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.sampler = sampler_pair.second;
+      }
+    }
+  }
+
+  // Texture/sampler descriptor set reuse (resolving the upstream
+  // "TODO(Triang3l): Reuse texture and sampler bindings if not changed"):
+  // hash the would-be contents, then either keep the currently recorded set,
+  // adopt a set written with identical contents earlier this frame, or fall
+  // through to allocating and writing a new one. The image info structs are
+  // value-initialized, so hashing only the meaningful fields is stable.
+  const bool reuse_texture_descriptor_sets =
+      REXCVAR_GET(vulkan_reuse_transient_texture_descriptors);
+  auto hash_texture_bindings = [](bool is_vertex, uint32_t texture_count, uint32_t sampler_count,
+                                  const VkDescriptorImageInfo* texture_image_info,
+                                  const VkDescriptorImageInfo* sampler_image_info) -> uint64_t {
+    XXH3_state_t hash_state;
+    XXH3_64bits_reset(&hash_state);
+    const uint32_t layout_dimensions[3] = {uint32_t(is_vertex), texture_count, sampler_count};
+    XXH3_64bits_update(&hash_state, layout_dimensions, sizeof(layout_dimensions));
+    for (uint32_t i = 0; i < texture_count; ++i) {
+      XXH3_64bits_update(&hash_state, &texture_image_info[i].imageView, sizeof(VkImageView));
+    }
+    for (uint32_t i = 0; i < sampler_count; ++i) {
+      XXH3_64bits_update(&hash_state, &sampler_image_info[i].sampler, sizeof(VkSampler));
+    }
+    return XXH3_64bits_digest(&hash_state);
+  };
+  // Indexed [0] = vertex, [1] = pixel.
+  uint64_t texture_descriptor_set_hashes[2] = {};
+  bool texture_descriptor_set_contents_current[2] = {};
+  VkDescriptorSet texture_descriptor_set_cached[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+  if (texture_descriptor_fast_path) {
+    // The recorded sets hold exactly this draw's contents; the stored hashes
+    // also remain accurate for later slow-path draws.
+    texture_descriptor_set_contents_current[0] = have_vertex_textures;
+    texture_descriptor_set_contents_current[1] = have_pixel_textures;
+  } else if (reuse_texture_descriptor_sets) {
+    if (have_vertex_textures) {
+      texture_descriptor_set_hashes[0] = hash_texture_bindings(
+          true, texture_count_vertex, sampler_count_vertex,
+          descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
+          descriptor_write_image_info_.data() + vertex_sampler_image_info_offset);
+      if (current_texture_descriptor_set_hash_valid_[0] &&
+          current_texture_descriptor_set_hashes_[0] == texture_descriptor_set_hashes[0]) {
+        texture_descriptor_set_contents_current[0] = true;
+      } else {
+        auto reuse_it =
+            texture_transient_descriptor_set_reuse_cache_.find(texture_descriptor_set_hashes[0]);
+        if (reuse_it != texture_transient_descriptor_set_reuse_cache_.end()) {
+          texture_descriptor_set_cached[0] = reuse_it->second;
+        }
+      }
+    }
+    if (have_pixel_textures) {
+      texture_descriptor_set_hashes[1] = hash_texture_bindings(
+          false, texture_count_pixel, sampler_count_pixel,
+          descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+          descriptor_write_image_info_.data() + pixel_sampler_image_info_offset);
+      if (current_texture_descriptor_set_hash_valid_[1] &&
+          current_texture_descriptor_set_hashes_[1] == texture_descriptor_set_hashes[1]) {
+        texture_descriptor_set_contents_current[1] = true;
+      } else {
+        auto reuse_it =
+            texture_transient_descriptor_set_reuse_cache_.find(texture_descriptor_set_hashes[1]);
+        if (reuse_it != texture_transient_descriptor_set_reuse_cache_.end()) {
+          texture_descriptor_set_cached[1] = reuse_it->second;
+        }
+      }
+    }
+  } else {
+    current_texture_descriptor_set_hash_valid_[0] = false;
+    current_texture_descriptor_set_hash_valid_[1] = false;
+  }
+
+  constexpr uint32_t kTexturesVertexBit = UINT32_C(1)
+                                          << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+  constexpr uint32_t kTexturesPixelBit = UINT32_C(1)
+                                         << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+  if (texture_descriptor_set_contents_current[0]) {
+    // The recorded set already holds these contents (also recovers the value
+    // validity if a previous draw failed after invalidating it).
+    current_graphics_descriptor_set_values_up_to_date_ |= kTexturesVertexBit;
+  } else if (texture_descriptor_set_cached[0] != VK_NULL_HANDLE) {
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
+        texture_descriptor_set_cached[0];
+    current_graphics_descriptor_set_values_up_to_date_ |= kTexturesVertexBit;
+    // A different set object must be rebound.
+    current_graphics_descriptor_sets_bound_up_to_date_ &= ~kTexturesVertexBit;
+    current_texture_descriptor_set_hashes_[0] = texture_descriptor_set_hashes[0];
+    current_texture_descriptor_set_hash_valid_[0] = true;
+  } else {
+    current_graphics_descriptor_set_values_up_to_date_ &= ~kTexturesVertexBit;
+  }
+  if (texture_descriptor_set_contents_current[1]) {
+    current_graphics_descriptor_set_values_up_to_date_ |= kTexturesPixelBit;
+  } else if (texture_descriptor_set_cached[1] != VK_NULL_HANDLE) {
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+        texture_descriptor_set_cached[1];
+    current_graphics_descriptor_set_values_up_to_date_ |= kTexturesPixelBit;
+    current_graphics_descriptor_sets_bound_up_to_date_ &= ~kTexturesPixelBit;
+    current_texture_descriptor_set_hashes_[1] = texture_descriptor_set_hashes[1];
+    current_texture_descriptor_set_hash_valid_[1] = true;
+  } else {
+    current_graphics_descriptor_set_values_up_to_date_ &= ~kTexturesPixelBit;
+  }
 
   // Make sure new descriptor sets are bound to the command buffer.
 
   current_graphics_descriptor_sets_bound_up_to_date_ &=
       current_graphics_descriptor_set_values_up_to_date_;
 
-  // Fill the texture and sampler write image infos.
-
   bool write_vertex_textures =
-      (texture_count_vertex || sampler_count_vertex) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+      have_vertex_textures &&
+      !(current_graphics_descriptor_set_values_up_to_date_ & kTexturesVertexBit);
   bool write_pixel_textures =
-      (texture_count_pixel || sampler_count_pixel) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-  descriptor_write_image_info_.clear();
-  descriptor_write_image_info_.reserve(
-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
-  size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && texture_count_vertex) {
-    for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
-      descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
-                                              ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                              : VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-  }
-  size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && sampler_count_vertex) {
-    for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
-         current_samplers_vertex_) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.sampler = sampler_pair.second;
-    }
-  }
-  size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && texture_count_pixel) {
-    for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
-      descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
-                                              ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                              : VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-  }
-  size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && sampler_count_pixel) {
-    for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
-         current_samplers_pixel_) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.sampler = sampler_pair.second;
-    }
-  }
+      have_pixel_textures &&
+      !(current_graphics_descriptor_set_values_up_to_date_ & kTexturesPixelBit);
 
   // Write the new descriptor sets.
 
@@ -8129,8 +8563,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   assert_not_zero(current_graphics_descriptor_set_values_up_to_date_ &
                   (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram));
   // Constant buffers.
-  if (!(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants))) {
+  if (constants_push_descriptors_used_) {
+    // The buffer infos are complete at this point; the descriptors themselves
+    // are pushed into the command buffer right before binding (where the
+    // bound-up-to-date bit, cleared above when any constant buffer was
+    // rewritten or by pipeline layout/command buffer changes, is checked).
+    current_graphics_descriptor_set_values_up_to_date_ |=
+        UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+  } else if (!(current_graphics_descriptor_set_values_up_to_date_ &
+               (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants))) {
     VkDescriptorSet constants_descriptor_set;
     if (!constants_transient_descriptors_free_.empty()) {
       constants_descriptor_set = constants_transient_descriptors_free_.back();
@@ -8207,6 +8648,26 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // Only make valid if all descriptor sets have been allocated and written
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
+  // Register the newly written texture sets for reuse by later draws in this
+  // frame. This must happen only after the vkUpdateDescriptorSets call - a
+  // set staged for writing but abandoned by an early return would otherwise
+  // be reused with undefined contents.
+  if (reuse_texture_descriptor_sets) {
+    if (write_vertex_textures) {
+      current_texture_descriptor_set_hashes_[0] = texture_descriptor_set_hashes[0];
+      current_texture_descriptor_set_hash_valid_[0] = true;
+      texture_transient_descriptor_set_reuse_cache_.emplace(
+          texture_descriptor_set_hashes[0],
+          current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex]);
+    }
+    if (write_pixel_textures) {
+      current_texture_descriptor_set_hashes_[1] = texture_descriptor_set_hashes[1];
+      current_texture_descriptor_set_hash_valid_[1] = true;
+      texture_transient_descriptor_set_reuse_cache_.emplace(
+          texture_descriptor_set_hashes[1],
+          current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel]);
+    }
+  }
 
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
@@ -8215,6 +8676,21 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   }
   if (!texture_count_pixel && !sampler_count_pixel) {
     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+  }
+  if (constants_push_descriptors_used_) {
+    // The constants set index uses push descriptors - record the push when
+    // its contents or the command buffer binding state changed, and exclude
+    // it from the regular vkCmdBindDescriptorSets ranges.
+    constexpr uint32_t kConstantsDescriptorBit =
+        UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+    if (!(current_graphics_descriptor_sets_bound_up_to_date_ & kConstantsDescriptorBit)) {
+      deferred_command_buffer_.CmdVkPushUniformBufferDescriptorSet(
+          VK_PIPELINE_BIND_POINT_GRAPHICS,
+          current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
+          SpirvShaderTranslator::kDescriptorSetConstants,
+          SpirvShaderTranslator::kConstantBufferCount, current_constant_buffer_infos_);
+      current_graphics_descriptor_sets_bound_up_to_date_ |= kConstantsDescriptorBit;
+    }
   }
   uint32_t descriptor_sets_remaining =
       descriptor_sets_needed & ~current_graphics_descriptor_sets_bound_up_to_date_;

@@ -725,6 +725,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     PERF_counter_add(kTextureBindingsChanged, changed_binding_count);
 #endif
+    ++texture_bindings_generation_;
     UpdateTextureBindingsImpl(bindings_changed);
   }
   DebugLogScaledTextureBindings(used_texture_mask);
@@ -835,6 +836,16 @@ bool TextureCache::DebugIsTeamProfileBackgroundCandidateKey(const TextureKey& ke
 bool TextureCache::DebugIsTeamProfileBackgroundTexture(const Texture& texture) const {
   const TextureKey& key = texture.key();
   if (!DebugIsTeamProfileBackgroundCandidateKey(key) || key.scaled_resolve) {
+    return false;
+  }
+  // Identifying the texture requires hashing up to 32 KB of guest memory, and
+  // candidate keys (128x256 DXT4_5) can be bound across many draws per frame.
+  // Never pay that cost unless one of the team-profile-background debug logs
+  // is armed. The draws cvar is defined in the Vulkan command processor, so it
+  // is read through the registry rather than REXCVAR_GET.
+  if (REXCVAR_GET(vulkan_debug_log_team_profile_background_candidates_remaining) <= 0 &&
+      REXCVAR_GET(vulkan_debug_log_team_profile_background_bindings_remaining) <= 0 &&
+      rex::cvar::Query<int32_t>("vulkan_debug_log_team_profile_background_draws_remaining") <= 0) {
     return false;
   }
   const uint8_t* data = shared_memory().DebugTranslatePhysical(key.base_page << 12);
@@ -1671,8 +1682,11 @@ void TextureCache::ResetTextureBindings(bool from_destructor) {
     bindings_reset |= UINT32_C(1) << i;
   }
   texture_bindings_in_sync_ &= ~bindings_reset;
-  if (!from_destructor && bindings_reset) {
-    UpdateTextureBindingsImpl(bindings_reset);
+  if (bindings_reset) {
+    ++texture_bindings_generation_;
+    if (!from_destructor) {
+      UpdateTextureBindingsImpl(bindings_reset);
+    }
   }
 }
 

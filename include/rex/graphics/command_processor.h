@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -306,6 +307,19 @@ class CommandProcessor {
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
 
  private:
+  // CPU-side frame attribution for the GPU emulation thread (gpu_cpu_profile
+  // cvar): manages the rex::perf::cpu_profile enable state and logs the
+  // per-bucket breakdown every kCpuProfileLogFrameInterval frames. Called once
+  // per guest frame from the XE_SWAP packet handler.
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  void CpuProfileOnFrameEnd();
+
+  static constexpr uint32_t kCpuProfileLogFrameInterval = 120;
+  uint32_t cpu_profile_frames_ = 0;
+  uint64_t cpu_profile_window_start_ticks_ = 0;
+  std::chrono::steady_clock::time_point cpu_profile_window_start_time_{};
+#endif
+
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;

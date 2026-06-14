@@ -1721,6 +1721,9 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     return false;
   }
   uint32_t descriptor_write_index = 0;
+  // Time the load dispatches for the GPU profile breakdown.
+  uint32_t gpu_timestamp_query =
+      command_processor_.BeginGpuTimestampedDraw(rex::perf::DrawBucket::kTextureUpload);
   command_processor_.SetExternalPipeline(pipeline);
   command_list.D3DSetComputeRootSignature(load_root_signature_.Get());
   // Set up the destination descriptor.
@@ -1782,6 +1785,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
           is_base ? d3d12_texture.GetGuestBaseSize() : d3d12_texture.GetGuestMipsSize();
       if (!MakeScaledResolveRangeCurrent(guest_address, guest_size_unscaled,
                                          load_shader_info.source_bpe_log2)) {
+        command_processor_.EndGpuTimestampedDraw(gpu_timestamp_query);
         command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
         return false;
       }
@@ -1932,6 +1936,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       location_source.PlacedFootprint.Offset += host_slice_size;
     }
   }
+
+  command_processor_.EndGpuTimestampedDraw(gpu_timestamp_query);
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 

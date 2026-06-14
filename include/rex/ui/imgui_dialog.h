@@ -39,6 +39,14 @@ class ImGuiDialog {
 
   void Draw();
 
+  // Whether the dialog needs the UI to repaint continuously while it's open
+  // (interactive dialogs - input handling, animations). Passive readouts
+  // should return false so they only repaint when something else (such as a
+  // new guest output frame) triggers a paint - a continuous repaint loop
+  // presents without new guest frames, inflating externally measured FPS and
+  // burning CPU/GPU.
+  virtual bool WantsContinuousRepaint() const { return true; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

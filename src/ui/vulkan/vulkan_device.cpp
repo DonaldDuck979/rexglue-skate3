@@ -25,6 +25,12 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_robust_buffer_access, true, "UI/Vulkan",
+                    "Enable robustBufferAccess (bounds checking on all shader buffer accesses, "
+                    "including the per-vertex guest memory fetches). Disabling can improve GPU "
+                    "performance but out-of-bounds accesses from invalid guest fetch constants "
+                    "then return undefined data and may crash the GPU - experimental")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
@@ -218,6 +224,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1, 2)
     // #70. Must be enabled for VK_KHR_sampler_ycbcr_conversion.
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance1, 1, 1)
+    // #81. Used for guest draw constant buffer descriptors.
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_push_descriptor)
     // #141.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
     // #148.
@@ -613,6 +621,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxViewportDimensions[1])
   XE_UI_VULKAN_LIMIT(minUniformBufferOffsetAlignment)
   XE_UI_VULKAN_LIMIT(minStorageBufferOffsetAlignment)
+  XE_UI_VULKAN_LIMIT(maxTexelBufferElements)
+  XE_UI_VULKAN_LIMIT(minTexelBufferOffsetAlignment)
   XE_UI_VULKAN_LIMIT(maxFramebufferWidth)
   XE_UI_VULKAN_LIMIT(maxFramebufferHeight)
   XE_UI_VULKAN_ENUM_LIMIT(framebufferColorSampleCounts, SampleCountFlags)
@@ -632,6 +642,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   if (with_gpu_emulation) {
     XE_UI_VULKAN_FEATURE(robustBufferAccess)
+    if (!REXCVAR_GET(vulkan_robust_buffer_access)) {
+      enabled_features.robustBufferAccess = VK_FALSE;
+      device->properties_.robustBufferAccess = VK_FALSE;
+      REXLOG_INFO("* robustBufferAccess disabled by vulkan_robust_buffer_access=false");
+    }
     XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
     XE_UI_VULKAN_FEATURE(independentBlend)
     XE_UI_VULKAN_FEATURE(geometryShader)
@@ -805,6 +820,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+  }
+  if (device->extensions_.ext_KHR_push_descriptor) {
+#include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

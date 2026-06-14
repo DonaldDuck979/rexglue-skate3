@@ -41,11 +41,24 @@ REXCVAR_DEFINE_BOOL(vulkan_scaled_resolve_write_barrier_overlap_only, false, "GP
                     "not overlap")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(vulkan_debug_log_3d_as_2d_remaining, 256, "GPU/Vulkan",
+REXCVAR_DEFINE_INT32(vulkan_debug_log_3d_as_2d_remaining, 0, "GPU/Vulkan",
                      "Log scaled 3D-as-2D texture wrapper usage")
     .range(0, 10000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
+
+REXCVAR_DEFINE_BOOL(vulkan_texel_buffer_texture_loads, true, "GPU/Vulkan",
+                    "Read guest texture data through uniform texel buffers instead of raw "
+                    "storage buffer loads where a texel-buffer variant of the load shader is "
+                    "available - much faster for the tiled access pattern on some hosts")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_storage_image_texture_loads, true, "GPU/Vulkan",
+                    "Write guest texture data directly from the load shader through a storage "
+                    "image where a variant of the load shader is available, instead of going "
+                    "through an intermediate buffer and a buffer-to-image copy - the copy is "
+                    "several times slower than device bandwidth on some hosts")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -124,6 +137,235 @@ namespace {
 // descriptors, which force all sampled channels to 0.
 constexpr VkFormat kInvalidTextureFetchFallbackFormat = VK_FORMAT_R8G8B8A8_UNORM;
 const VkClearColorValue kInvalidTextureFetchFallbackColor = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+// Texel-buffer-source port of texture_load_32bpb_scaled_cs. The body is an
+// exact transcription of the spirv-cross decompilation of the shipped SPIR-V
+// (only variables renamed and the source storage buffer reads replaced with
+// texelFetch from an RGBA32_UINT uniform texel buffer, which is an identical
+// uvec4 per element). The push constant block matches LoadConstants.
+// Storage-image-destination port of texture_load_32bpb_scaled_cs: the same
+// transcription, but the destination is written directly to mip 0 of the
+// texture through an R32_UINT storage image view (one packed 32bpp texel per
+// store, byte-identical to the buffer path plus buffer-to-image copy), with
+// explicit bounds checks replacing the padded destination buffer pitch. Host
+// pitch and offset constants are ignored. 2D, single-level, single-layer
+// textures only.
+const char kTextureLoad32bpbScaledStorageDestShaderSource[] = R"(#version 450
+layout(local_size_x = 4, local_size_y = 32, local_size_z = 1) in;
+layout(set = 1, binding = 0, std430) readonly buffer XeTextureLoadSource {
+  uvec4 data[];
+} xe_src;
+layout(set = 0, binding = 0, r32ui) uniform writeonly uimage2D xe_dest;
+layout(push_constant, std430) uniform XeTextureLoadConstants {
+  uint info;
+  uint guest_offset;
+  uint guest_pitch_aligned;
+  uint guest_z_stride_block_rows_aligned;
+  uvec3 size_blocks;
+  uint host_offset;
+  uint host_pitch;
+  uint height_texels;
+} xe;
+void main() {
+  uint endian = (xe.info >> 2u) & 3u;
+  uvec2 scale = (uvec2(xe.info) >> uvec2(4u, 7u)) & uvec2(7u);
+  uvec3 block_index = gl_GlobalInvocationID << uvec3(3u, 0u, 0u);
+  if (any(greaterThanEqual(block_index.xy, xe.size_blocks.xy))) {
+    return;
+  }
+  uint block_x = block_index.x;
+  uint block_x_div_4 = block_x >> 2u;
+  uvec2 block_xy_div_scale_pre = uvec2(block_x_div_4, block_index.y);
+  uvec2 block_xy_unscaled = block_xy_div_scale_pre / scale;
+  uvec3 guest_block = uvec3(block_xy_unscaled.x << 2u, block_xy_unscaled.y, block_index.z);
+  uint guest_block_offset;
+  if ((xe.info & 2u) != 0u) {
+    ivec3 b = ivec3(guest_block);
+    int by = b.y;
+    int bz = b.z;
+    int bz_div_4 = bz >> 2;
+    int bx = b.x;
+    int t0 = (((bx & 7) + ((by & 6) << 2)) << int(8u)) >> 6;
+    int t1 = ((by >> 3) + bz_div_4) & 1;
+    int t2 = t1 + ((((bx >> 3) + (t1 << 1)) & 3) << 1);
+    int t3 = (((((((((bx >> 5) +
+                     (((by >> 4) + (bz_div_4 * int(xe.guest_z_stride_block_rows_aligned >> 4u))) *
+                      int(xe.guest_pitch_aligned >> 5u))) << int(8u)) & 268435455) << 1) +
+                 (t0 & (-16))) << 1) + (t0 & 15)) + ((bz & 3) << int(8u))) + ((by & 1) << 4);
+    guest_block_offset =
+        uint(((((((((t2 & 1) << 3) + ((t3 >> 6) & 7)) << 3) + (t2 & (-2))) << 2) +
+              (t3 & (-512))) << 3) + (t3 & 63));
+  } else {
+    ivec2 b = ivec2(guest_block.xy);
+    int bx = b.x;
+    int by = b.y;
+    int t0 = ((bx & 7) + ((by & 14) << 2)) << int(2u);
+    int t1 = (((((bx >> 5) + ((by >> 5) * int(xe.guest_pitch_aligned >> 5u))) << int(9u)) +
+               ((t0 & (-16)) << 1)) + (t0 & 15)) + ((by & 1) << 4);
+    guest_block_offset =
+        uint((((((t1 & (-512)) << 3) + ((by & 16) << 7)) + ((t1 & 448) << 2)) +
+              (((((by & 8) >> 2) + (bx >> 3)) & 3) << 6)) + (t1 & 63));
+  }
+  uvec2 scale_remainder = block_xy_div_scale_pre - (block_xy_unscaled * scale);
+  uint scale_x = scale.x;
+  uint scale_y = scale.y;
+  uint source_index =
+      (xe.guest_offset +
+       ((guest_block_offset * (scale_x * scale_y)) +
+        (((((scale_remainder.x * scale_y) + scale_remainder.y) << 2u) + (block_x & 3u))
+         << 2u))) >> 4u;
+  bool endian_8in16 = endian == 2u;
+  bool endian_swap_8 = (endian == 1u) || endian_8in16;
+  bool endian_swap_16 = endian_8in16 || (endian == 3u);
+  uvec4 value_0 = xe_src.data[source_index];
+  if (endian_swap_8) {
+    value_0 = ((value_0 & uvec4(16711935u)) << uvec4(8u)) |
+              ((value_0 & uvec4(4278255360u)) >> uvec4(8u));
+  }
+  if (endian_swap_16) {
+    value_0 = (value_0 << uvec4(16u)) | (value_0 >> uvec4(16u));
+  }
+  int dest_y = int(block_index.y);
+  for (uint j = 0u; j < 4u; ++j) {
+    uint dest_x = block_x + j;
+    if (dest_x < xe.size_blocks.x) {
+      imageStore(xe_dest, ivec2(int(dest_x), dest_y), uvec4(value_0[j], 0u, 0u, 0u));
+    }
+  }
+  uint second_advance_bytes;
+  if (scale_x > 1u) {
+    uint x_unscaled_remainder = block_x_div_4 - ((block_x_div_4 / scale_x) * scale_x);
+    if ((x_unscaled_remainder + 1u) == scale_x) {
+      second_advance_bytes = (32u * scale_x) - (x_unscaled_remainder << 4u);
+    } else {
+      second_advance_bytes = 16u;
+    }
+  } else {
+    second_advance_bytes = 32u;
+  }
+  uint source_index_1 = source_index + ((second_advance_bytes * scale_y) >> 4u);
+  uvec4 value_1 = xe_src.data[source_index_1];
+  if (endian_swap_8) {
+    value_1 = ((value_1 & uvec4(16711935u)) << uvec4(8u)) |
+              ((value_1 & uvec4(4278255360u)) >> uvec4(8u));
+  }
+  if (endian_swap_16) {
+    value_1 = (value_1 << uvec4(16u)) | (value_1 >> uvec4(16u));
+  }
+  for (uint j = 0u; j < 4u; ++j) {
+    uint dest_x = block_x + 4u + j;
+    if (dest_x < xe.size_blocks.x) {
+      imageStore(xe_dest, ivec2(int(dest_x), dest_y), uvec4(value_1[j], 0u, 0u, 0u));
+    }
+  }
+}
+)";
+
+const char kTextureLoad32bpbScaledTexelBufferShaderSource[] = R"(#version 450
+layout(local_size_x = 4, local_size_y = 32, local_size_z = 1) in;
+layout(set = 1, binding = 0) uniform utextureBuffer xe_src;
+layout(set = 0, binding = 0, std430) writeonly buffer XeTextureLoadDest {
+  uvec4 data[];
+} xe_dest;
+layout(push_constant, std430) uniform XeTextureLoadConstants {
+  uint info;
+  uint guest_offset;
+  uint guest_pitch_aligned;
+  uint guest_z_stride_block_rows_aligned;
+  uvec3 size_blocks;
+  uint host_offset;
+  uint host_pitch;
+  uint height_texels;
+} xe;
+void main() {
+  uint endian = (xe.info >> 2u) & 3u;
+  uvec2 scale = (uvec2(xe.info) >> uvec2(4u, 7u)) & uvec2(7u);
+  uvec3 block_index = gl_GlobalInvocationID << uvec3(3u, 0u, 0u);
+  if (any(greaterThanEqual(block_index.xy, xe.size_blocks.xy))) {
+    return;
+  }
+  ivec3 block_index_int = ivec3(block_index);
+  uint dest_index =
+      (uint((block_index_int.x * 4) +
+            (((block_index_int.z * int(xe.size_blocks.y)) + block_index_int.y) *
+             int(xe.host_pitch))) +
+       xe.host_offset) >> 4u;
+  uint block_x = block_index.x;
+  uint block_x_div_4 = block_x >> 2u;
+  uvec2 block_xy_div_scale_pre = uvec2(block_x_div_4, block_index.y);
+  uvec2 block_xy_unscaled = block_xy_div_scale_pre / scale;
+  uvec3 guest_block = uvec3(block_xy_unscaled.x << 2u, block_xy_unscaled.y, block_index.z);
+  uint guest_block_offset;
+  if ((xe.info & 2u) != 0u) {
+    ivec3 b = ivec3(guest_block);
+    int by = b.y;
+    int bz = b.z;
+    int bz_div_4 = bz >> 2;
+    int bx = b.x;
+    int t0 = (((bx & 7) + ((by & 6) << 2)) << int(8u)) >> 6;
+    int t1 = ((by >> 3) + bz_div_4) & 1;
+    int t2 = t1 + ((((bx >> 3) + (t1 << 1)) & 3) << 1);
+    int t3 = (((((((((bx >> 5) +
+                     (((by >> 4) + (bz_div_4 * int(xe.guest_z_stride_block_rows_aligned >> 4u))) *
+                      int(xe.guest_pitch_aligned >> 5u))) << int(8u)) & 268435455) << 1) +
+                 (t0 & (-16))) << 1) + (t0 & 15)) + ((bz & 3) << int(8u))) + ((by & 1) << 4);
+    guest_block_offset =
+        uint(((((((((t2 & 1) << 3) + ((t3 >> 6) & 7)) << 3) + (t2 & (-2))) << 2) +
+              (t3 & (-512))) << 3) + (t3 & 63));
+  } else {
+    ivec2 b = ivec2(guest_block.xy);
+    int bx = b.x;
+    int by = b.y;
+    int t0 = ((bx & 7) + ((by & 14) << 2)) << int(2u);
+    int t1 = (((((bx >> 5) + ((by >> 5) * int(xe.guest_pitch_aligned >> 5u))) << int(9u)) +
+               ((t0 & (-16)) << 1)) + (t0 & 15)) + ((by & 1) << 4);
+    guest_block_offset =
+        uint((((((t1 & (-512)) << 3) + ((by & 16) << 7)) + ((t1 & 448) << 2)) +
+              (((((by & 8) >> 2) + (bx >> 3)) & 3) << 6)) + (t1 & 63));
+  }
+  uvec2 scale_remainder = block_xy_div_scale_pre - (block_xy_unscaled * scale);
+  uint scale_x = scale.x;
+  uint scale_y = scale.y;
+  uint source_index =
+      (xe.guest_offset +
+       ((guest_block_offset * (scale_x * scale_y)) +
+        (((((scale_remainder.x * scale_y) + scale_remainder.y) << 2u) + (block_x & 3u))
+         << 2u))) >> 4u;
+  bool endian_8in16 = endian == 2u;
+  bool endian_swap_8 = (endian == 1u) || endian_8in16;
+  uvec4 value_0 = texelFetch(xe_src, int(source_index));
+  if (endian_swap_8) {
+    value_0 = ((value_0 & uvec4(16711935u)) << uvec4(8u)) |
+              ((value_0 & uvec4(4278255360u)) >> uvec4(8u));
+  }
+  bool endian_swap_16 = endian_8in16 || (endian == 3u);
+  if (endian_swap_16) {
+    value_0 = (value_0 << uvec4(16u)) | (value_0 >> uvec4(16u));
+  }
+  xe_dest.data[dest_index] = value_0;
+  uint second_advance_bytes;
+  if (scale_x > 1u) {
+    uint x_unscaled_remainder = block_x_div_4 - ((block_x_div_4 / scale_x) * scale_x);
+    if ((x_unscaled_remainder + 1u) == scale_x) {
+      second_advance_bytes = (32u * scale_x) - (x_unscaled_remainder << 4u);
+    } else {
+      second_advance_bytes = 16u;
+    }
+  } else {
+    second_advance_bytes = 32u;
+  }
+  uint source_index_1 = source_index + ((second_advance_bytes * scale_y) >> 4u);
+  uvec4 value_1 = texelFetch(xe_src, int(source_index_1));
+  if (endian_swap_8) {
+    value_1 = ((value_1 & uvec4(16711935u)) << uvec4(8u)) |
+              ((value_1 & uvec4(4278255360u)) >> uvec4(8u));
+  }
+  if (endian_swap_16) {
+    value_1 = (value_1 << uvec4(16u)) | (value_1 >> uvec4(16u));
+  }
+  xe_dest.data[dest_index + 1u] = value_1;
+}
+)";
 
 }  // namespace
 
@@ -502,10 +744,49 @@ VulkanTextureCache::~VulkanTextureCache() {
   if (load_pipeline_layout_ != VK_NULL_HANDLE) {
     dfn.vkDestroyPipelineLayout(device, load_pipeline_layout_, nullptr);
   }
+  for (VkPipeline load_pipeline : load_pipelines_scaled_texel_) {
+    if (load_pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, load_pipeline, nullptr);
+    }
+  }
+  load_pipelines_scaled_texel_.fill(VK_NULL_HANDLE);
+  load_pipelines_scaled_texel_attempted_.fill(false);
+  for (const auto& binding_pair : load_source_texel_bindings_) {
+    dfn.vkDestroyBufferView(device, binding_pair.second.buffer_view, nullptr);
+  }
+  load_source_texel_bindings_.clear();
+  load_source_texel_descriptor_set_pool_.reset();
+  if (load_pipeline_layout_texel_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineLayout(device, load_pipeline_layout_texel_, nullptr);
+    load_pipeline_layout_texel_ = VK_NULL_HANDLE;
+  }
+  if (load_descriptor_set_layout_source_texel_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorSetLayout(device, load_descriptor_set_layout_source_texel_, nullptr);
+    load_descriptor_set_layout_source_texel_ = VK_NULL_HANDLE;
+  }
+  for (VkPipeline load_pipeline : load_pipelines_scaled_storage_dest_) {
+    if (load_pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, load_pipeline, nullptr);
+    }
+  }
+  load_pipelines_scaled_storage_dest_.fill(VK_NULL_HANDLE);
+  load_pipelines_scaled_storage_dest_attempted_.fill(false);
+  if (load_pipeline_layout_storage_dest_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineLayout(device, load_pipeline_layout_storage_dest_, nullptr);
+    load_pipeline_layout_storage_dest_ = VK_NULL_HANDLE;
+  }
 
   // Textures memory is allocated using the Vulkan Memory Allocator, destroy all
-  // textures before destroying VMA.
+  // textures before destroying VMA. The texture destructors release their
+  // storage destination descriptor sets, so the pool and its set layout must
+  // still be alive here.
   DestroyAllTextures(true);
+
+  load_dest_storage_descriptor_set_pool_.reset();
+  if (load_descriptor_set_layout_dest_storage_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorSetLayout(device, load_descriptor_set_layout_dest_storage_, nullptr);
+    load_descriptor_set_layout_dest_storage_ = VK_NULL_HANDLE;
+  }
 
   if (vma_allocator_ != VK_NULL_HANDLE) {
     vmaDestroyAllocator(vma_allocator_);
@@ -1179,12 +1460,36 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   bool is_3d = key.dimension == xenos::DataDimension::k3D;
   uint32_t depth_or_array_size = key.GetDepthOrArraySize();
 
+  // Whether to create the image with storage usage and an R32_UINT view
+  // format, so the load shaders can write it directly (32-bit uncompressed
+  // host formats of 2D single-layer textures only).
+  bool storage_capable = false;
+  if (!is_3d && key.dimension != xenos::DataDimension::kCube && depth_or_array_size == 1) {
+    switch (formats[0]) {
+      case VK_FORMAT_R8G8B8A8_UNORM:
+      case VK_FORMAT_B8G8R8A8_UNORM:
+      case VK_FORMAT_R8G8B8A8_UINT:
+      case VK_FORMAT_R16G16_UNORM:
+      case VK_FORMAT_R16G16_SNORM:
+      case VK_FORMAT_R16G16_SFLOAT:
+      case VK_FORMAT_R16G16_UINT:
+      case VK_FORMAT_R32_SFLOAT:
+      case VK_FORMAT_R32_UINT:
+      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        storage_capable = true;
+        break;
+      default:
+        break;
+    }
+  }
+
   VkImageCreateInfo image_create_info;
   VkImageCreateInfo* image_create_info_last = &image_create_info;
   image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_create_info.pNext = nullptr;
   image_create_info.flags = 0;
-  if (formats[1] != VK_FORMAT_UNDEFINED) {
+  if (formats[1] != VK_FORMAT_UNDEFINED || storage_capable) {
     image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
   }
   if (key.dimension == xenos::DataDimension::kCube) {
@@ -1204,19 +1509,29 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  if (storage_capable) {
+    image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkFormat view_formats[3] = {formats[0], VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+  uint32_t view_format_count = 1;
+  if (formats[1] != VK_FORMAT_UNDEFINED) {
+    view_formats[view_format_count++] = formats[1];
+  }
+  if (storage_capable) {
+    view_formats[view_format_count++] = VK_FORMAT_R32_UINT;
+  }
   VkImageFormatListCreateInfo image_format_list_create_info;
-  if (formats[1] != VK_FORMAT_UNDEFINED &&
-      vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
+  if (view_format_count > 1 && vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
     image_create_info_last->pNext = &image_format_list_create_info;
     image_create_info_last = reinterpret_cast<VkImageCreateInfo*>(&image_format_list_create_info);
     image_format_list_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
     image_format_list_create_info.pNext = nullptr;
-    image_format_list_create_info.viewFormatCount = 2;
-    image_format_list_create_info.pViewFormats = formats;
+    image_format_list_create_info.viewFormatCount = view_format_count;
+    image_format_list_create_info.pViewFormats = view_formats;
   }
 
   VmaAllocationCreateInfo allocation_create_info = {};
@@ -1229,7 +1544,9 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     return nullptr;
   }
 
-  return std::unique_ptr<Texture>(new VulkanTexture(*this, key, image, allocation));
+  VulkanTexture* vulkan_texture = new VulkanTexture(*this, key, image, allocation);
+  vulkan_texture->SetImageStorageCapable(storage_capable);
+  return std::unique_ptr<Texture>(vulkan_texture);
 }
 
 bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
@@ -1256,6 +1573,8 @@ const char* VulkanTextureCache::DebugVulkanTextureUsageName(VulkanTexture::Usage
       return "undefined";
     case VulkanTexture::Usage::kTransferDestination:
       return "transfer-dst";
+    case VulkanTexture::Usage::kStorageWrite:
+      return "storage-write";
     case VulkanTexture::Usage::kGuestShaderSampled:
       return "guest-sampled";
     case VulkanTexture::Usage::kSwapSampled:
@@ -1302,6 +1621,145 @@ void VulkanTextureCache::DebugLogTeamProfileBackgroundGpuEvent(
       uint32_t(signed_format), host_format_pair.swizzle);
 }
 
+VkPipeline VulkanTextureCache::GetLoadPipelineScaledTexelBuffer(LoadShaderIndex load_shader) {
+  if (load_pipeline_layout_texel_ == VK_NULL_HANDLE || !load_source_texel_descriptor_set_pool_) {
+    return VK_NULL_HANDLE;
+  }
+  if (load_pipelines_scaled_texel_attempted_[load_shader]) {
+    return load_pipelines_scaled_texel_[load_shader];
+  }
+  load_pipelines_scaled_texel_attempted_[load_shader] = true;
+
+  const char* source = nullptr;
+  switch (load_shader) {
+    case kLoadShaderIndex32bpb:
+      source = kTextureLoad32bpbScaledTexelBufferShaderSource;
+      break;
+    default:
+      return VK_NULL_HANDLE;
+  }
+
+  std::vector<uint32_t> spirv;
+  std::string compile_error;
+  if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source, spirv,
+                                             compile_error)) {
+    REXGPU_WARN(
+        "VulkanTextureCache: Failed to compile the texel-buffer load shader (index {}): {}",
+        uint32_t(load_shader), compile_error);
+    return VK_NULL_HANDLE;
+  }
+  VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
+      command_processor_.GetVulkanDevice(), load_pipeline_layout_texel_, spirv.data(),
+      sizeof(uint32_t) * spirv.size());
+  if (pipeline == VK_NULL_HANDLE) {
+    REXGPU_WARN("VulkanTextureCache: Failed to create the texel-buffer load pipeline (index {})",
+                uint32_t(load_shader));
+  } else {
+    REXGPU_INFO("VulkanTextureCache: Texel-buffer load pipeline created (index {})",
+                uint32_t(load_shader));
+  }
+  load_pipelines_scaled_texel_[load_shader] = pipeline;
+  return pipeline;
+}
+
+VkPipeline VulkanTextureCache::GetLoadPipelineScaledStorageDest(LoadShaderIndex load_shader) {
+  if (load_pipeline_layout_storage_dest_ == VK_NULL_HANDLE ||
+      !load_dest_storage_descriptor_set_pool_) {
+    return VK_NULL_HANDLE;
+  }
+  if (load_pipelines_scaled_storage_dest_attempted_[load_shader]) {
+    return load_pipelines_scaled_storage_dest_[load_shader];
+  }
+  load_pipelines_scaled_storage_dest_attempted_[load_shader] = true;
+
+  const char* source = nullptr;
+  switch (load_shader) {
+    case kLoadShaderIndex32bpb:
+      source = kTextureLoad32bpbScaledStorageDestShaderSource;
+      break;
+    default:
+      return VK_NULL_HANDLE;
+  }
+
+  std::vector<uint32_t> spirv;
+  std::string compile_error;
+  if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source, spirv,
+                                             compile_error)) {
+    REXGPU_WARN(
+        "VulkanTextureCache: Failed to compile the storage-image load shader (index {}): {}",
+        uint32_t(load_shader), compile_error);
+    return VK_NULL_HANDLE;
+  }
+  VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
+      command_processor_.GetVulkanDevice(), load_pipeline_layout_storage_dest_, spirv.data(),
+      sizeof(uint32_t) * spirv.size());
+  if (pipeline == VK_NULL_HANDLE) {
+    REXGPU_WARN("VulkanTextureCache: Failed to create the storage-image load pipeline (index {})",
+                uint32_t(load_shader));
+  } else {
+    REXGPU_INFO("VulkanTextureCache: Storage-image load pipeline created (index {})",
+                uint32_t(load_shader));
+  }
+  load_pipelines_scaled_storage_dest_[load_shader] = pipeline;
+  return pipeline;
+}
+
+VkDescriptorSet VulkanTextureCache::GetLoadSourceTexelBufferDescriptorSet(VkBuffer buffer,
+                                                                          VkDeviceSize offset,
+                                                                          VkDeviceSize range) {
+  if (!load_source_texel_descriptor_set_pool_) {
+    return VK_NULL_HANDLE;
+  }
+  auto key = std::make_tuple(uint64_t(reinterpret_cast<uintptr_t>(buffer)), uint64_t(offset),
+                             uint64_t(range));
+  auto it = load_source_texel_bindings_.find(key);
+  if (it != load_source_texel_bindings_.end()) {
+    return load_source_texel_descriptor_set_pool_->Get(it->second.descriptor_set_index);
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkBufferViewCreateInfo buffer_view_create_info;
+  buffer_view_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+  buffer_view_create_info.pNext = nullptr;
+  buffer_view_create_info.flags = 0;
+  buffer_view_create_info.buffer = buffer;
+  buffer_view_create_info.format = VK_FORMAT_R32G32B32A32_UINT;
+  buffer_view_create_info.offset = offset;
+  buffer_view_create_info.range = range;
+  VkBufferView buffer_view;
+  if (dfn.vkCreateBufferView(device, &buffer_view_create_info, nullptr, &buffer_view) !=
+      VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  size_t descriptor_set_index = load_source_texel_descriptor_set_pool_->Allocate();
+  if (descriptor_set_index == SIZE_MAX) {
+    dfn.vkDestroyBufferView(device, buffer_view, nullptr);
+    return VK_NULL_HANDLE;
+  }
+  VkDescriptorSet descriptor_set =
+      load_source_texel_descriptor_set_pool_->Get(descriptor_set_index);
+  VkWriteDescriptorSet write_descriptor_set;
+  write_descriptor_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write_descriptor_set.pNext = nullptr;
+  write_descriptor_set.dstSet = descriptor_set;
+  write_descriptor_set.dstBinding = 0;
+  write_descriptor_set.dstArrayElement = 0;
+  write_descriptor_set.descriptorCount = 1;
+  write_descriptor_set.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+  write_descriptor_set.pImageInfo = nullptr;
+  write_descriptor_set.pBufferInfo = nullptr;
+  write_descriptor_set.pTexelBufferView = &buffer_view;
+  dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set, 0, nullptr);
+
+  LoadSourceTexelBinding& binding = load_source_texel_bindings_[key];
+  binding.buffer_view = buffer_view;
+  binding.descriptor_set_index = descriptor_set_index;
+  return descriptor_set;
+}
+
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
@@ -1326,6 +1784,14 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                    : load_pipelines_[load_shader];
   if (pipeline == VK_NULL_HANDLE) {
     return false;
+  }
+  // Prefer the texel-buffer-source variant where available - reading the
+  // source through the texture path is much faster for the tiled access
+  // pattern on some hosts. Falls back to the storage buffer pipeline if the
+  // source ranges can't be expressed as texel buffer views.
+  VkPipeline pipeline_texel = VK_NULL_HANDLE;
+  if (texture_key.scaled_resolve && REXCVAR_GET(vulkan_texel_buffer_texture_loads)) {
+    pipeline_texel = GetLoadPipelineScaledTexelBuffer(load_shader);
   }
   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
   LoadShaderIndex load_shader_float_convert = kLoadShaderIndexUnknown;
@@ -1469,15 +1935,60 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VulkanSharedMemory& vulkan_shared_memory = static_cast<VulkanSharedMemory&>(shared_memory());
+
+  // Storage-image destination fast path: write the texture directly from the
+  // load shader, skipping the copy buffer and the buffer-to-image copy (much
+  // slower than device bandwidth on some hosts). 2D single-layer single-level
+  // unpacked textures with 32-bit-class host formats only.
+  VkPipeline pipeline_storage_dest = VK_NULL_HANDLE;
+  VkDescriptorSet descriptor_set_dest_storage = VK_NULL_HANDLE;
+  if (texture_key.scaled_resolve && REXCVAR_GET(vulkan_storage_image_texture_loads)) {
+    static int storage_dest_fallback_logs_remaining = 8;
+    auto log_storage_fallback = [&](const char* reason) {
+      if (storage_dest_fallback_logs_remaining > 0) {
+        --storage_dest_fallback_logs_remaining;
+        REXGPU_INFO(
+            "VulkanTextureCache: storage-image load fallback ({}): load_shader={}, "
+            "storage_capable={}, levels={}..{}, packed={}, array={}, {} more logs",
+            reason, uint32_t(load_shader), vulkan_texture.image_storage_capable(), level_first,
+            level_last, level_packed, array_size, storage_dest_fallback_logs_remaining);
+      }
+    };
+    if (!vulkan_texture.image_storage_capable()) {
+      log_storage_fallback("image-not-storage-capable");
+    } else if (level_first != 0 || level_last != 0 || level_packed == 0) {
+      log_storage_fallback("levels");
+    } else if (array_size != 1) {
+      log_storage_fallback("array");
+    } else {
+      pipeline_storage_dest = GetLoadPipelineScaledStorageDest(load_shader);
+      if (pipeline_storage_dest != VK_NULL_HANDLE) {
+        descriptor_set_dest_storage = vulkan_texture.GetStorageDescriptorSet();
+        if (descriptor_set_dest_storage == VK_NULL_HANDLE) {
+          log_storage_fallback("storage-binding");
+          pipeline_storage_dest = VK_NULL_HANDLE;
+        }
+      } else {
+        log_storage_fallback("no-shader-variant");
+      }
+    }
+  }
+  const bool use_storage_dest = pipeline_storage_dest != VK_NULL_HANDLE;
+  if (use_storage_dest) {
+    // The texel-buffer source variant uses a different pipeline layout.
+    pipeline_texel = VK_NULL_HANDLE;
+  }
+
   std::array<VkWriteDescriptorSet, 3> write_descriptor_sets;
   uint32_t write_descriptor_set_count = 0;
-  VkDescriptorSet descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
-      VulkanCommandProcessor::SingleTransientDescriptorLayout ::kStorageBufferCompute);
-  if (!descriptor_set_dest) {
-    return false;
-  }
+  VkDescriptorSet descriptor_set_dest = descriptor_set_dest_storage;
   VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
-  {
+  if (!use_storage_dest) {
+    descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
+        VulkanCommandProcessor::SingleTransientDescriptorLayout ::kStorageBufferCompute);
+    if (!descriptor_set_dest) {
+      return false;
+    }
     write_descriptor_set_dest_buffer_info.buffer = scratch_buffer;
     write_descriptor_set_dest_buffer_info.offset = 0;
     write_descriptor_set_dest_buffer_info.range = host_buffer_size;
@@ -1508,7 +2019,73 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   uint64_t debug_source_base_range = 0;
   uint64_t debug_source_mips_start = 0;
   uint64_t debug_source_mips_range = 0;
-  if (level_first == 0) {
+  // Extra byte offsets folded into the guest offset constant when the texel
+  // buffer view had to start earlier than the source range for alignment.
+  uint32_t source_base_texel_extra_offset = 0;
+  uint32_t source_mips_texel_extra_offset = 0;
+  if (pipeline_texel != VK_NULL_HANDLE) {
+    // Try to set up texel buffer views of the source ranges; on any failure,
+    // use the storage buffer pipeline for this load.
+    const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
+    VkDeviceSize texel_offset_alignment =
+        std::max(device_properties.minTexelBufferOffsetAlignment, VkDeviceSize(16));
+    uint64_t max_view_bytes = uint64_t(device_properties.maxTexelBufferElements) * 16;
+    auto acquire_texel_source = [&](uint32_t start_unscaled, uint32_t guest_size,
+                                    VkDescriptorSet& descriptor_set_out,
+                                    uint32_t& extra_offset_out) -> bool {
+      uint64_t source_start;
+      uint64_t source_range;
+      VkBuffer source_buffer;
+      if (texture_key.scaled_resolve) {
+        if (!GetScaledResolveRange(start_unscaled, guest_size, load_shader_info.source_bpe_log2,
+                                   source_start, source_range)) {
+          return false;
+        }
+        source_buffer = scaled_resolve_buffer_;
+      } else {
+        source_start = start_unscaled;
+        source_range = rex::align(uint64_t(guest_size), uint64_t(source_length_alignment));
+        if (source_range > uint64_t(SharedMemory::kBufferSize) - source_start) {
+          return false;
+        }
+        source_buffer = vulkan_shared_memory.buffer();
+      }
+      uint64_t view_offset = source_start & ~uint64_t(texel_offset_alignment - 1);
+      uint64_t extra_offset = source_start - view_offset;
+      // The extra offset is added to byte offsets that the shader divides by
+      // the 16-byte element size - must keep element indexing exact.
+      if (extra_offset & 15) {
+        return false;
+      }
+      uint64_t view_range = rex::align(extra_offset + source_range, uint64_t(16));
+      if (view_range > max_view_bytes) {
+        return false;
+      }
+      descriptor_set_out =
+          GetLoadSourceTexelBufferDescriptorSet(source_buffer, view_offset, view_range);
+      extra_offset_out = uint32_t(extra_offset);
+      return descriptor_set_out != VK_NULL_HANDLE;
+    };
+    bool texel_sources_ok = true;
+    if (level_first == 0) {
+      texel_sources_ok &=
+          acquire_texel_source(texture_key.base_page << 12, vulkan_texture.GetGuestBaseSize(),
+                               descriptor_set_source_base, source_base_texel_extra_offset);
+    }
+    if (texel_sources_ok && level_last != 0) {
+      texel_sources_ok &=
+          acquire_texel_source(texture_key.mip_page << 12, vulkan_texture.GetGuestMipsSize(),
+                               descriptor_set_source_mips, source_mips_texel_extra_offset);
+    }
+    if (!texel_sources_ok) {
+      pipeline_texel = VK_NULL_HANDLE;
+      descriptor_set_source_base = VK_NULL_HANDLE;
+      descriptor_set_source_mips = VK_NULL_HANDLE;
+      source_base_texel_extra_offset = 0;
+      source_mips_texel_extra_offset = 0;
+    }
+  }
+  if (pipeline_texel == VK_NULL_HANDLE && level_first == 0) {
     descriptor_set_source_base = command_processor_.AllocateSingleTransientDescriptor(
         VulkanCommandProcessor::SingleTransientDescriptorLayout ::kStorageBufferCompute);
     if (!descriptor_set_source_base) {
@@ -1550,7 +2127,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     write_descriptor_set_source_base.pBufferInfo = &write_descriptor_set_source_base_buffer_info;
     write_descriptor_set_source_base.pTexelBufferView = nullptr;
   }
-  if (level_last != 0) {
+  if (pipeline_texel == VK_NULL_HANDLE && level_last != 0) {
     descriptor_set_source_mips = command_processor_.AllocateSingleTransientDescriptor(
         VulkanCommandProcessor::SingleTransientDescriptorLayout ::kStorageBufferCompute);
     if (!descriptor_set_source_mips) {
@@ -1645,6 +2222,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                         : "none",
         debug_team_profile_mips_scaled_start, debug_team_profile_mips_scaled_length);
   }
+  // Attribute the GPU time of the load dispatches (and the barriers around
+  // them) to the texture upload profiling bucket.
+  command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kTextureUpload);
+
   if (texture_key.scaled_resolve) {
     UseScaledResolveBufferForRead();
   } else {
@@ -1655,9 +2236,38 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
-  command_processor_.BindExternalComputePipeline(pipeline);
+  // For direct storage image writes, transition the texture to the writable
+  // usage before the dispatches (the barrier is flushed before dispatching).
+  if (use_storage_dest) {
+    vulkan_texture.MarkAsUsed();
+    VulkanTexture::Usage texture_old_usage =
+        vulkan_texture.SetUsage(VulkanTexture::Usage::kStorageWrite);
+    if (texture_old_usage != VulkanTexture::Usage::kStorageWrite) {
+      VkPipelineStageFlags texture_src_stage_mask, texture_dst_stage_mask;
+      VkAccessFlags texture_src_access_mask, texture_dst_access_mask;
+      VkImageLayout texture_old_layout, texture_new_layout;
+      GetTextureUsageMasks(texture_old_usage, texture_src_stage_mask, texture_src_access_mask,
+                           texture_old_layout);
+      GetTextureUsageMasks(VulkanTexture::Usage::kStorageWrite, texture_dst_stage_mask,
+                           texture_dst_access_mask, texture_new_layout);
+      command_processor_.PushImageMemoryBarrier(
+          vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+          texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
+          texture_dst_access_mask, texture_old_layout, texture_new_layout);
+    }
+  }
 
-  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
+  VkPipelineLayout active_load_pipeline_layout =
+      use_storage_dest
+          ? load_pipeline_layout_storage_dest_
+          : (pipeline_texel != VK_NULL_HANDLE ? load_pipeline_layout_texel_
+                                              : load_pipeline_layout_);
+  command_processor_.BindExternalComputePipeline(
+      use_storage_dest ? pipeline_storage_dest
+                       : (pipeline_texel != VK_NULL_HANDLE ? pipeline_texel : pipeline));
+
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         active_load_pipeline_layout,
                                          kLoadDescriptorSetIndexDestination, 1,
                                          &descriptor_set_dest, 0, nullptr);
 
@@ -1681,13 +2291,17 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         is_base ? descriptor_set_source_base : descriptor_set_source_mips;
     if (descriptor_set_source_current != descriptor_set_source) {
       descriptor_set_source_current = descriptor_set_source;
-      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                             active_load_pipeline_layout,
                                              kLoadDescriptorSetIndexSource, 1,
                                              &descriptor_set_source, 0, nullptr);
     }
 
     // TODO(Triang3l): guest_offset relative to the storage buffer origin.
-    load_constants.guest_offset = 0;
+    // For texel buffer sources, the offset starts at the alignment padding of
+    // the view rather than 0.
+    load_constants.guest_offset =
+        is_base ? source_base_texel_extra_offset : source_mips_texel_extra_offset;
     if (!is_base) {
       load_constants.guest_offset += guest_layout.mip_offsets_bytes[level] *
                                      (texture_resolution_scale_x * texture_resolution_scale_y);
@@ -1738,7 +2352,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     load_constants.host_pitch =
         load_shader_info.bytes_per_host_block * level_host_layout.x_pitch_blocks;
 
-    command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+    command_buffer.CmdVkPushConstants(active_load_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                       sizeof(load_constants), &load_constants);
 
     uint32_t level_array_slice_stride_bytes_scaled =
@@ -1746,11 +2360,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         (texture_resolution_scale_x * texture_resolution_scale_y);
     for (uint32_t slice = 0; slice < array_size; ++slice) {
       if (slice != 0) {
-        command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+        command_buffer.CmdVkPushConstants(active_load_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                           offsetof(LoadConstants, guest_offset),
                                           sizeof(load_constants.guest_offset),
                                           &load_constants.guest_offset);
-        command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+        command_buffer.CmdVkPushConstants(active_load_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                           offsetof(LoadConstants, host_offset),
                                           sizeof(load_constants.host_offset),
                                           &load_constants.host_offset);
@@ -1864,7 +2478,16 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
   }
 
+  if (use_storage_dest) {
+    // The texture was written directly by the load dispatches - no copy
+    // needed.
+    DebugLogTeamProfileBackgroundGpuEvent("load-exit", UINT32_MAX, texture);
+    return true;
+  }
+
   // Submit copying from the copy buffer to the host texture.
+  // Timed separately from the load dispatches to attribute the upload cost.
+  command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kTextureUploadCopy);
   command_processor_.PushBufferMemoryBarrier(
       scratch_buffer, 0, VK_WHOLE_SIZE,
       scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_TRANSFER_BIT),
@@ -2034,7 +2657,81 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
   }
+  if (storage_view_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, storage_view_, nullptr);
+  }
+  if (storage_descriptor_set_index_ != SIZE_MAX) {
+    VulkanTextureCache& mutable_cache = const_cast<VulkanTextureCache&>(vulkan_texture_cache);
+    if (mutable_cache.load_dest_storage_descriptor_set_pool_) {
+      mutable_cache.load_dest_storage_descriptor_set_pool_->Free(storage_descriptor_set_index_);
+    }
+  }
   vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
+}
+
+VkDescriptorSet VulkanTextureCache::VulkanTexture::GetStorageDescriptorSet() {
+  VulkanTextureCache& vulkan_texture_cache =
+      const_cast<VulkanTextureCache&>(static_cast<const VulkanTextureCache&>(texture_cache()));
+  if (!image_storage_capable_ || !vulkan_texture_cache.load_dest_storage_descriptor_set_pool_) {
+    return VK_NULL_HANDLE;
+  }
+  if (storage_binding_attempted_) {
+    return storage_descriptor_set_index_ != SIZE_MAX
+               ? vulkan_texture_cache.load_dest_storage_descriptor_set_pool_->Get(
+                     storage_descriptor_set_index_)
+               : VK_NULL_HANDLE;
+  }
+  storage_binding_attempted_ = true;
+
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      vulkan_texture_cache.command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkImageViewCreateInfo view_create_info;
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.pNext = nullptr;
+  view_create_info.flags = 0;
+  view_create_info.image = image_;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_create_info.format = VK_FORMAT_R32_UINT;
+  view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.subresourceRange =
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+  if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &storage_view_) != VK_SUCCESS) {
+    storage_view_ = VK_NULL_HANDLE;
+    return VK_NULL_HANDLE;
+  }
+  size_t descriptor_set_index =
+      vulkan_texture_cache.load_dest_storage_descriptor_set_pool_->Allocate();
+  if (descriptor_set_index == SIZE_MAX) {
+    dfn.vkDestroyImageView(device, storage_view_, nullptr);
+    storage_view_ = VK_NULL_HANDLE;
+    return VK_NULL_HANDLE;
+  }
+  VkDescriptorSet descriptor_set =
+      vulkan_texture_cache.load_dest_storage_descriptor_set_pool_->Get(descriptor_set_index);
+  VkDescriptorImageInfo image_info;
+  image_info.sampler = VK_NULL_HANDLE;
+  image_info.imageView = storage_view_;
+  image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  VkWriteDescriptorSet write_descriptor_set;
+  write_descriptor_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write_descriptor_set.pNext = nullptr;
+  write_descriptor_set.dstSet = descriptor_set;
+  write_descriptor_set.dstBinding = 0;
+  write_descriptor_set.dstArrayElement = 0;
+  write_descriptor_set.descriptorCount = 1;
+  write_descriptor_set.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  write_descriptor_set.pImageInfo = &image_info;
+  write_descriptor_set.pBufferInfo = nullptr;
+  write_descriptor_set.pTexelBufferView = nullptr;
+  dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set, 0, nullptr);
+  storage_descriptor_set_index_ = descriptor_set_index;
+  return descriptor_set;
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
@@ -2288,7 +2985,10 @@ bool VulkanTextureCache::InitializeScaledResolveBuffer() {
   buffer_create_info.pNext = nullptr;
   buffer_create_info.flags = sparse_flags;
   buffer_create_info.size = scaled_resolve_buffer_size_;
-  buffer_create_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  // UNIFORM_TEXEL_BUFFER is for the texel-buffer-source texture load
+  // pipelines.
+  buffer_create_info.usage =
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
@@ -2323,7 +3023,8 @@ bool VulkanTextureCache::InitializeScaledResolveBuffer() {
   if (scaled_resolve_buffer_ == VK_NULL_HANDLE) {
     buffer_create_info.flags = 0;
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            vulkan_device, scaled_resolve_buffer_size_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            vulkan_device, scaled_resolve_buffer_size_,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT,
             ui::vulkan::util::MemoryPurpose::kDeviceLocal, scaled_resolve_buffer_,
             scaled_resolve_buffer_memory_.emplace_back(), &scaled_resolve_buffer_memory_type_)) {
       REXGPU_ERROR(
@@ -2961,6 +3662,110 @@ bool VulkanTextureCache::Initialize() {
     return false;
   }
 
+  // Texel-buffer-source load pipeline layout (set 0 - storage buffer
+  // destination, set 1 - uniform texel buffer source) and the descriptor set
+  // pool for the persistent cached source bindings. Failure is not fatal -
+  // the storage buffer path is used then.
+  {
+    VkDescriptorSetLayoutBinding source_texel_binding;
+    source_texel_binding.binding = 0;
+    source_texel_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    source_texel_binding.descriptorCount = 1;
+    source_texel_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    source_texel_binding.pImmutableSamplers = nullptr;
+    VkDescriptorSetLayoutCreateInfo source_texel_layout_create_info;
+    source_texel_layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    source_texel_layout_create_info.pNext = nullptr;
+    source_texel_layout_create_info.flags = 0;
+    source_texel_layout_create_info.bindingCount = 1;
+    source_texel_layout_create_info.pBindings = &source_texel_binding;
+    if (dfn.vkCreateDescriptorSetLayout(device, &source_texel_layout_create_info, nullptr,
+                                        &load_descriptor_set_layout_source_texel_) == VK_SUCCESS) {
+      VkDescriptorSetLayout load_texel_descriptor_set_layouts[kLoadDescriptorSetCount] = {};
+      load_texel_descriptor_set_layouts[kLoadDescriptorSetIndexDestination] =
+          load_descriptor_set_layout_storage_buffer;
+      load_texel_descriptor_set_layouts[kLoadDescriptorSetIndexSource] =
+          load_descriptor_set_layout_source_texel_;
+      VkPipelineLayoutCreateInfo load_texel_pipeline_layout_create_info =
+          load_pipeline_layout_create_info;
+      load_texel_pipeline_layout_create_info.pSetLayouts = load_texel_descriptor_set_layouts;
+      if (dfn.vkCreatePipelineLayout(device, &load_texel_pipeline_layout_create_info, nullptr,
+                                     &load_pipeline_layout_texel_) == VK_SUCCESS) {
+        VkDescriptorPoolSize source_texel_pool_size;
+        source_texel_pool_size.type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        source_texel_pool_size.descriptorCount = 1;
+        load_source_texel_descriptor_set_pool_ =
+            std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
+                vulkan_device, 256, 1, &source_texel_pool_size,
+                load_descriptor_set_layout_source_texel_);
+      } else {
+        REXGPU_WARN(
+            "VulkanTextureCache: Failed to create the texel-buffer load pipeline layout - using "
+            "storage buffer texture loads");
+        dfn.vkDestroyDescriptorSetLayout(device, load_descriptor_set_layout_source_texel_,
+                                         nullptr);
+        load_descriptor_set_layout_source_texel_ = VK_NULL_HANDLE;
+      }
+    } else {
+      REXGPU_WARN(
+          "VulkanTextureCache: Failed to create the texel-buffer load descriptor set layout - "
+          "using storage buffer texture loads");
+      load_descriptor_set_layout_source_texel_ = VK_NULL_HANDLE;
+    }
+  }
+
+  // Storage-image-destination load pipeline layout (set 0 - storage image
+  // destination, set 1 - storage buffer source) and the descriptor set pool
+  // for the per-texture destination bindings. Failure is not fatal - the
+  // buffer destination plus copy path is used then.
+  {
+    VkDescriptorSetLayoutBinding dest_storage_binding;
+    dest_storage_binding.binding = 0;
+    dest_storage_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    dest_storage_binding.descriptorCount = 1;
+    dest_storage_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    dest_storage_binding.pImmutableSamplers = nullptr;
+    VkDescriptorSetLayoutCreateInfo dest_storage_layout_create_info;
+    dest_storage_layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dest_storage_layout_create_info.pNext = nullptr;
+    dest_storage_layout_create_info.flags = 0;
+    dest_storage_layout_create_info.bindingCount = 1;
+    dest_storage_layout_create_info.pBindings = &dest_storage_binding;
+    if (dfn.vkCreateDescriptorSetLayout(device, &dest_storage_layout_create_info, nullptr,
+                                        &load_descriptor_set_layout_dest_storage_) == VK_SUCCESS) {
+      VkDescriptorSetLayout load_storage_descriptor_set_layouts[kLoadDescriptorSetCount] = {};
+      load_storage_descriptor_set_layouts[kLoadDescriptorSetIndexDestination] =
+          load_descriptor_set_layout_dest_storage_;
+      load_storage_descriptor_set_layouts[kLoadDescriptorSetIndexSource] =
+          load_descriptor_set_layout_storage_buffer;
+      VkPipelineLayoutCreateInfo load_storage_pipeline_layout_create_info =
+          load_pipeline_layout_create_info;
+      load_storage_pipeline_layout_create_info.pSetLayouts = load_storage_descriptor_set_layouts;
+      if (dfn.vkCreatePipelineLayout(device, &load_storage_pipeline_layout_create_info, nullptr,
+                                     &load_pipeline_layout_storage_dest_) == VK_SUCCESS) {
+        VkDescriptorPoolSize dest_storage_pool_size;
+        dest_storage_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        dest_storage_pool_size.descriptorCount = 1;
+        load_dest_storage_descriptor_set_pool_ =
+            std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
+                vulkan_device, 256, 1, &dest_storage_pool_size,
+                load_descriptor_set_layout_dest_storage_);
+      } else {
+        REXGPU_WARN(
+            "VulkanTextureCache: Failed to create the storage-image load pipeline layout - using "
+            "buffer texture loads");
+        dfn.vkDestroyDescriptorSetLayout(device, load_descriptor_set_layout_dest_storage_,
+                                         nullptr);
+        load_descriptor_set_layout_dest_storage_ = VK_NULL_HANDLE;
+      }
+    } else {
+      REXGPU_WARN(
+          "VulkanTextureCache: Failed to create the storage-image load descriptor set layout - "
+          "using buffer texture loads");
+      load_descriptor_set_layout_dest_storage_ = VK_NULL_HANDLE;
+    }
+  }
+
   // Load pipelines, only the ones needed for the formats that will be used.
 
   bool load_shaders_needed[kLoadShaderCount] = {};
@@ -3418,6 +4223,11 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
       access_mask = VK_ACCESS_TRANSFER_WRITE_BIT;
       layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      break;
+    case VulkanTexture::Usage::kStorageWrite:
+      stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
+      layout = VK_IMAGE_LAYOUT_GENERAL;
       break;
     case VulkanTexture::Usage::kGuestShaderSampled:
       stage_mask = guest_shader_pipeline_stages_;

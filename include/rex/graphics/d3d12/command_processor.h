@@ -387,9 +387,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   void EndGpuTimestampFrame();
   void ResolveGpuTimestampFrame(ID3D12GraphicsCommandList* command_list);
   void ProcessGpuTimestampResults();
+ public:
+  // Also used by the texture and render target caches for profiling regions.
   uint32_t BeginGpuTimestampedDraw(rex::perf::DrawBucket bucket);
   void EndGpuTimestampedDraw(uint32_t start_query_index);
- public:
   uint32_t BeginGpuTimestampedCounter(ID3D12GraphicsCommandList* command_list,
                                       rex::perf::CounterId counter_id);
   void EndGpuTimestampedCounter(ID3D12GraphicsCommandList* command_list,
@@ -693,6 +694,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t* gpu_timestamp_readback_mapping_ = nullptr;
   uint64_t gpu_timestamp_frequency_ = 0;
   bool gpu_timestamp_resources_available_ = false;
+  bool gpu_timestamp_draws_enabled_ = false;
   struct GpuTimestampFrame {
     uint64_t frame = 0;
     uint64_t submission = 0;
@@ -707,6 +709,12 @@ class D3D12CommandProcessor : public CommandProcessor {
     std::vector<uint32_t> counter_start_queries;
   };
   std::array<GpuTimestampFrame, kQueueFrames> gpu_timestamp_frames_;
+  // Averaged full-frame GPU time attribution, logged periodically when bucket
+  // timestamps are enabled.
+  static constexpr uint32_t kGpuProfileLogFrameInterval = 120;
+  uint64_t gpu_profile_bucket_us_[size_t(rex::perf::DrawBucket::kCount)] = {};
+  uint64_t gpu_profile_span_us_ = 0;
+  uint32_t gpu_profile_frames_ = 0;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

@@ -50,6 +50,11 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamp_buckets, false, "GPU/D3D12",
+                    "Measure GPU time of draws and resolves with timestamp queries and report "
+                    "the breakdown in the FPS overlay and a periodic profile log")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skate3_ultrawide_skip_shadow_targets, true, "Skate 3",
                     "Do not apply Skate 3 Hor+ NDC correction while rendering likely shadow maps")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -215,6 +220,18 @@ bool ShouldApplySkate3UltrawideHorPlus(
   return selected;
 }
 
+// Frame-cached read of the cross-TU draw trace flag - the registry Query is a
+// mutex + string hash, too expensive to run for every draw.
+bool QuerySkate3UltrawideTraceDraws(uint64_t frame) {
+  thread_local uint64_t cached_frame = UINT64_MAX;
+  thread_local bool cached_value = false;
+  if (cached_frame != frame) {
+    cached_value = rex::cvar::Query<bool>("skate3_ultrawide_trace_draws");
+    cached_frame = frame;
+  }
+  return cached_value;
+}
+
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 class ScopedDrawStageTimer {
  public:
@@ -246,7 +263,9 @@ class ScopedDrawStageTimer {
 #define REX_D3D12_DRAW_STAGE_TIMER(counter_id) \
   ScopedDrawStageTimer REX_CONCAT(draw_stage_timer_, __LINE__)(rex::perf::CounterId::counter_id)
 #else
-#define REX_D3D12_DRAW_STAGE_TIMER(counter_id)
+// Without compiled-in perf counters, draw stage timers still feed the
+// runtime-gated rex::perf::cpu_profile attribution (gpu_cpu_profile cvar).
+#define REX_D3D12_DRAW_STAGE_TIMER(counter_id) PROFILE_SCOPE_COUNTER(counter_id)
 #endif
 
 }  // namespace
@@ -1929,9 +1948,7 @@ bool D3D12CommandProcessor::SetupContext() {
   pix_capture_requested_.store(false, std::memory_order_relaxed);
   pix_capturing_ = false;
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
   gpu_timestamp_resources_available_ = InitializeGpuTimestampResources();
-#endif
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1942,9 +1959,7 @@ bool D3D12CommandProcessor::SetupContext() {
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
   ShutdownGpuTimestampResources();
-#endif
   ShutdownOcclusionQueryResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
@@ -2812,9 +2827,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
     // Update viewport, scissor, blend factor and stencil reference.
     UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
+  }
 
-    // Update system constants before uploading them.
-    // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
+  // Update system constants before uploading them.
+  // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
+  {
+    REX_D3D12_DRAW_STAGE_TIMER(kDrawStageSystemConstantsUs);
     UpdateSystemConstantValues(memexport_used, primitive_polygonal,
                                primitive_processing_result.host_vertex_shader_type,
                                primitive_processing_result.line_loop_closing_index,
@@ -2983,7 +3001,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   const uint32_t skate3_ultrawide_draw_primitive_count = draw_util::EstimatePrimitiveCount(
       primitive_processing_result.host_primitive_type, host_draw_vertex_count);
   bool skate3_ultrawide_submit_draw = true;
-  if (rex::cvar::Query<bool>("skate3_ultrawide_trace_draws")) {
+  // Frame-cached: the registry Query takes the registry mutex and hashes the
+  // name, far too expensive for a per-draw debug-flag check.
+  if (QuerySkate3UltrawideTraceDraws(frame_current_)) {
     ultrawide_debug::DrawFingerprint fingerprint;
     fingerprint.bucket =
         memexport_used
@@ -3043,9 +3063,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!skate3_ultrawide_submit_draw) {
     return true;
   }
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
-  const uint32_t host_draw_primitive_count = draw_util::EstimatePrimitiveCount(
-      primitive_processing_result.host_primitive_type, host_draw_vertex_count);
   const rex::perf::DrawBucket draw_bucket =
       memexport_used
           ? rex::perf::DrawBucket::kMemexport
@@ -3053,6 +3070,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                  ? rex::perf::DrawBucket::kDepthOnly
                  : (pixel_shader == nullptr ? rex::perf::DrawBucket::kNoPixelShader
                                             : rex::perf::DrawBucket::kMainColorDepth));
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  const uint32_t host_draw_primitive_count = draw_util::EstimatePrimitiveCount(
+      primitive_processing_result.host_primitive_type, host_draw_vertex_count);
   const bool collect_draw_fingerprints = rex::perf::ShouldCollectDrawFingerprints();
   rex::perf::DrawFingerprint draw_fingerprint;
   if (collect_draw_fingerprints) {
@@ -3105,12 +3125,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       if (collect_draw_fingerprints) {
         PROFILE_DRAW_FINGERPRINT(draw_fingerprint);
       }
+#endif
       uint32_t gpu_timestamp_query = BeginGpuTimestampedDraw(draw_bucket);
-#endif
       deferred_command_list_.D3DDrawInstanced(host_draw_vertex_count, 1, 0, 0);
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
       EndGpuTimestampedDraw(gpu_timestamp_query);
-#endif
     }
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
@@ -3187,12 +3205,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       if (collect_draw_fingerprints) {
         PROFILE_DRAW_FINGERPRINT(draw_fingerprint);
       }
+#endif
       uint32_t gpu_timestamp_query = BeginGpuTimestampedDraw(draw_bucket);
-#endif
       deferred_command_list_.D3DDrawIndexedInstanced(host_draw_vertex_count, 1, 0, 0, 0);
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
       EndGpuTimestampedDraw(gpu_timestamp_query);
-#endif
     }
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
@@ -3399,6 +3415,7 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  PROFILE_SCOPE_COUNTER(kRtResolveUs);
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -3407,8 +3424,14 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (readback_mode == ReadbackResolveMode::kDisabled &&
       (!texture_cache_->IsDrawResolutionScaled() || gameplay_state_active)) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    // Time the whole resolve (render target dump, copy and clear) for the GPU
+    // profile breakdown.
+    uint32_t gpu_timestamp_query =
+        BeginGpuTimestampedDraw(rex::perf::DrawBucket::kCopyResolve);
+    bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                  written_address, written_length);
+    EndGpuTimestampedDraw(gpu_timestamp_query);
+    return resolved;
   }
   return IssueCopy_ReadbackResolvePath();
 }
@@ -3662,7 +3685,16 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                         fence_value, fence_completion_event_)))) {
         PROFILE_CMD_BUFFER_STALL();
         rex::perf::ScopedCounterTimer wait_timer(rex::perf::CounterId::kCpuD3D12FenceWaitUs);
+        rex::perf::ScopedCounterTimer gpu_thread_wait_timer(
+            rex::perf::CounterId::kGpuThreadFenceWaitUs, true);
+        const std::chrono::steady_clock::time_point wait_start = std::chrono::steady_clock::now();
         WaitForSingleObject(fence_completion_event_, INFINITE);
+        if (ui::Presenter* wait_presenter = graphics_system_->presenter()) {
+          wait_presenter->AddGuestFrameWaitMicroseconds(uint64_t(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - wait_start)
+                  .count()));
+        }
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -3682,7 +3714,18 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
       rex::perf::ScopedCounterTimer wait_timer(rex::perf::CounterId::kCpuD3D12FenceWaitUs);
+      rex::perf::ScopedCounterTimer gpu_thread_wait_timer(
+          rex::perf::CounterId::kGpuThreadFenceWaitUs, true);
+      // Also reported through the presenter so the FPS overlay can show the
+      // blocked time in builds without perf counters.
+      const std::chrono::steady_clock::time_point wait_start = std::chrono::steady_clock::now();
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      if (ui::Presenter* wait_presenter = graphics_system_->presenter()) {
+        wait_presenter->AddGuestFrameWaitMicroseconds(uint64_t(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                  wait_start)
+                .count()));
+      }
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -3933,9 +3976,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
     texture_cache_->BeginFrame();
 
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
     BeginGpuTimestampFrame();
-#endif
   }
 
   return true;
@@ -3967,9 +4008,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   if (is_closing_frame) {
     {
       PROFILE_SCOPE_COUNTER(kCpuD3D12EndFrameUs);
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
       EndGpuTimestampFrame();
-#endif
 
       texture_cache_->EndFrame();
 
@@ -4011,9 +4050,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       deferred_command_list_.Execute(command_list_, command_list_1_);
     }
     if (is_closing_frame) {
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
       ResolveGpuTimestampFrame(command_list_);
-#endif
     }
     {
       PROFILE_SCOPE_COUNTER(kCpuD3D12CommandListCloseUs);
@@ -5511,12 +5548,15 @@ void D3D12CommandProcessor::ShutdownGpuTimestampResources() {
   gpu_timestamp_query_heap_.Reset();
   gpu_timestamp_frequency_ = 0;
   gpu_timestamp_resources_available_ = false;
+  gpu_timestamp_draws_enabled_ = false;
   for (auto& frame : gpu_timestamp_frames_) {
     frame = {};
   }
 }
 
 void D3D12CommandProcessor::BeginGpuTimestampFrame() {
+  gpu_timestamp_draws_enabled_ =
+      rex::perf::IsCaptureRecording() || REXCVAR_GET(d3d12_gpu_timestamp_buckets);
   if (!gpu_timestamp_resources_available_) {
     return;
   }
@@ -5532,7 +5572,7 @@ void D3D12CommandProcessor::BeginGpuTimestampFrame() {
   frame.bucket_start_queries.clear();
   frame.counter_ids.clear();
   frame.counter_start_queries.clear();
-  if (rex::perf::IsCaptureRecording() && gpu_timestamp_query_heap_) {
+  if (gpu_timestamp_draws_enabled_ && gpu_timestamp_query_heap_) {
     frame.frame_start_query = frame.query_count++;
     deferred_command_list_.D3DEndQuery(gpu_timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                                        frame.query_base + frame.frame_start_query);
@@ -5582,17 +5622,24 @@ void D3D12CommandProcessor::ProcessGpuTimestampResults() {
       continue;
     }
     const uint64_t* timestamps = gpu_timestamp_readback_mapping_ + frame.query_base;
+    int64_t frame_span_us = 0;
     if (frame.frame_start_query != UINT32_MAX && frame.frame_end_query != UINT32_MAX) {
       uint64_t start = timestamps[frame.frame_start_query];
       uint64_t end = timestamps[frame.frame_end_query];
       if (end > start) {
         int64_t elapsed_us =
             static_cast<int64_t>((end - start) * uint64_t(1000000) / gpu_timestamp_frequency_);
+        frame_span_us = elapsed_us;
         rex::perf::IncrementCounter(rex::perf::CounterId::kGpuCommandProcessorFrameUs,
                                     elapsed_us);
         rex::perf::IncrementCounter(rex::perf::CounterId::kGpuTimestampedFrames);
+        if (ui::Presenter* presenter = graphics_system_->presenter()) {
+          presenter->SetGuestFrameGpuSpanMicroseconds(uint64_t(elapsed_us));
+        }
       }
     }
+    uint64_t bucket_draw_us = 0;
+    uint64_t bucket_resolve_us = 0;
     for (uint32_t i = 0; i < frame.buckets.size(); ++i) {
       if (i >= frame.bucket_start_queries.size()) {
         break;
@@ -5608,27 +5655,69 @@ void D3D12CommandProcessor::ProcessGpuTimestampResults() {
       }
       int64_t elapsed_us =
           static_cast<int64_t>((end - start) * uint64_t(1000000) / gpu_timestamp_frequency_);
+      if (size_t(frame.buckets[i]) < size_t(rex::perf::DrawBucket::kCount)) {
+        gpu_profile_bucket_us_[size_t(frame.buckets[i])] += uint64_t(elapsed_us);
+      }
       rex::perf::CounterId counter_id;
       switch (frame.buckets[i]) {
         case rex::perf::DrawBucket::kMainColorDepth:
           counter_id = rex::perf::CounterId::kGpuMainUs;
+          bucket_draw_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kDepthOnly:
           counter_id = rex::perf::CounterId::kGpuDepthUs;
+          bucket_draw_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kCopyResolve:
           counter_id = rex::perf::CounterId::kGpuCopyUs;
+          bucket_resolve_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kMemexport:
           counter_id = rex::perf::CounterId::kGpuMemexportUs;
+          bucket_draw_us += uint64_t(elapsed_us);
           break;
         case rex::perf::DrawBucket::kNoPixelShader:
           counter_id = rex::perf::CounterId::kGpuNoPixelShaderUs;
+          bucket_draw_us += uint64_t(elapsed_us);
           break;
         default:
           continue;
       }
       rex::perf::IncrementCounter(counter_id, elapsed_us);
+    }
+    if (ui::Presenter* presenter = graphics_system_->presenter()) {
+      // Zeros when bucket timestamps are disabled, which hides the breakdown
+      // in the FPS overlay. Unlike on Vulkan, the draw buckets are individual
+      // begin/end pairs around the draw commands, so barriers and other
+      // in-between work are not included anywhere ("other" covers them).
+      presenter->SetGuestFrameGpuBreakdownMicroseconds(bucket_draw_us, bucket_resolve_us, 0);
+    }
+    // Periodic full attribution log, mirroring the Vulkan backend's.
+    if (frame_span_us > 0 && REXCVAR_GET(d3d12_gpu_timestamp_buckets)) {
+      gpu_profile_span_us_ += uint64_t(frame_span_us);
+      if (++gpu_profile_frames_ >= kGpuProfileLogFrameInterval) {
+        uint64_t buckets_sum_us = 0;
+        std::string breakdown;
+        for (size_t bucket = 0; bucket < size_t(rex::perf::DrawBucket::kCount); ++bucket) {
+          uint64_t total_us = gpu_profile_bucket_us_[bucket];
+          buckets_sum_us += total_us;
+          if (!total_us) {
+            continue;
+          }
+          breakdown +=
+              fmt::format(" {}={}", rex::perf::DrawBucketName(rex::perf::DrawBucket(bucket)),
+                          total_us / gpu_profile_frames_);
+        }
+        uint64_t span_avg_us = gpu_profile_span_us_ / gpu_profile_frames_;
+        uint64_t sum_avg_us = buckets_sum_us / gpu_profile_frames_;
+        REXGPU_INFO(
+            "D3D12 GPU profile (avg us/frame over {} frames): span={} buckets={} untimed={} |{}",
+            gpu_profile_frames_, span_avg_us, sum_avg_us,
+            span_avg_us > sum_avg_us ? span_avg_us - sum_avg_us : 0, breakdown);
+        std::memset(gpu_profile_bucket_us_, 0, sizeof(gpu_profile_bucket_us_));
+        gpu_profile_span_us_ = 0;
+        gpu_profile_frames_ = 0;
+      }
     }
     for (uint32_t i = 0; i < frame.counter_ids.size(); ++i) {
       if (i >= frame.counter_start_queries.size()) {
@@ -5657,7 +5746,7 @@ void D3D12CommandProcessor::ProcessGpuTimestampResults() {
 
 uint32_t D3D12CommandProcessor::BeginGpuTimestampedDraw(rex::perf::DrawBucket bucket) {
   if (!gpu_timestamp_resources_available_ || !gpu_timestamp_query_heap_ ||
-      !rex::perf::IsCaptureRecording() || !frame_open_) {
+      !gpu_timestamp_draws_enabled_ || !frame_open_) {
     return UINT32_MAX;
   }
 

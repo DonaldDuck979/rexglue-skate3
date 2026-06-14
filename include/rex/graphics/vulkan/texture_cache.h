@@ -11,7 +11,9 @@
  */
 
 #include <array>
+#include <map>
 #include <memory>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -21,6 +23,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
+#include <rex/ui/vulkan/single_layout_descriptor_set_pool.h>
 
 namespace rex::graphics::vulkan {
 
@@ -198,6 +201,8 @@ class VulkanTextureCache final : public TextureCache {
     enum class Usage {
       kUndefined,
       kTransferDestination,
+      // Direct load shader writes through a storage image view.
+      kStorageWrite,
       kGuestShaderSampled,
       kSwapSampled,
     };
@@ -219,6 +224,14 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+
+    // Descriptor set with an R32_UINT storage image view of mip 0 layer 0, for
+    // direct load shader writes. VK_NULL_HANDLE if unavailable (the image was
+    // not created with storage usage, or creation failed). Created lazily,
+    // released in the destructor.
+    VkDescriptorSet GetStorageDescriptorSet();
+    bool image_storage_capable() const { return image_storage_capable_; }
+    void SetImageStorageCapable(bool capable) { image_storage_capable_ = capable; }
 
    private:
     union ViewKey {
@@ -277,6 +290,13 @@ class VulkanTextureCache final : public TextureCache {
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
+
+    // Whether the image was created with storage usage and an R32_UINT view
+    // format for direct load shader writes.
+    bool image_storage_capable_ = false;
+    VkImageView storage_view_ = VK_NULL_HANDLE;
+    size_t storage_descriptor_set_index_ = SIZE_MAX;
+    bool storage_binding_attempted_ = false;
   };
 
   static const char* DebugVulkanTextureUsageName(VulkanTexture::Usage usage);
@@ -359,6 +379,48 @@ class VulkanTextureCache final : public TextureCache {
   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
+
+  // Texel-buffer-source variants of hot load pipelines: the source is read
+  // through a uniform texel buffer (the texture path with its caching)
+  // instead of raw storage buffer loads, which is several times faster for
+  // the scattered tiled access pattern of guest texture loading on some
+  // hosts. Lazily compiled from GLSL ports of the corresponding shipped
+  // shaders; the attempt flags prevent retrying after a failure.
+  VkDescriptorSetLayout load_descriptor_set_layout_source_texel_ = VK_NULL_HANDLE;
+  VkPipelineLayout load_pipeline_layout_texel_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_texel_{};
+  std::array<bool, kLoadShaderCount> load_pipelines_scaled_texel_attempted_{};
+  VkPipeline GetLoadPipelineScaledTexelBuffer(LoadShaderIndex load_shader);
+
+  // Storage-image-destination variants of hot load pipelines: the load shader
+  // writes the texture directly through an R32_UINT storage image view,
+  // skipping the intermediate copy buffer and the buffer-to-image copy (which
+  // is several times slower than device bandwidth on some hosts). Set 0 is
+  // the storage image destination, set 1 the storage buffer source.
+  VkDescriptorSetLayout load_descriptor_set_layout_dest_storage_ = VK_NULL_HANDLE;
+  VkPipelineLayout load_pipeline_layout_storage_dest_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_storage_dest_{};
+  std::array<bool, kLoadShaderCount> load_pipelines_scaled_storage_dest_attempted_{};
+  VkPipeline GetLoadPipelineScaledStorageDest(LoadShaderIndex load_shader);
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>
+      load_dest_storage_descriptor_set_pool_;
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>
+      load_source_texel_descriptor_set_pool_;
+  struct LoadSourceTexelBinding {
+    VkBufferView buffer_view;
+    size_t descriptor_set_index;
+  };
+  // Persistent cached buffer views and descriptor sets for texel-buffer load
+  // sources, keyed by (buffer, view offset, view range) - the underlying
+  // buffers (shared memory, scaled resolve) live for the cache's lifetime.
+  std::map<std::tuple<uint64_t, uint64_t, uint64_t>, LoadSourceTexelBinding>
+      load_source_texel_bindings_;
+  // Returns the descriptor set (or VK_NULL_HANDLE on failure) for reading
+  // [offset, offset + range) of the buffer as an RGBA32_UINT texel buffer.
+  // The offset must be aligned to minTexelBufferOffsetAlignment and the range
+  // to the texel size by the caller.
+  VkDescriptorSet GetLoadSourceTexelBufferDescriptorSet(VkBuffer buffer, VkDeviceSize offset,
+                                                        VkDeviceSize range);
 
   // If both images can be placed in the same allocation, it's one allocation,
   // otherwise it's two separate.

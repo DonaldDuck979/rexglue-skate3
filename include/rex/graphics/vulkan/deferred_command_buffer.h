@@ -164,6 +164,28 @@ class DeferredCommandBuffer {
                 sizeof(VkImageSubresourceRange) * range_count);
   }
 
+  VkImageSubresourceRange* CmdClearDepthStencilImageEmplace(
+      VkImage image, VkImageLayout image_layout, const VkClearDepthStencilValue* depth_stencil,
+      uint32_t range_count) {
+    const size_t header_size =
+        rex::align(sizeof(ArgsVkClearDepthStencilImage), alignof(VkImageSubresourceRange));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkClearDepthStencilImage,
+                     header_size + sizeof(VkImageSubresourceRange) * range_count));
+    auto& args = *reinterpret_cast<ArgsVkClearDepthStencilImage*>(args_ptr);
+    args.image = image;
+    args.image_layout = image_layout;
+    args.depth_stencil = *depth_stencil;
+    args.range_count = range_count;
+    return reinterpret_cast<VkImageSubresourceRange*>(args_ptr + header_size);
+  }
+  void CmdVkClearDepthStencilImage(VkImage image, VkImageLayout image_layout,
+                                   const VkClearDepthStencilValue* depth_stencil,
+                                   uint32_t range_count, const VkImageSubresourceRange* ranges) {
+    std::memcpy(CmdClearDepthStencilImageEmplace(image, image_layout, depth_stencil, range_count),
+                ranges, sizeof(VkImageSubresourceRange) * range_count);
+  }
+
   VkBufferCopy* CmdCopyBufferEmplace(VkBuffer src_buffer, VkBuffer dst_buffer,
                                      uint32_t region_count) {
     const size_t header_size = rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy));
@@ -294,6 +316,29 @@ class DeferredCommandBuffer {
     std::memcpy(args_ptr + sizeof(ArgsVkPushConstants), values, size);
   }
 
+  // Pushes uniform buffer descriptors (bindings 0 through buffer_count - 1 of
+  // the set, one buffer each) via VK_KHR_push_descriptor - the extension must
+  // be available and the set layout must have been created with the push
+  // descriptor flag.
+  void CmdVkPushUniformBufferDescriptorSet(VkPipelineBindPoint pipeline_bind_point,
+                                           VkPipelineLayout layout, uint32_t set,
+                                           uint32_t buffer_count,
+                                           const VkDescriptorBufferInfo* buffer_infos) {
+    size_t arguments_size = rex::align(sizeof(ArgsVkPushUniformBufferDescriptorSet),
+                                       alignof(VkDescriptorBufferInfo));
+    size_t buffer_infos_offset = arguments_size;
+    arguments_size += sizeof(VkDescriptorBufferInfo) * buffer_count;
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkPushUniformBufferDescriptorSet, arguments_size));
+    auto& args = *reinterpret_cast<ArgsVkPushUniformBufferDescriptorSet*>(args_ptr);
+    args.pipeline_bind_point = pipeline_bind_point;
+    args.layout = layout;
+    args.set = set;
+    args.buffer_count = buffer_count;
+    std::memcpy(args_ptr + buffer_infos_offset, buffer_infos,
+                sizeof(VkDescriptorBufferInfo) * buffer_count);
+  }
+
   void CmdVkSetBlendConstants(const float* blend_constants) {
     auto& args = *reinterpret_cast<ArgsVkSetBlendConstants*>(
         WriteCommand(Command::kVkSetBlendConstants, sizeof(ArgsVkSetBlendConstants)));
@@ -370,6 +415,7 @@ class DeferredCommandBuffer {
     kVkBindVertexBuffers,
     kVkClearAttachments,
     kVkClearColorImage,
+    kVkClearDepthStencilImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
     kVkCopyQueryPoolResults,
@@ -382,6 +428,7 @@ class DeferredCommandBuffer {
     kVkEndRendering,
     kVkPipelineBarrier,
     kVkPushConstants,
+    kVkPushUniformBufferDescriptorSet,
     kVkResetQueryPool,
     kVkSetBlendConstants,
     kVkSetDepthBias,
@@ -477,6 +524,15 @@ class DeferredCommandBuffer {
     static_assert(alignof(VkImageSubresourceRange) <= alignof(uintmax_t));
   };
 
+  struct ArgsVkClearDepthStencilImage {
+    VkImage image;
+    VkImageLayout image_layout;
+    VkClearDepthStencilValue depth_stencil;
+    uint32_t range_count;
+    // Followed by aligned VkImageSubresourceRange[].
+    static_assert(alignof(VkImageSubresourceRange) <= alignof(uintmax_t));
+  };
+
   struct ArgsVkCopyBuffer {
     VkBuffer src_buffer;
     VkBuffer dst_buffer;
@@ -562,6 +618,15 @@ class DeferredCommandBuffer {
     uint32_t offset;
     uint32_t size;
     // Followed by `size` bytes of values.
+  };
+
+  struct ArgsVkPushUniformBufferDescriptorSet {
+    VkPipelineBindPoint pipeline_bind_point;
+    VkPipelineLayout layout;
+    uint32_t set;
+    uint32_t buffer_count;
+    // Followed by aligned VkDescriptorBufferInfo[buffer_count].
+    static_assert(alignof(VkDescriptorBufferInfo) <= alignof(uintmax_t));
   };
 
   struct ArgsVkSetBlendConstants {

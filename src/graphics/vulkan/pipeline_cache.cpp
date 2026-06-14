@@ -3025,12 +3025,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   // be created from the disk storage.
 
   if (creation_arguments.pixel_shader) {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}, PS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash(),
-                creation_arguments.pixel_shader->shader().ucode_data_hash());
+    REXGPU_DEBUG("Creating graphics pipeline state with VS {:016X}, PS {:016X}",
+                 creation_arguments.vertex_shader->shader().ucode_data_hash(),
+                 creation_arguments.pixel_shader->shader().ucode_data_hash());
   } else {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash());
+    REXGPU_DEBUG("Creating graphics pipeline state with VS {:016X}",
+                 creation_arguments.vertex_shader->shader().ucode_data_hash());
   }
 
   const PipelineDescription& description = creation_arguments.pipeline->first;

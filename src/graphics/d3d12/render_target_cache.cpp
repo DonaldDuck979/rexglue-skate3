@@ -3968,6 +3968,24 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+
+  // Time ownership transfers and resolve clears for the GPU profile breakdown.
+  // This is called with nothing to do for most draws - only time when there's
+  // actual work.
+  bool transfer_work_needed = resolve_clear_needed;
+  if (!transfer_work_needed) {
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i] && !render_target_transfers[i].empty()) {
+        transfer_work_needed = true;
+        break;
+      }
+    }
+  }
+  uint32_t gpu_timestamp_query =
+      transfer_work_needed
+          ? command_processor_.BeginGpuTimestampedDraw(rex::perf::DrawBucket::kRtTransfer)
+          : UINT32_MAX;
+
   D3D12_RECT clear_rect;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the
@@ -4223,6 +4241,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   current_temporary_descriptors_gpu_.resize(descriptor_count);
   if (!command_processor_.RequestOneUseSingleViewDescriptors(
           descriptor_count, current_temporary_descriptors_gpu_.data())) {
+    command_processor_.EndGpuTimestampedDraw(gpu_timestamp_query);
     return;
   }
   for (uint32_t i = 0; i < descriptor_count; ++i) {
@@ -4849,6 +4868,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       }
     }
   }
+
+  command_processor_.EndGpuTimestampedDraw(gpu_timestamp_query);
 }
 
 void D3D12RenderTargetCache::SetCommandListRenderTargets(

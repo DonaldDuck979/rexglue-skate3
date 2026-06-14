@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -19,6 +20,14 @@
 
 #ifdef REXGLUE_ENABLE_PROFILING
 #include <tracy/Tracy.hpp>
+#endif
+
+#if defined(_M_X64) || defined(_M_IX86)
+#include <intrin.h>
+#define REX_PERF_CPU_PROFILE_RDTSC 1
+#elif defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#define REX_PERF_CPU_PROFILE_RDTSC 1
 #endif
 
 namespace rex::perf {
@@ -34,7 +43,65 @@ enum class DrawBucket : uint8_t {
   kCopyResolveFast32,
   kCopyResolveFull32,
   kResolveDownscale,
+  // Guest render pass entry: ending the previous render pass, beginning the
+  // new one and replaying deferred resolve clears. Not aggregated into the
+  // draw/res/dump FPS overlay lines - shows up in "other".
+  kRenderPassEntry,
+  // Render target ownership transfers and resolve clears performed in
+  // PerformTransfersAndResolveClears.
+  kRtTransfer,
+  // Texture cache uploads (guest texture data load compute dispatches).
+  kTextureUpload,
+  // Shared memory (guest memory mirror buffer) uploads.
+  kSharedMemoryUpload,
+  // From the end of a resolve operation until the next instrumented point -
+  // the post-resolve barriers and any idle gap before the next draws.
+  kResolveGap,
+  // The buffer-to-image copy phase of a texture upload (kTextureUpload then
+  // covers only the load compute dispatches and their barriers).
+  kTextureUploadCopy,
+  kCount,
 };
+
+// Short display name of a draw bucket (for logs and capture CSVs).
+inline const char* DrawBucketName(DrawBucket bucket) {
+  switch (bucket) {
+    case DrawBucket::kMainColorDepth:
+      return "Main";
+    case DrawBucket::kDepthOnly:
+      return "Depth";
+    case DrawBucket::kCopyResolve:
+      return "Copy";
+    case DrawBucket::kMemexport:
+      return "MemExp";
+    case DrawBucket::kNoPixelShader:
+      return "NoPS";
+    case DrawBucket::kCopyDump:
+      return "CopyDump";
+    case DrawBucket::kCopyResolveShader:
+      return "CopyResolve";
+    case DrawBucket::kCopyResolveFast32:
+      return "CopyResolveFast32";
+    case DrawBucket::kCopyResolveFull32:
+      return "CopyResolveFull32";
+    case DrawBucket::kResolveDownscale:
+      return "ResolveDownscale";
+    case DrawBucket::kRenderPassEntry:
+      return "PassEntry";
+    case DrawBucket::kRtTransfer:
+      return "RtTransfer";
+    case DrawBucket::kTextureUpload:
+      return "TexUpload";
+    case DrawBucket::kSharedMemoryUpload:
+      return "SMUpload";
+    case DrawBucket::kResolveGap:
+      return "ResolveGap";
+    case DrawBucket::kTextureUploadCopy:
+      return "TexUpCopy";
+    default:
+      return "Unknown";
+  }
+}
 
 struct DrawFingerprint {
   DrawBucket bucket = DrawBucket::kMainColorDepth;
@@ -91,6 +158,13 @@ enum class CounterId : uint16_t {
   kDrawStageVertexBuffersUs,
   kDrawStageBarriersUs,
   kDrawStageSubmitUs,
+  kDrawStageSystemConstantsUs,
+  kDrawSamplerFastPathDraws,
+  kDrawTextureFastPathDraws,
+  kDrawStageAnalyzeUs,
+  kDrawStageTranslateUs,
+  kDrawStageSamplersUs,
+  kDrawStagePreDrawUs,
   kGpuMainUs,
   kGpuDepthUs,
   kGpuCopyUs,
@@ -113,6 +187,8 @@ enum class CounterId : uint16_t {
   kGpuResolveQueryUs,
   kCpuPrimaryBufferUs,
   kCpuIndirectBufferUs,
+  kCpuGuestWaitUs,
+  kCpuSwapUs,
   kCpuD3D12BeginSubmissionUs,
   kCpuD3D12BeginSubmissionFenceUs,
   kCpuD3D12BeginSubmissionFrameOpenUs,
@@ -135,6 +211,10 @@ enum class CounterId : uint16_t {
   kCpuD3D12PaintUiUs,
   kCpuD3D12PresentWaitUs,
   kCpuD3D12PresentUs,
+  // Time the GPU emulation thread spent blocked waiting for submission
+  // fences (both backends) - high values mean GPU-bound, near zero means the
+  // thread itself is the bottleneck.
+  kGpuThreadFenceWaitUs,
   kTextureRequestUs,
   kTextureRequestCalls,
   kTextureFetchesRequested,
@@ -243,6 +323,50 @@ enum class CounterId : uint16_t {
   kCount  // sentinel -- must be last
 };
 
+// Lightweight CPU-side scope attribution for perf-counter builds. When enabled
+// at runtime (the gpu_cpu_profile cvar), every ScopedCounterTimer scope
+// accumulates raw timestamp ticks and a hit count per CounterId; the command
+// processor converts ticks to microseconds against a wall-clock calibration
+// window and logs the breakdown periodically at frame end. Constraint: each
+// CounterId may only be written from one thread (slots are not atomic).
+namespace cpu_profile {
+
+inline uint64_t Ticks() {
+#ifdef REX_PERF_CPU_PROFILE_RDTSC
+  return __rdtsc();
+#else
+  return uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+
+struct Slot {
+  uint64_t ticks;
+  uint64_t count;
+};
+
+inline std::atomic<bool> enabled{false};
+inline Slot slots[size_t(CounterId::kCount)]{};
+
+inline void Reset() {
+  for (Slot& slot : slots) {
+    slot.ticks = 0;
+    slot.count = 0;
+  }
+}
+
+// Count an event (no time attribution) when the CPU profile is armed.
+inline void CountEvent(CounterId id) {
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  if (enabled.load(std::memory_order_relaxed)) {
+    ++slots[size_t(id)].count;
+  }
+#else
+  (void)id;
+#endif
+}
+
+}  // namespace cpu_profile
+
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 
 // Returns human-readable name for a counter (e.g. "frame_time_us")
@@ -294,6 +418,9 @@ class ScopedCounterTimer {
     if (active_) {
       start_ = Clock::now();
     }
+    if (cpu_profile::enabled.load(std::memory_order_relaxed)) {
+      cpu_profile_start_ticks_ = cpu_profile::Ticks();
+    }
   }
 
   ~ScopedCounterTimer() {
@@ -301,6 +428,12 @@ class ScopedCounterTimer {
   }
 
   void Stop() {
+    if (cpu_profile_start_ticks_) {
+      cpu_profile::Slot& slot = cpu_profile::slots[size_t(counter_id_)];
+      slot.ticks += cpu_profile::Ticks() - cpu_profile_start_ticks_;
+      ++slot.count;
+      cpu_profile_start_ticks_ = 0;
+    }
     if (!active_) {
       return;
     }
@@ -318,6 +451,7 @@ class ScopedCounterTimer {
   CounterId counter_id_;
   bool active_;
   Clock::time_point start_;
+  uint64_t cpu_profile_start_ticks_ = 0;
 };
 
 // Read a counter's current live value
@@ -406,6 +540,9 @@ class ScopedCounterTimer {
     (void)counter_id;
     (void)active;
   }
+
+  ~ScopedCounterTimer() = default;
+
   void Stop() {}
 
   ScopedCounterTimer(const ScopedCounterTimer&) = delete;
@@ -487,7 +624,12 @@ class Profiler {
 
 }  // namespace rex::perf
 
-// Perf counter macros -- compile to no-ops when counters are disabled.
+// Perf counter macros -- compile to no-ops when counters are disabled. CPU
+// profile scope timers are perf-build-only so shipped builds do not pay
+// per-scope constructor/destructor or atomic-check costs.
+#define REX_PERF_CONCAT_INNER(a, b) a##b
+#define REX_PERF_CONCAT(a, b) REX_PERF_CONCAT_INNER(a, b)
+
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 
 // Generic helpers for easily adding new counters
@@ -510,8 +652,6 @@ class Profiler {
 #define PROFILE_DRAW_FINGERPRINT(fingerprint) rex::perf::RecordDrawFingerprint(fingerprint)
 #define PROFILE_DRAW_STAGE_US(id, delta) rex::perf::IncrementCounter((id), (delta))
 #define PROFILE_GPU_TIMESTAMPED_DRAW() PERF_counter_inc(kGpuTimestampedDraws)
-#define REX_PERF_CONCAT_INNER(a, b) a##b
-#define REX_PERF_CONCAT(a, b) REX_PERF_CONCAT_INNER(a, b)
 #define PROFILE_SCOPE_COUNTER(id) \
   rex::perf::ScopedCounterTimer REX_PERF_CONCAT(perf_scope_timer_, __LINE__)(rex::perf::CounterId::id)
 #define PROFILE_SCOPE_COUNTER_IF(id, active) \

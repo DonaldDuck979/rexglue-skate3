@@ -585,6 +585,16 @@ bool Presenter::RefreshGuestOutput(
       return false;
     }
     guest_output_active_last_refresh_ = true;
+    if (GuestFrameStatsEnabled()) {
+      std::lock_guard<std::mutex> stats_lock(guest_frame_stats_mutex_);
+      guest_frame_timestamps_[guest_frame_timestamp_next_] = std::chrono::steady_clock::now();
+      guest_frame_timestamp_next_ = (guest_frame_timestamp_next_ + 1) % kGuestFrameTimestampCount;
+      guest_frame_timestamp_count_ =
+          std::min(guest_frame_timestamp_count_ + 1, kGuestFrameTimestampCount);
+      ++guest_frame_total_count_;
+      guest_frame_last_wait_us_ =
+          guest_frame_wait_accumulator_us_.exchange(0, std::memory_order_relaxed);
+    }
   } else {
     // Request presenting a blank image if there was a true image previously,
     // but not now.
@@ -685,6 +695,93 @@ bool Presenter::RefreshGuestOutput(
   }
 
   return is_active;
+}
+
+void Presenter::SetGuestFrameStatsEnabled(bool enabled) {
+  const bool was_enabled = GuestFrameStatsEnabled();
+  if (enabled == was_enabled) {
+    return;
+  }
+  if (!enabled) {
+    guest_frame_stats_enabled_.store(false, std::memory_order_relaxed);
+    return;
+  }
+
+  std::lock_guard<std::mutex> stats_lock(guest_frame_stats_mutex_);
+  guest_frame_timestamps_ = {};
+  guest_frame_timestamp_next_ = 0;
+  guest_frame_timestamp_count_ = 0;
+  guest_frame_total_count_ = 0;
+  guest_frame_last_wait_us_ = 0;
+  guest_frame_wait_accumulator_us_.store(0, std::memory_order_relaxed);
+  guest_frame_gpu_span_us_.store(0, std::memory_order_relaxed);
+  guest_frame_gpu_draw_us_.store(0, std::memory_order_relaxed);
+  guest_frame_gpu_resolve_us_.store(0, std::memory_order_relaxed);
+  guest_frame_gpu_dump_us_.store(0, std::memory_order_relaxed);
+  guest_frame_stats_enabled_.store(true, std::memory_order_relaxed);
+}
+
+Presenter::GuestFrameStats Presenter::GetGuestFrameStats() const {
+  if (!GuestFrameStatsEnabled()) {
+    return {};
+  }
+
+  // Average over up to the last second of frames. Measuring the window from
+  // the oldest in-window frame to the present time (rather than to the newest
+  // frame) makes the reported FPS decay naturally when the guest stops
+  // producing frames instead of freezing at the last value.
+  constexpr std::chrono::steady_clock::duration kWindow = std::chrono::seconds(1);
+  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  const std::chrono::steady_clock::time_point window_start = now - kWindow;
+
+  GuestFrameStats stats;
+  std::lock_guard<std::mutex> stats_lock(guest_frame_stats_mutex_);
+  stats.frame_count = guest_frame_total_count_;
+  stats.wait_ms = double(guest_frame_last_wait_us_) / 1000.0;
+  stats.gpu_ms = double(guest_frame_gpu_span_us_.load(std::memory_order_relaxed)) / 1000.0;
+  stats.gpu_draw_ms = double(guest_frame_gpu_draw_us_.load(std::memory_order_relaxed)) / 1000.0;
+  stats.gpu_resolve_ms =
+      double(guest_frame_gpu_resolve_us_.load(std::memory_order_relaxed)) / 1000.0;
+  stats.gpu_dump_ms = double(guest_frame_gpu_dump_us_.load(std::memory_order_relaxed)) / 1000.0;
+  size_t frames_in_window = 0;
+  std::chrono::steady_clock::time_point oldest_in_window;
+  std::chrono::steady_clock::time_point newest_in_window;
+  for (size_t i = 0; i < guest_frame_timestamp_count_; ++i) {
+    // Walk from the newest sample backwards.
+    size_t index =
+        (guest_frame_timestamp_next_ + kGuestFrameTimestampCount - 1 - i) %
+        kGuestFrameTimestampCount;
+    const std::chrono::steady_clock::time_point timestamp = guest_frame_timestamps_[index];
+    if (timestamp < window_start) {
+      break;
+    }
+    if (!frames_in_window) {
+      newest_in_window = timestamp;
+    }
+    oldest_in_window = timestamp;
+    ++frames_in_window;
+  }
+  if (!frames_in_window) {
+    return stats;
+  }
+  const double span_to_now_seconds =
+      std::chrono::duration_cast<std::chrono::duration<double>>(now - oldest_in_window).count();
+  if (span_to_now_seconds > 0.0) {
+    stats.fps = double(frames_in_window) / span_to_now_seconds;
+  }
+  if (frames_in_window >= 2) {
+    const double span_between_frames_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(newest_in_window -
+                                                                  oldest_in_window)
+            .count();
+    if (span_between_frames_seconds > 0.0) {
+      stats.frame_time_ms =
+          span_between_frames_seconds * 1000.0 / double(frames_in_window - 1);
+    }
+  } else if (stats.fps > 0.0) {
+    stats.frame_time_ms = 1000.0 / stats.fps;
+  }
+  return stats;
 }
 
 void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {

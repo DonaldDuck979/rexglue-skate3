@@ -1423,4 +1423,45 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   }
 }
 
+bool RenderTargetCache::IsOwnershipConfinedToRange(RenderTargetKey key,
+                                                   uint32_t start_tiles_base_relative,
+                                                   uint32_t length_tiles) const {
+  if (key.IsEmpty()) {
+    return false;
+  }
+  // Convert to up to two absolute extents the same way as ChangeOwnership.
+  uint32_t start_tiles = (key.base_tiles + start_tiles_base_relative) & (xenos::kEdramTileCount - 1);
+  uint32_t end_tiles = start_tiles + length_tiles;
+  uint32_t extent_starts[2] = {start_tiles, 0};
+  uint32_t extent_ends[2] = {std::min(end_tiles, xenos::kEdramTileCount), 0};
+  uint32_t extent_count = 1;
+  if (end_tiles > xenos::kEdramTileCount) {
+    extent_ends[extent_count++] = std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles);
+  }
+  bool host_depth_encoding_different = key.is_depth && GetPath() == Path::kHostRenderTargets &&
+                                       IsHostDepthEncodingDifferent(key.GetDepthFormat());
+  for (const auto& range_pair : ownership_ranges_) {
+    uint32_t range_start = range_pair.first;
+    uint32_t range_end = range_pair.second.end_tiles;
+    bool references_key = range_pair.second.render_target == key;
+    if (!references_key && host_depth_encoding_different) {
+      references_key = range_pair.second.GetHostDepthRenderTarget(key.GetDepthFormat()) == key;
+    }
+    if (!references_key) {
+      continue;
+    }
+    bool contained = false;
+    for (uint32_t i = 0; i < extent_count; ++i) {
+      if (range_start >= extent_starts[i] && range_end <= extent_ends[i]) {
+        contained = true;
+        break;
+      }
+    }
+    if (!contained) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace rex::graphics

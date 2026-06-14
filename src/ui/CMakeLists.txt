@@ -20,6 +20,7 @@ set(REXUI_CORE_SOURCES
 set(REXUI_OVERLAY_SOURCES
     overlay/debug_overlay.cpp
     overlay/console_overlay.cpp
+    overlay/fps_overlay.cpp
     overlay/acquire_wizard_overlay.cpp
     overlay/install_wizard_overlay.cpp
     overlay/simple_settings_overlay.cpp
@@ -145,6 +146,11 @@ if(WIN32)
     target_link_libraries(rexui PUBLIC
         dwmapi
         Shcore
+        # The backend-agnostic Presenter drives a DXGI UI tick thread on Windows
+        # (display-refresh sync), so DXGI is required regardless of the graphics
+        # backend selected (e.g. Vulkan-on-Windows builds with D3D12 disabled).
+        dxgi
+        dxguid
     )
 elseif(APPLE)
     target_link_libraries(rexui PUBLIC SDL3::SDL3)
@@ -163,11 +169,9 @@ else()
     )
 endif()
 
-# D3D12 backend dependencies
+# D3D12 backend dependencies (dxgi/dxguid linked unconditionally on Windows above)
 if(REXGLUE_USE_D3D12)
     target_link_libraries(rexui PUBLIC
-        dxgi
-        dxguid
         dxc-headers
     )
 endif()

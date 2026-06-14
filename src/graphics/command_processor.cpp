@@ -109,6 +109,13 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+REXCVAR_DEFINE_BOOL(gpu_cpu_profile, false, "GPU",
+                    "Log per-frame CPU time attribution for the GPU emulation thread "
+                    "(packet processing, draw stages, submission) every 120 frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#endif
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
@@ -1132,11 +1139,103 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  {
+    PROFILE_SCOPE_COUNTER(kCpuSwapUs);
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
+
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  CpuProfileOnFrameEnd();
+#endif
 
   ++counter_;
   return true;
 }
+
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+void CommandProcessor::CpuProfileOnFrameEnd() {
+  namespace cpu_profile = rex::perf::cpu_profile;
+  if (!REXCVAR_GET(gpu_cpu_profile)) {
+    if (cpu_profile::enabled.load(std::memory_order_relaxed)) {
+      cpu_profile::enabled.store(false, std::memory_order_relaxed);
+    }
+    return;
+  }
+  const uint64_t now_ticks = cpu_profile::Ticks();
+  const std::chrono::steady_clock::time_point now_time = std::chrono::steady_clock::now();
+  if (!cpu_profile::enabled.load(std::memory_order_relaxed)) {
+    // Newly armed - start accumulating from the next frame.
+    cpu_profile::enabled.store(true, std::memory_order_relaxed);
+    cpu_profile::Reset();
+    cpu_profile_frames_ = 0;
+    cpu_profile_window_start_ticks_ = now_ticks;
+    cpu_profile_window_start_time_ = now_time;
+    REXGPU_INFO("CPU profile armed (gpu_cpu_profile): logging every {} frames",
+                kCpuProfileLogFrameInterval);
+    return;
+  }
+  if (++cpu_profile_frames_ < kCpuProfileLogFrameInterval) {
+    return;
+  }
+
+  // Scope timers record raw TSC ticks; calibrate them against the wall-clock
+  // duration of the whole logging window.
+  const int64_t window_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                now_time - cpu_profile_window_start_time_)
+                                .count();
+  const uint64_t window_ticks = now_ticks - cpu_profile_window_start_ticks_;
+  const uint32_t frames = cpu_profile_frames_;
+  if (window_us > 0 && window_ticks > 0) {
+    const double us_per_tick = double(window_us) / double(window_ticks);
+    using rex::perf::CounterId;
+    auto avg_us = [&](CounterId id) -> uint64_t {
+      return uint64_t(double(cpu_profile::slots[size_t(id)].ticks) * us_per_tick) / frames;
+    };
+    auto avg_count = [&](CounterId id) -> uint64_t {
+      return cpu_profile::slots[size_t(id)].count / frames;
+    };
+    // Nesting: everything below is inside pm4. copy is inside draw (resolves
+    // are initiated by draw packets); sub_begin/fence waits happen inside
+    // draws; sub_end happens inside swap (frame-ending submission) unless
+    // submitting per primary buffer end.
+    const uint64_t pm4_us = avg_us(CounterId::kCpuPrimaryBufferUs);
+    const uint64_t guest_wait_us = avg_us(CounterId::kCpuGuestWaitUs);
+    const uint64_t draw_us = avg_us(CounterId::kDrawStageTotalUs);
+    const uint64_t swap_us = avg_us(CounterId::kCpuSwapUs);
+    const uint64_t accounted_us = guest_wait_us + draw_us + swap_us;
+    REXGPU_INFO(
+        "CPU profile (avg us/frame over {} frames): frame={} pm4={} draws={} | draw={} [anlz={} "
+        "prim={} xlat={} smp={} rt={} pso={} tex={} fixfn={} sysconst={} bind={} vb={} barrier={} "
+        "pre={} subm={}] copy={} ({}x) | sub_begin={} [fence_check={} fence_wait={}] sub_end={} "
+        "({}x) [pipe_end={} barriers={} record={} close={} qsubmit={} signal={}] | swap={} "
+        "guest_wait={} pm4_other={} | fast_smp={} fast_tex={}",
+        frames, window_us / frames, pm4_us, avg_count(CounterId::kDrawStageTotalUs), draw_us,
+        avg_us(CounterId::kDrawStageAnalyzeUs), avg_us(CounterId::kDrawStagePrimitiveUs),
+        avg_us(CounterId::kDrawStageTranslateUs), avg_us(CounterId::kDrawStageSamplersUs),
+        avg_us(CounterId::kDrawStageRenderTargetUs),
+        avg_us(CounterId::kDrawStagePipelineUs), avg_us(CounterId::kDrawStageTextureUs),
+        avg_us(CounterId::kDrawStageFixedFunctionUs),
+        avg_us(CounterId::kDrawStageSystemConstantsUs), avg_us(CounterId::kDrawStageBindingsUs),
+        avg_us(CounterId::kDrawStageVertexBuffersUs), avg_us(CounterId::kDrawStageBarriersUs),
+        avg_us(CounterId::kDrawStagePreDrawUs), avg_us(CounterId::kDrawStageSubmitUs),
+        avg_us(CounterId::kRtResolveUs),
+        avg_count(CounterId::kRtResolveUs), avg_us(CounterId::kCpuD3D12BeginSubmissionUs),
+        avg_us(CounterId::kCpuD3D12CheckFenceUs), avg_us(CounterId::kCpuD3D12FenceWaitUs),
+        avg_us(CounterId::kCpuD3D12EndSubmissionUs), avg_count(CounterId::kCpuD3D12EndSubmissionUs),
+        avg_us(CounterId::kCpuD3D12PipelineEndUs), avg_us(CounterId::kCpuD3D12SubmitBarriersUs),
+        avg_us(CounterId::kCpuD3D12DeferredExecuteUs),
+        avg_us(CounterId::kCpuD3D12CommandListCloseUs),
+        avg_us(CounterId::kCpuD3D12ExecuteCommandListsUs), avg_us(CounterId::kCpuD3D12SignalUs),
+        swap_us, guest_wait_us, pm4_us > accounted_us ? pm4_us - accounted_us : 0,
+        avg_count(CounterId::kDrawSamplerFastPathDraws),
+        avg_count(CounterId::kDrawTextureFastPathDraws));
+  }
+  cpu_profile::Reset();
+  cpu_profile_frames_ = 0;
+  cpu_profile_window_start_ticks_ = now_ticks;
+  cpu_profile_window_start_time_ = now_time;
+}
+#endif
 
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
@@ -1205,7 +1304,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
-      // Wait.
+      // Wait. Attributed separately so time spent blocked on guest-side
+      // progress isn't read as command processing cost.
+      PROFILE_SCOPE_COUNTER(kCpuGuestWaitUs);
       if (wait >= 0x100) {
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {

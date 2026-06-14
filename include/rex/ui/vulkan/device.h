@@ -74,6 +74,8 @@ class VulkanDevice {
     uint32_t maxViewportDimensions[2] = {4096, 4096};
     VkDeviceSize minUniformBufferOffsetAlignment = 256;
     VkDeviceSize minStorageBufferOffsetAlignment = 256;
+    uint32_t maxTexelBufferElements = 65536;
+    VkDeviceSize minTexelBufferOffsetAlignment = 256;
     uint32_t maxFramebufferWidth = 4096;
     uint32_t maxFramebufferHeight = 4096;
     VkSampleCountFlags framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
@@ -184,6 +186,7 @@ class VulkanDevice {
   // `ext_major_minor_` prefix rather than `ext_`).
   struct Extensions {
     bool ext_KHR_swapchain = false;                     // #2
+    bool ext_KHR_push_descriptor = false;               // #81
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
@@ -214,6 +217,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_1_0.inc>
     // VK_KHR_swapchain (#2)
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+    // VK_KHR_push_descriptor (#81)
+#include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
     // VK_KHR_get_memory_requirements2 (#147, promoted to 1.1)
 #include <rex/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc>
     // VK_KHR_bind_memory2 (#158, promoted to 1.1)

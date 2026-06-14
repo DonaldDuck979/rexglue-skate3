@@ -159,6 +159,13 @@ constexpr const char* kCounterNames[] = {
     "draw_stage_vertex_buffers_us",
     "draw_stage_barriers_us",
     "draw_stage_submit_us",
+    "draw_stage_system_constants_us",
+    "draw_sampler_fast_path_draws",
+    "draw_texture_fast_path_draws",
+    "draw_stage_analyze_us",
+    "draw_stage_translate_us",
+    "draw_stage_samplers_us",
+    "draw_stage_pre_draw_us",
     "gpu_main_us",
     "gpu_depth_us",
     "gpu_copy_us",
@@ -181,6 +188,8 @@ constexpr const char* kCounterNames[] = {
     "gpu_resolve_query_us",
     "cpu_primary_buffer_us",
     "cpu_indirect_buffer_us",
+    "cpu_guest_wait_us",
+    "cpu_swap_us",
     "cpu_d3d12_begin_submission_us",
     "cpu_d3d12_begin_submission_fence_us",
     "cpu_d3d12_begin_submission_frame_open_us",
@@ -203,6 +212,7 @@ constexpr const char* kCounterNames[] = {
     "cpu_d3d12_paint_ui_us",
     "cpu_d3d12_present_wait_us",
     "cpu_d3d12_present_us",
+    "gpu_thread_fence_wait_us",
     "texture_request_us",
     "texture_request_calls",
     "texture_fetches_requested",
@@ -337,6 +347,13 @@ constexpr bool kIsGauge[] = {
     false,  // kDrawStageVertexBuffersUs
     false,  // kDrawStageBarriersUs
     false,  // kDrawStageSubmitUs
+    false,  // kDrawStageSystemConstantsUs
+    false,  // kDrawSamplerFastPathDraws
+    false,  // kDrawTextureFastPathDraws
+    false,  // kDrawStageAnalyzeUs
+    false,  // kDrawStageTranslateUs
+    false,  // kDrawStageSamplersUs
+    false,  // kDrawStagePreDrawUs
     false,  // kGpuMainUs
     false,  // kGpuDepthUs
     false,  // kGpuCopyUs
@@ -359,6 +376,8 @@ constexpr bool kIsGauge[] = {
     false,  // kGpuResolveQueryUs
     false,  // kCpuPrimaryBufferUs
     false,  // kCpuIndirectBufferUs
+    false,  // kCpuGuestWaitUs
+    false,  // kCpuSwapUs
     false,  // kCpuD3D12BeginSubmissionUs
     false,  // kCpuD3D12BeginSubmissionFenceUs
     false,  // kCpuD3D12BeginSubmissionFrameOpenUs
@@ -381,6 +400,7 @@ constexpr bool kIsGauge[] = {
     false,  // kCpuD3D12PaintUiUs
     false,  // kCpuD3D12PresentWaitUs
     false,  // kCpuD3D12PresentUs
+    false,  // kGpuThreadFenceWaitUs
     false,  // kTextureRequestUs
     false,  // kTextureRequestCalls
     false,  // kTextureFetchesRequested
@@ -487,32 +507,7 @@ int g_csv_frame_count = 0;
 
 }  // anonymous namespace
 
-const char* DrawBucketName(DrawBucket bucket) {
-  switch (bucket) {
-    case DrawBucket::kMainColorDepth:
-      return "Main";
-    case DrawBucket::kDepthOnly:
-      return "Depth";
-    case DrawBucket::kCopyResolve:
-      return "Copy";
-    case DrawBucket::kMemexport:
-      return "MemExp";
-    case DrawBucket::kNoPixelShader:
-      return "NoPS";
-    case DrawBucket::kCopyDump:
-      return "CopyDump";
-    case DrawBucket::kCopyResolveShader:
-      return "CopyResolve";
-    case DrawBucket::kCopyResolveFast32:
-      return "CopyResolveFast32";
-    case DrawBucket::kCopyResolveFull32:
-      return "CopyResolveFull32";
-    case DrawBucket::kResolveDownscale:
-      return "ResolveDownscale";
-    default:
-      return "Unknown";
-  }
-}
+// DrawBucketName is defined inline in counter.h.
 
 const char* CounterName(CounterId id) {
   auto idx = static_cast<size_t>(id);

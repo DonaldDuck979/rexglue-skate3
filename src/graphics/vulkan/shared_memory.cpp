@@ -345,6 +345,9 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  // Attribute the GPU time of the upload copies (and the barriers around
+  // them) to the shared memory upload profiling bucket.
+  command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kSharedMemoryUpload);
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,

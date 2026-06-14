@@ -127,6 +127,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                          uint32_t* color_attachment_count_out,
                                          VkRenderingAttachmentInfo* depth_attachment,
                                          VkRenderingAttachmentInfo* stencil_attachment) const;
+  // To be called by the command processor right after entering the render pass
+  // for guest draws - replays the deferred resolve clears pending on the bound
+  // render targets with vkCmdClearAttachments inside that render pass.
+  // render_area_extent is the render area of the entered render pass which the
+  // clear rectangles must be contained in (entries that don't fit are kept
+  // deferred).
+  void FlushDeferredResolveClearsIntoEnteredRenderPass(const VkExtent2D& render_area_extent);
 
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
@@ -372,6 +379,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
 
+    // Resolve clears deferred until the next render pass binding this render
+    // target, or a standalone flush if its contents are needed earlier.
+    struct DeferredClear {
+      Transfer::Rectangle rectangle;
+      uint64_t clear_value;
+      // Absolute EDRAM tile range (may wrap across the addressing period)
+      // conservatively covering the rectangle, for read intersection checks.
+      uint32_t tiles_start;
+      uint32_t tiles_length;
+    };
+    std::vector<DeferredClear>& deferred_clears() { return deferred_clears_; }
+
    private:
     VulkanRenderTargetCache& render_target_cache_;
 
@@ -396,6 +415,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_sort_index_ = 0;
+
+    std::vector<DeferredClear> deferred_clears_;
   };
 
   struct FramebufferKey {
@@ -769,6 +790,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t source_base_tiles;
     uint32_t source_pitch_tiles;
     uint32_t dispatch_first_tile;
+    // Resolve rectangle height in pixels (the width is in
+    // resolve.dest_relative.coordinate_info, but the height is normally only
+    // implied by the dispatch size).
+    uint32_t height_pixels;
+    // How to pack the sampled host render target texel into the raw 32bpp
+    // guest dword: 0 = unorm8x4 (k_8_8_8_8 family), 1 = unorm 2_10_10_10.
+    uint32_t source_format_case;
   };
 
   struct DirectResolvePipelineKey {
@@ -813,9 +841,43 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
+  // Compute pipeline reading a 32bpp color or unorm24 depth / stencil host
+  // render target (single-sampled, native 2x MSAA or 4x MSAA) and writing the
+  // raw resolve destination directly, skipping the EDRAM buffer round trip.
+  // VK_NULL_HANDLE if unsupported or creation failed.
+  VkPipeline GetDirectResolveFast32Pipeline(bool is_depth, xenos::MsaaSamples source_msaa_samples);
+  // When this returns true, the destination has been fully written - the
+  // caller must skip both the render target dump and the EDRAM buffer copy.
   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                               draw_util::ResolveCopyShaderIndex copy_shader,
-                              bool draw_resolution_scaled);
+                              bool draw_resolution_scaled, VulkanSharedMemory& shared_memory,
+                              const draw_util::ResolveCopyShaderConstants& copy_shader_constants);
+
+  // Deferred resolve clears: instead of an own render pass with a rectangle
+  // attachment clear per resolve, clears are accumulated on the render target
+  // and replayed with vkCmdClearAttachments inside the next render pass that
+  // binds it for drawing (via FlushDeferredResolveClearsIntoEnteredRenderPass)
+  // or in a standalone ownership transfer render pass if something needs the
+  // render target's contents before then. This removes the per-resolve render
+  // pass and layout transition overhead, which is a large fixed cost on some
+  // hosts.
+  void DeferResolveClear(VulkanRenderTarget& render_target,
+                         const Transfer::Rectangle& clear_rectangle, uint64_t clear_value);
+  // Emits the pending deferred clears of the render target in a standalone
+  // ownership transfer render pass.
+  void FlushDeferredResolveClears(VulkanRenderTarget& render_target);
+  // Flushes the pending deferred clears of any render target whose deferred
+  // tile ranges intersect the given absolute EDRAM tile range that's about to
+  // be read (such as by a resolve dump).
+  void FlushDeferredResolveClearsBeforeEdramRead(uint32_t base_tiles, uint32_t length_tiles);
+  // Converts the guest resolve clear value the same way for all the clear
+  // paths. through_transfer_view selects between the image's own format (used
+  // when clearing through the guest render pass attachment) and the ownership
+  // transfer view format (uint for 16- and 32-bit-per-component color).
+  VkClearDepthStencilValue GetResolveClearDepthStencilValue(RenderTargetKey key,
+                                                            uint64_t clear_value) const;
+  VkClearColorValue GetResolveClearColorValue(RenderTargetKey key, uint64_t clear_value,
+                                              bool through_transfer_view) const;
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -867,6 +929,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
   std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
       direct_resolve_pipelines_;
+  // Lazily created (compiled from GLSL at runtime); the attempt flags prevent
+  // retrying the compilation every resolve after a failure. Indexed
+  // [is_depth][uint32_t(source MsaaSamples)].
+  VkPipeline direct_resolve_fast32_pipelines_[2][3] = {};
+  bool direct_resolve_fast32_pipelines_attempted_[2][3] = {};
+
+  // Render targets that currently have deferred resolve clears pending.
+  std::vector<VulkanRenderTarget*> deferred_clear_render_targets_;
+  // Temporary storage for FlushDeferredResolveClearsBeforeEdramRead.
+  std::vector<VulkanRenderTarget*> flush_deferred_clear_temp_;
+  // Deferred resolve clear statistics, logged periodically for diagnostics.
+  uint64_t deferred_clear_stat_deferred_ = 0;
+  uint64_t deferred_clear_stat_pass_entry_flushed_ = 0;
+  uint64_t deferred_clear_stat_standalone_flushed_ = 0;
+  uint64_t deferred_clear_stat_immediate_ = 0;
 
   // Temporary storage for Resolve.
   std::vector<Transfer> clear_transfers_[2];

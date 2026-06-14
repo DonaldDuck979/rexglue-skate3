@@ -541,6 +541,16 @@ class RenderTargetCache {
                                             RenderTarget*& color_render_target_out,
                                             std::vector<Transfer>& color_transfers_out);
 
+  // Returns whether every EDRAM tile range for which the given render target
+  // holds the up-to-date contents - as the current owner, or as the latest
+  // host depth copy if the host depth encoding differs from the guest - lies
+  // fully within the given range relative to the render target's base (using
+  // the same wrapping rules as ChangeOwnership). When this holds, destroying
+  // the host render target's contents outside that range (for example with a
+  // whole-image clear) loses no data that could still be read.
+  bool IsOwnershipConfinedToRange(RenderTargetKey key, uint32_t start_tiles_base_relative,
+                                  uint32_t length_tiles) const;
+
   // For restoring EDRAM contents from frame traces, obtains or creates a render
   // target at base 0 with of 1280 (only 1 sample and color because copying
   // between MSAA render targets and buffers is not possible in Direct3D 12, and

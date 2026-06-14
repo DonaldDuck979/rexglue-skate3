@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -339,6 +340,67 @@ class Presenter {
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
+
+  // Guest frame pacing measured at RefreshGuestOutput - one sample per guest
+  // swap, independent of how many times the host paints (UI repaints while a
+  // dialog is open present without a new guest frame, so host present rate is
+  // not a valid guest FPS measurement). Thread-safe.
+  struct GuestFrameStats {
+    // Averaged over the sampling window (zero when no recent frames).
+    double fps = 0.0;
+    double frame_time_ms = 0.0;
+    // Time the guest output producer (GPU emulation thread) reported spending
+    // blocked on host GPU waits during the last frame, via
+    // AddGuestFrameWaitMicroseconds. Near frame_time_ms = host GPU bound,
+    // near zero = producer thread bound.
+    double wait_ms = 0.0;
+    // Host GPU time span of the most recently measured guest frame (first to
+    // last command on the device timeline), via
+    // SetGuestFrameGpuSpanMicroseconds. Zero when the backend doesn't report
+    // it.
+    double gpu_ms = 0.0;
+    // Optional GPU time breakdown of the measured frame (guest draws,
+    // resolves, render target dumps), via
+    // SetGuestFrameGpuBreakdownMicroseconds. All zero when the backend isn't
+    // measuring buckets.
+    double gpu_draw_ms = 0.0;
+    double gpu_resolve_ms = 0.0;
+    double gpu_dump_ms = 0.0;
+    // Total guest frames since startup.
+    uint64_t frame_count = 0;
+  };
+  GuestFrameStats GetGuestFrameStats() const;
+  bool GuestFrameStatsEnabled() const {
+    return guest_frame_stats_enabled_.load(std::memory_order_relaxed);
+  }
+  void SetGuestFrameStatsEnabled(bool enabled);
+  // Reports time the guest output producer spent blocked waiting for the host
+  // GPU; accumulated into the current frame's stats and reset at the next
+  // RefreshGuestOutput. Thread-safe.
+  void AddGuestFrameWaitMicroseconds(uint64_t wait_us) {
+    if (!GuestFrameStatsEnabled()) {
+      return;
+    }
+    guest_frame_wait_accumulator_us_.fetch_add(wait_us, std::memory_order_relaxed);
+  }
+  // Reports the host GPU time span of a completed guest frame (measured by
+  // the backend, typically a few frames behind real time). Thread-safe.
+  void SetGuestFrameGpuSpanMicroseconds(uint64_t gpu_span_us) {
+    if (!GuestFrameStatsEnabled()) {
+      return;
+    }
+    guest_frame_gpu_span_us_.store(gpu_span_us, std::memory_order_relaxed);
+  }
+  // Reports the GPU time breakdown of a completed guest frame. Thread-safe.
+  void SetGuestFrameGpuBreakdownMicroseconds(uint64_t draw_us, uint64_t resolve_us,
+                                             uint64_t dump_us) {
+    if (!GuestFrameStatsEnabled()) {
+      return;
+    }
+    guest_frame_gpu_draw_us_.store(draw_us, std::memory_order_relaxed);
+    guest_frame_gpu_resolve_us_.store(resolve_us, std::memory_order_relaxed);
+    guest_frame_gpu_dump_us_.store(dump_us, std::memory_order_relaxed);
+  }
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
@@ -967,6 +1029,26 @@ class Presenter {
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
+
+  // Guest frame timestamps for GetGuestFrameStats, written by the refreshing
+  // thread, read by any thread. Sized to cover the stats window even at very
+  // high frame rates.
+  static constexpr size_t kGuestFrameTimestampCount = 512;
+  std::atomic<bool> guest_frame_stats_enabled_{false};
+  mutable std::mutex guest_frame_stats_mutex_;
+  std::array<std::chrono::steady_clock::time_point, kGuestFrameTimestampCount>
+      guest_frame_timestamps_{};
+  size_t guest_frame_timestamp_next_ = 0;
+  size_t guest_frame_timestamp_count_ = 0;
+  uint64_t guest_frame_total_count_ = 0;
+  std::atomic<uint64_t> guest_frame_wait_accumulator_us_{0};
+  // Captured from the accumulator at each guest output refresh; guarded by
+  // guest_frame_stats_mutex_.
+  uint64_t guest_frame_last_wait_us_ = 0;
+  std::atomic<uint64_t> guest_frame_gpu_span_us_{0};
+  std::atomic<uint64_t> guest_frame_gpu_draw_us_{0};
+  std::atomic<uint64_t> guest_frame_gpu_resolve_us_{0};
+  std::atomic<uint64_t> guest_frame_gpu_dump_us_{0};
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as

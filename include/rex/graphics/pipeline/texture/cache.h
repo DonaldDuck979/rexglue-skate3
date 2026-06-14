@@ -115,6 +115,13 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
+
+  // Monotonic generation of the active texture binding views - incremented
+  // whenever any binding's textures change (UpdateTextureBindingsImpl calls).
+  // Backends can compare this between draws to skip rebuilding descriptor
+  // contents when the bound views are unchanged.
+  uint64_t texture_bindings_generation() const { return texture_bindings_generation_; }
+
   void DebugRecordResolveReadback(uint32_t start, uint32_t length, bool scaled);
   void DebugClearRecentResolveReadbacks();
   void DebugRecordTeamProfileBackgroundResolveRange(uint32_t start, uint32_t length, bool scaled,
@@ -669,6 +676,8 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+  // See texture_bindings_generation().
+  uint64_t texture_bindings_generation_ = 1;
 
   int32_t debug_scaled_texture_bindings_remaining_seen_ = 0;
   uint32_t debug_scaled_texture_binding_logs_this_sample_ = 0;

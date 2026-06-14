@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -138,6 +139,16 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkClearColorImage), alignof(VkImageSubresourceRange))));
       } break;
 
+      case Command::kVkClearDepthStencilImage: {
+        auto& args = *reinterpret_cast<const ArgsVkClearDepthStencilImage*>(stream);
+        dfn.vkCmdClearDepthStencilImage(
+            command_buffer, args.image, args.image_layout, &args.depth_stencil, args.range_count,
+            reinterpret_cast<const VkImageSubresourceRange*>(
+                reinterpret_cast<const uint8_t*>(stream) +
+                rex::align(sizeof(ArgsVkClearDepthStencilImage),
+                           alignof(VkImageSubresourceRange))));
+      } break;
+
       case Command::kVkCopyBuffer: {
         auto& args = *reinterpret_cast<const ArgsVkCopyBuffer*>(stream);
         dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
@@ -264,6 +275,34 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         dfn.vkCmdPushConstants(
             command_buffer, args.layout, args.stage_flags, args.offset, args.size,
             reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
+      } break;
+
+      case Command::kVkPushUniformBufferDescriptorSet: {
+        auto& args = *reinterpret_cast<const ArgsVkPushUniformBufferDescriptorSet*>(stream);
+        size_t offset_bytes = rex::align(sizeof(ArgsVkPushUniformBufferDescriptorSet),
+                                         alignof(VkDescriptorBufferInfo));
+        const VkDescriptorBufferInfo* buffer_infos = reinterpret_cast<const VkDescriptorBufferInfo*>(
+            reinterpret_cast<const uint8_t*>(stream) + offset_bytes);
+        constexpr uint32_t kMaxPushedUniformBuffers = 8;
+        assert_true(args.buffer_count <= kMaxPushedUniformBuffers);
+        VkWriteDescriptorSet writes[kMaxPushedUniformBuffers];
+        uint32_t write_count = std::min(args.buffer_count, kMaxPushedUniformBuffers);
+        for (uint32_t i = 0; i < write_count; ++i) {
+          VkWriteDescriptorSet& write = writes[i];
+          write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          write.pNext = nullptr;
+          // dstSet is ignored for push descriptors.
+          write.dstSet = VK_NULL_HANDLE;
+          write.dstBinding = i;
+          write.dstArrayElement = 0;
+          write.descriptorCount = 1;
+          write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+          write.pImageInfo = nullptr;
+          write.pBufferInfo = &buffer_infos[i];
+          write.pTexelBufferView = nullptr;
+        }
+        dfn.vkCmdPushDescriptorSetKHR(command_buffer, args.pipeline_bind_point, args.layout,
+                                      args.set, write_count, writes);
       } break;
 
       case Command::kVkResetQueryPool: {

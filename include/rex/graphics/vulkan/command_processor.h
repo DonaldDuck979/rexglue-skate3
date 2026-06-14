@@ -614,6 +614,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Descriptor set layouts used by different shaders.
   VkDescriptorSetLayout descriptor_set_layout_empty_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptor_set_layout_constants_ = VK_NULL_HANDLE;
+  // Whether the guest constant buffer descriptors are pushed via
+  // VK_KHR_push_descriptor instead of being written to transient descriptor
+  // sets (vulkan_push_constants_descriptors and driver support, applied at
+  // setup; descriptor_set_layout_constants_ is created with the push
+  // descriptor flag and must not be used with vkAllocateDescriptorSets then).
+  bool constants_push_descriptors_used_ = false;
   std::array<VkDescriptorSetLayout, size_t(SingleTransientDescriptorLayout::kCount)>
       descriptor_set_layouts_single_transient_{};
   VkDescriptorSetLayout descriptor_set_layout_shared_memory_and_edram_ = VK_NULL_HANDLE;
@@ -646,6 +652,21 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unordered_map<TextureDescriptorSetLayoutKey, std::vector<VkDescriptorSet>,
                      TextureDescriptorSetLayoutKey::Hasher>
       texture_transient_descriptor_sets_free_;
+  // Frame-local reuse of transient texture/sampler descriptor sets: XXH3 of
+  // the binding contents (stage, counts, image views, samplers) -> a set
+  // already written with those contents this frame. Transient sets are
+  // recycled only after their frame completes on the GPU, so within a frame
+  // their contents are immutable and the same set can simply be rebound
+  // instead of allocating and writing a new one for every draw. Cleared at
+  // frame open.
+  std::unordered_map<uint64_t, VkDescriptorSet, rex::IdentityHasher<uint64_t>>
+      texture_transient_descriptor_set_reuse_cache_;
+  // Content hashes of the texture descriptor sets currently recorded in
+  // current_graphics_descriptor_sets_, indexed [0] = vertex, [1] = pixel. The
+  // valid flag is false when the recorded set's contents are unknown (frame
+  // open, write failure, or reuse disabled).
+  bool current_texture_descriptor_set_hash_valid_[2] = {};
+  uint64_t current_texture_descriptor_set_hashes_[2] = {};
 
   std::unique_ptr<VulkanSharedMemory> shared_memory_;
 
@@ -784,8 +805,12 @@ class VulkanCommandProcessor : public CommandProcessor {
     bool valid = false;
   } active_occlusion_query_;
   // MoltenVK maps timestamp queries to Metal counter sample buffers with a
-  // small per-pool limit, so keep the per-frame query budget modest.
+  // small per-pool limit, so keep the per-frame query budget modest there.
+#if REX_PLATFORM_MAC
   static constexpr uint32_t kMaxGpuTimestampQueriesPerFrame = 1024;
+#else
+  static constexpr uint32_t kMaxGpuTimestampQueriesPerFrame = 4096;
+#endif
   VkQueryPool gpu_timestamp_query_pool_ = VK_NULL_HANDLE;
   VkBuffer gpu_timestamp_readback_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory gpu_timestamp_readback_memory_ = VK_NULL_HANDLE;
@@ -793,9 +818,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDeviceSize gpu_timestamp_readback_memory_size_ = 0;
   uint64_t* gpu_timestamp_readback_mapping_ = nullptr;
   bool gpu_timestamp_resources_available_ = false;
+  bool gpu_timestamp_draws_enabled_ = false;
   struct GpuTimestampFrame {
     uint64_t frame = 0;
     uint64_t submission = 0;
+    // Submission index when the frame began - for counting the queue
+    // submissions the frame spans in the profile log.
+    uint64_t first_submission = 0;
     uint32_t query_base = 0;
     uint32_t query_count = 0;
     uint32_t frame_start_query = UINT32_MAX;
@@ -809,6 +838,13 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<uint32_t> bucket_end_queries;
   };
   std::array<GpuTimestampFrame, kMaxFramesInFlight> gpu_timestamp_frames_;
+  // Averaged full-frame GPU time attribution, logged periodically when bucket
+  // timestamps are enabled.
+  static constexpr uint32_t kGpuProfileLogFrameInterval = 120;
+  uint64_t gpu_profile_bucket_us_[size_t(rex::perf::DrawBucket::kCount)] = {};
+  uint64_t gpu_profile_span_us_ = 0;
+  uint64_t gpu_profile_submissions_ = 0;
+  uint32_t gpu_profile_frames_ = 0;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;
@@ -855,6 +891,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
+
+  // State the per-draw binding fast path compares against
+  // (vulkan_reuse_unchanged_draw_bindings): when the previous draw in the same
+  // submission used the same shaders, identical sampler parameters and the
+  // texture cache's binding views are unchanged, the sampler cache walks and
+  // the texture descriptor gather/hash in UpdateBindings are skipped.
+  bool draw_binding_state_valid_ = false;
+  uint64_t draw_binding_submission_ = 0;
+  const VulkanShader* draw_binding_vertex_shader_ = nullptr;
+  const VulkanShader* draw_binding_pixel_shader_ = nullptr;
+  uint64_t draw_binding_texture_generation_ = 0;
+  // Set by IssueDraw for the draw currently being issued, consumed by
+  // UpdateBindings.
+  bool texture_bindings_unchanged_this_draw_ = false;
 
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE

@@ -21,6 +21,7 @@
 #include <rex/platform.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/fps_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/graphics/graphics_system.h>
 #if REX_HAS_VULKAN
@@ -207,6 +208,9 @@ void StartForcedExitWatchdog(const char* reason) {
 
 REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, true, "UI/Advanced",
                     "Enable the developer cvar browser on F4");
+
+REXCVAR_DEFINE_BOOL(show_fps_counter, false, "UI", "Show the guest FPS counter overlay")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // --- ReXApp ---
 
@@ -548,6 +552,31 @@ bool ReXApp::SetupPresentation() {
         imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(
             window_.get(), 64, [this](ImFontAtlas* atlas) { OnConfigureFonts(atlas); });
         imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, immediate_drawer_.get());
+        if (!frame_stats_provider_) {
+          frame_stats_provider_ = [presenter]() {
+            ui::Presenter::GuestFrameStats stats = presenter->GetGuestFrameStats();
+            return ui::FrameStats{stats.frame_time_ms, stats.fps, stats.frame_count};
+          };
+        }
+        auto update_guest_frame_stats_enabled = [this, presenter]() {
+          presenter->SetGuestFrameStatsEnabled(fps_overlay_ != nullptr || debug_overlay_ != nullptr);
+        };
+        rex::ui::RegisterBind("bind_fps_counter", "F2", "Toggle FPS counter", [this, presenter] {
+          if (fps_overlay_) {
+            fps_overlay_.reset();
+          } else {
+            fps_overlay_ =
+                std::make_unique<ui::FpsOverlayDialog>(imgui_drawer_.get(), presenter);
+          }
+          REXCVAR_SET(show_fps_counter, fps_overlay_ != nullptr);
+          presenter->SetGuestFrameStatsEnabled(fps_overlay_ != nullptr || debug_overlay_ != nullptr);
+          if (!config_path_.empty()) {
+            rex::cvar::SaveConfigValues(config_path_, {"show_fps_counter"});
+          }
+        });
+        if (REXCVAR_GET(show_fps_counter)) {
+          fps_overlay_ = std::make_unique<ui::FpsOverlayDialog>(imgui_drawer_.get(), presenter);
+        }
         rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
           if (debug_overlay_) {
             debug_overlay_.reset();
@@ -555,7 +584,13 @@ bool ReXApp::SetupPresentation() {
             debug_overlay_ = std::make_unique<ui::DebugOverlayDialog>(
                 imgui_drawer_.get(), frame_stats_provider_, GetBuildStamp());
           }
+          auto* graphics_system = static_cast<rex::graphics::GraphicsSystem*>(config_.graphics.get());
+          if (graphics_system && graphics_system->presenter()) {
+            graphics_system->presenter()->SetGuestFrameStatsEnabled(
+                fps_overlay_ != nullptr || debug_overlay_ != nullptr);
+          }
         });
+        update_guest_frame_stats_enabled();
         rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
           if (console_overlay_) {
             console_overlay_.reset();
