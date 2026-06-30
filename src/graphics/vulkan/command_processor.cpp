@@ -137,7 +137,7 @@ REXCVAR_DEFINE_BOOL(vulkan_skip_inert_no_pixel_draws, false, "GPU/Vulkan",
                     "occlusion side effects")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_reuse_transient_texture_descriptors, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_reuse_transient_texture_descriptors, false, "GPU/Vulkan",
                     "Reuse texture/sampler descriptor sets within a frame when the bindings are "
                     "unchanged instead of allocating and writing new ones for every draw")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -147,7 +147,7 @@ REXCVAR_DEFINE_BOOL(vulkan_push_constants_descriptors, false, "GPU/Vulkan",
                     "instead of allocating and writing a transient descriptor set whenever "
                     "constants change (requires driver support; applied at startup)");
 
-REXCVAR_DEFINE_BOOL(vulkan_reuse_unchanged_draw_bindings, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_reuse_unchanged_draw_bindings, false, "GPU/Vulkan",
                     "Skip the per-draw sampler cache walks and texture descriptor "
                     "gathering/hashing entirely when the previous draw in the same submission "
                     "used the same shaders with identical sampler parameters and texture "

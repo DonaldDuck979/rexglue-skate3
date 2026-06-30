@@ -682,7 +682,8 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
       if (submit_result != VK_SUCCESS) {
         REXLOG_ERROR(
             "VulkanPresenter: Failed to submit the guest output capturing "
-            "command buffer");
+            "command buffer ({})",
+            vk::to_string(vk::Result(submit_result)));
         fence_acqusition.SubmissionFailedOrDropped();
         dfn.vkDestroyCommandPool(device, command_pool, nullptr);
         dfn.vkDestroyBuffer(device, buffer, nullptr);
@@ -1645,7 +1646,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_ERROR_DEVICE_LOST:
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "
-          "device has been lost");
+          "device has been lost ({})",
+          vk::to_string(vk::Result(acquire_result)));
       return PaintResult::kGpuLostResponsible;
     case VK_ERROR_OUT_OF_DATE_KHR:
     case VK_ERROR_SURFACE_LOST_KHR:
@@ -1657,7 +1659,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           "dropped as the swapchain or the surface has become outdated");
       return PaintResult::kNotPresentedConnectionOutdated;
     default:
-      REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
+      REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image ({})",
+                   vk::to_string(vk::Result(acquire_result)));
       return PaintResult::kNotPresented;
   }
 
@@ -2281,7 +2284,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       }
     }
     if (submit_result != VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
+      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers ({})",
+                   vk::to_string(vk::Result(submit_result)));
       fence_acqusition.SubmissionFailedOrDropped();
       ui_fence_acquisition.SubmissionFailedOrDropped();
       if (ui_setup_command_buffer_index != SIZE_MAX) {
@@ -2333,7 +2337,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_ERROR_DEVICE_LOST:
       REXLOG_ERROR(
           "VulkanPresenter: Failed to present the swapchain image as the "
-          "device has been lost");
+          "device has been lost ({})",
+          vk::to_string(vk::Result(present_result)));
       return PaintResult::kGpuLostResponsible;
     case VK_ERROR_OUT_OF_DATE_KHR:
     case VK_ERROR_SURFACE_LOST_KHR:
@@ -2347,7 +2352,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       // however, this should have no effect on anything here likely.
       return PaintResult::kNotPresentedConnectionOutdated;
     default:
-      REXLOG_ERROR("VulkanPresenter: Failed to present the swapchain image");
+      REXLOG_ERROR("VulkanPresenter: Failed to present the swapchain image ({})",
+                   vk::to_string(vk::Result(present_result)));
       // The image is in an acquired state - but now, it will be in it forever.
       // To avoid that, recreate the swapchain - don't return just
       // kNotPresented.
