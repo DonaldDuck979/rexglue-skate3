@@ -142,7 +142,7 @@ REXCVAR_DEFINE_BOOL(vulkan_reuse_transient_texture_descriptors, true, "GPU/Vulka
                     "unchanged instead of allocating and writing new ones for every draw")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_push_constants_descriptors, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_push_constants_descriptors, false, "GPU/Vulkan",
                     "Use VK_KHR_push_descriptor for the guest constant buffer descriptor set "
                     "instead of allocating and writing a transient descriptor set whenever "
                     "constants change (requires driver support; applied at startup)");

@@ -50,7 +50,7 @@ REXCVAR_DEFINE_BOOL(vulkan_direct_resolve_fast32, true, "GPU/Vulkan",
                     "direct_host_resolve)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_deferred_resolve_clears, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_deferred_resolve_clears, false, "GPU/Vulkan",
                     "Defer resolve clears of host render targets and replay them inside the next "
                     "render pass binding the render target, instead of a dedicated render pass "
                     "with an attachment clear per resolve")
