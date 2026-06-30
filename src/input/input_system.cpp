@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
@@ -41,6 +42,10 @@ REXCVAR_DEFINE_STRING(input_backend, kDefaultInputBackend, "Input", "Input backe
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_BOOL(hid_rumble_enabled, true, "Input", "Enable controller vibration");
+REXCVAR_DEFINE_UINT32(hid_rumble_min_motor_speed, 0x1000, "Input",
+                      "Minimum XInput motor speed forwarded to host controllers")
+    .range(0, 0xFFFF);
 namespace rex::input {
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
@@ -170,9 +175,25 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
 
+  if (!vibration) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+
+  X_INPUT_VIBRATION filtered_vibration = {};
+  if (REXCVAR_GET(hid_rumble_enabled)) {
+    const uint32_t min_motor_speed = REXCVAR_GET(hid_rumble_min_motor_speed);
+    const auto filter_motor = [min_motor_speed](uint16_t speed) -> uint16_t {
+      return speed >= min_motor_speed ? speed : 0;
+    };
+    filtered_vibration.left_motor_speed =
+        filter_motor(static_cast<uint16_t>(vibration->left_motor_speed));
+    filtered_vibration.right_motor_speed =
+        filter_motor(static_cast<uint16_t>(vibration->right_motor_speed));
+  }
+
   bool any_connected = false;
   for (auto& driver : drivers_) {
-    X_RESULT result = driver->SetState(user_index, vibration);
+    X_RESULT result = driver->SetState(user_index, &filtered_vibration);
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }

@@ -43,9 +43,22 @@ std::filesystem::path to_path(const std::u16string_view source) {
 namespace filesystem {
 
 std::filesystem::path GetExecutablePath() {
-  wchar_t* path;
-  auto error = _get_wpgmptr(&path);
-  return !error ? std::filesystem::path(path) : std::filesystem::path();
+  std::wstring path(MAX_PATH, L'\0');
+  for (;;) {
+    const DWORD length =
+        GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (length == 0) {
+      return {};
+    }
+    if (length < path.size()) {
+      path.resize(length);
+      return std::filesystem::path(path);
+    }
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || path.size() >= 32768) {
+      return {};
+    }
+    path.resize(path.size() * 2);
+  }
 }
 
 std::filesystem::path GetExecutableFolder() {
