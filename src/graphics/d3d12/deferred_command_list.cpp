@@ -36,6 +36,7 @@ DeferredCommandPerfCategory GetPerfCategory(DeferredCommandList::Command command
     case Command::kD3DClearDepthStencilView:
     case Command::kD3DClearRenderTargetView:
     case Command::kD3DClearUnorderedAccessViewUint:
+    case Command::kD3DClearUnorderedAccessViewFloat:
       return {CounterId::kDeferredClearCount, CounterId::kDeferredClearUs,
               CounterId::kGpuClearUs};
     case Command::kD3DResourceBarrier:
@@ -144,6 +145,13 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
         command_list->ClearUnorderedAccessViewUint(
             args.view_gpu_handle_in_current_heap, args.view_cpu_handle, args.resource,
             args.values_uint, args.num_rects,
+            args.num_rects ? reinterpret_cast<const D3D12_RECT*>(&args + 1) : nullptr);
+      } break;
+      case Command::kD3DClearUnorderedAccessViewFloat: {
+        auto& args = *reinterpret_cast<const ClearUnorderedAccessViewHeader*>(stream);
+        command_list->ClearUnorderedAccessViewFloat(
+            args.view_gpu_handle_in_current_heap, args.view_cpu_handle, args.resource,
+            args.values_float, args.num_rects,
             args.num_rects ? reinterpret_cast<const D3D12_RECT*>(&args + 1) : nullptr);
       } break;
       case Command::kD3DCopyBufferRegion: {

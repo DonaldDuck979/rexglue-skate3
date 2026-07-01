@@ -103,6 +103,8 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   ui::d3d12::D3D12UploadBufferPool& GetConstantBufferPool() const { return *constant_buffer_pool_; }
 
+  D3D12SharedMemory& GetSharedMemory() const { return *shared_memory_; }
+
   D3D12_CPU_DESCRIPTOR_HANDLE GetViewBindlessHeapCPUStart() const {
     assert_true(bindless_resources_used_);
     return view_bindless_heap_cpu_start_;

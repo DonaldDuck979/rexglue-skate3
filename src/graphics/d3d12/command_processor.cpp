@@ -21,6 +21,7 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/native_guest_renderer.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -2320,7 +2321,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
-       guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       guest_output_height, display_width,
+       display_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
 
@@ -2377,6 +2379,148 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
 
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+
+        ID3D12Resource* guest_output_resource =
+            static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
+                .resource_uav_capable();
+
+        NativeGuestOutputRenderContext native_context;
+        native_context.backend = NativeGuestOutputBackend::kD3D12;
+        native_context.guest_output_width = guest_output_width;
+        native_context.guest_output_height = guest_output_height;
+        native_context.display_width = display_width;
+        native_context.display_height = display_height;
+        native_context.d3d12.command_processor = this;
+        native_context.d3d12.command_processor_user_data = this;
+        native_context.d3d12.device = device;
+        native_context.d3d12.guest_output_resource = guest_output_resource;
+        native_context.d3d12.guest_output_format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+        native_context.d3d12.guest_output_initial_state =
+            ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
+        native_context.d3d12.request_one_use_view_descriptor =
+            [](void* user_data, D3D12_CPU_DESCRIPTOR_HANDLE* cpu_out,
+               D3D12_GPU_DESCRIPTOR_HANDLE* gpu_out) -> bool {
+          auto* command_processor = static_cast<D3D12CommandProcessor*>(user_data);
+          ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
+          if (!command_processor->RequestOneUseSingleViewDescriptors(1, &descriptor)) {
+            return false;
+          }
+          *cpu_out = descriptor.first;
+          *gpu_out = descriptor.second;
+          return true;
+        };
+        native_context.d3d12.create_root_signature =
+            [](void* user_data, const D3D12_ROOT_SIGNATURE_DESC* desc,
+               ID3D12RootSignature** root_signature_out) -> bool {
+          auto* command_processor = static_cast<D3D12CommandProcessor*>(user_data);
+          *root_signature_out =
+              ui::d3d12::util::CreateRootSignature(command_processor->GetD3D12Provider(), *desc);
+          return *root_signature_out != nullptr;
+        };
+        native_context.d3d12.push_transition_barrier =
+            [](void* user_data, ID3D12Resource* resource, D3D12_RESOURCE_STATES old_state,
+               D3D12_RESOURCE_STATES new_state) -> bool {
+          return static_cast<D3D12CommandProcessor*>(user_data)->PushTransitionBarrier(
+              resource, old_state, new_state);
+        };
+        native_context.d3d12.submit_barriers = [](void* user_data) {
+          static_cast<D3D12CommandProcessor*>(user_data)->SubmitBarriers();
+        };
+        native_context.d3d12.copy_texture_region =
+            [](void* user_data, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dst_x, UINT dst_y,
+               UINT dst_z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* src_box) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DCopyTextureRegion(dst, dst_x, dst_y, dst_z, src, src_box);
+        };
+        native_context.d3d12.clear_render_target_view =
+            [](void* user_data, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4]) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DClearRenderTargetView(rtv, color, 0, nullptr);
+        };
+        native_context.d3d12.clear_unordered_access_view_float =
+            [](void* user_data, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
+               D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource* resource,
+               const FLOAT values[4]) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, resource, values, 0,
+                                                nullptr);
+        };
+        native_context.d3d12.set_graphics_root_signature =
+            [](void* user_data, ID3D12RootSignature* root_signature) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DSetGraphicsRootSignature(root_signature);
+        };
+        native_context.d3d12.set_graphics_root_32bit_constants =
+            [](void* user_data, UINT root_parameter_index, UINT num_32bit_values_to_set,
+               const void* src_data, UINT dest_offset_in_32bit_values) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DSetGraphicsRoot32BitConstants(root_parameter_index, num_32bit_values_to_set,
+                                                src_data, dest_offset_in_32bit_values);
+        };
+        native_context.d3d12.set_graphics_root_descriptor_table =
+            [](void* user_data, UINT root_parameter_index,
+               D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DSetGraphicsRootDescriptorTable(root_parameter_index, base_descriptor);
+        };
+        native_context.d3d12.set_pipeline_state =
+            [](void* user_data, ID3D12PipelineState* pipeline_state) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DSetPipelineState(pipeline_state);
+        };
+        native_context.d3d12.ia_set_primitive_topology =
+            [](void* user_data, D3D12_PRIMITIVE_TOPOLOGY primitive_topology) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DIASetPrimitiveTopology(primitive_topology);
+        };
+        native_context.d3d12.ia_set_vertex_buffers =
+            [](void* user_data, UINT start_slot, UINT num_views,
+               const D3D12_VERTEX_BUFFER_VIEW* views) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DIASetVertexBuffers(start_slot, num_views, views);
+        };
+        native_context.d3d12.om_set_render_targets =
+            [](void* user_data, UINT num_render_target_descriptors,
+               const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
+               BOOL rts_single_handle_to_descriptor_range,
+               const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DOMSetRenderTargets(num_render_target_descriptors, render_target_descriptors,
+                                     rts_single_handle_to_descriptor_range,
+                                     depth_stencil_descriptor);
+        };
+        native_context.d3d12.rs_set_viewport = [](void* user_data,
+                                                  const D3D12_VIEWPORT* viewport) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .RSSetViewport(*viewport);
+        };
+        native_context.d3d12.rs_set_scissor_rect = [](void* user_data, const D3D12_RECT* rect) {
+          static_cast<D3D12CommandProcessor*>(user_data)->GetDeferredCommandList().RSSetScissorRect(
+              *rect);
+        };
+        native_context.d3d12.draw_instanced =
+            [](void* user_data, UINT vertex_count_per_instance, UINT instance_count,
+               UINT start_vertex_location, UINT start_instance_location) {
+          static_cast<D3D12CommandProcessor*>(user_data)
+              ->GetDeferredCommandList()
+              .D3DDrawInstanced(vertex_count_per_instance, instance_count, start_vertex_location,
+                                start_instance_location);
+        };
+        if (TryRenderNativeGuestOutput(native_context)) {
+          EndSubmission(true);
+          return true;
+        }
 
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
@@ -2437,10 +2581,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           apply_gamma_descriptor_gamma_ramp = apply_gamma_descriptors[2];
           WriteGammaRampSRV(use_pwl_gamma_ramp, apply_gamma_descriptor_gamma_ramp.first);
         }
-
-        ID3D12Resource* guest_output_resource =
-            static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
-                .resource_uav_capable();
 
         if (use_fxaa) {
           fxaa_source_texture_submission_ = submission_current_;

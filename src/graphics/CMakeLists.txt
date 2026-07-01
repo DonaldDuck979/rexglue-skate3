@@ -24,6 +24,7 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     util/draw_extent_estimator.cpp
     util/draw.cpp
     packet_disassembler.cpp
+    native_guest_renderer.cpp
     primitive_processor.cpp
     pipeline/render_target/cache.cpp
     shared_memory.cpp
@@ -148,4 +149,3 @@ if(REXGLUE_USE_D3D12)
     )
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_D3D12=1)
 endif()
-
