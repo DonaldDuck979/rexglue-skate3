@@ -10,6 +10,9 @@
  */
 
 #include <rex/kernel/xam/apps/xgi_app.h>
+
+#include <atomic>
+
 #include <rex/cvar.h>
 #include <rex/graphics/ultrawide_debug.h>
 #include <rex/input/input.h>
@@ -50,12 +53,26 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                                                   context_value);
       if (rex::cvar::Query<bool>("skate3_demo_path") && user_index == 0 &&
           context_id == 0x8001) {
+        // Boot automation is strictly ONE-SHOT: the dialog A auto-tap exists
+        // only to accept boot-flow dialogs (autosave prompt etc.) between the
+        // press-start screen and gameplay. The game also sets this context to
+        // 0 for the PAUSE MENU and loading screens; re-arming the auto-tap
+        // there blindly "confirmed" pause menu entries and teleported the
+        // player across the map. Once gameplay (context 1) has been seen,
+        // never inject input again for the rest of the session.
+        static std::atomic<bool> boot_automation_done{false};
         if (context_value == 0) {
-          rex::kernel::xam::SetSyntheticAutoTap(rex::input::X_INPUT_GAMEPAD_A, true);
-          REXKRNL_INFO("Skate 3 demo path: gameplay context 0; enabling dialog A auto-tap");
+          if (!boot_automation_done.load(std::memory_order_relaxed)) {
+            rex::kernel::xam::SetSyntheticAutoTap(rex::input::X_INPUT_GAMEPAD_A, true);
+            REXKRNL_INFO("Skate 3 demo path: gameplay context 0; enabling dialog A auto-tap");
+          }
         } else if (context_value == 1) {
           rex::kernel::xam::ClearSyntheticInput();
-          REXKRNL_INFO("Skate 3 demo path: gameplay context 1; stopping synthetic input");
+          if (!boot_automation_done.exchange(true, std::memory_order_relaxed)) {
+            REXKRNL_INFO(
+                "Skate 3 demo path: gameplay reached; boot automation complete, synthetic "
+                "input disabled for the session");
+          }
         }
       }
       if (!old_value || *old_value != context_value) {

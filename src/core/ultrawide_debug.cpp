@@ -723,10 +723,19 @@ std::string CurrentGuestFunctionStack() {
 
 }  // namespace
 
+// Live value of the Skate 3 presence context (0x8001): 1 = in gameplay,
+// 0 = frontend / pause menu / loading. Consumers (the native scene renderer)
+// yield to the emulated output while the game is in menus.
+static std::atomic<uint32_t> g_skate3_gameplay_context_value{0};
+
 void NotifySkate3GameplayContext(uint32_t user_index, uint32_t context_id, uint32_t value) {
   constexpr uint32_t kSkate3GameplayContext = 0x8001;
   constexpr uint32_t kSkate3GameplayValue = 1;
-  if (user_index != 0 || context_id != kSkate3GameplayContext || value != kSkate3GameplayValue) {
+  if (user_index != 0 || context_id != kSkate3GameplayContext) {
+    return;
+  }
+  g_skate3_gameplay_context_value.store(value, std::memory_order_relaxed);
+  if (value != kSkate3GameplayValue) {
     return;
   }
 
@@ -738,6 +747,10 @@ void NotifySkate3GameplayContext(uint32_t user_index, uint32_t context_id, uint3
 
 bool IsSkate3GameplayUltrawideActive() {
   return g_skate3_gameplay_ultrawide_latched.load(std::memory_order_relaxed);
+}
+
+uint32_t Skate3GameplayContextValue() {
+  return g_skate3_gameplay_context_value.load(std::memory_order_relaxed);
 }
 
 GuestFunctionScope::GuestFunctionScope(const char* function_name) {

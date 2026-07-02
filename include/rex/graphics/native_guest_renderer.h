@@ -86,4 +86,12 @@ using NativeGuestOutputRenderer = bool (*)(const NativeGuestOutputRenderContext&
 void SetNativeGuestOutputRenderer(NativeGuestOutputRenderer renderer, void* user_data);
 bool TryRenderNativeGuestOutput(const NativeGuestOutputRenderContext& context);
 
+// True while the registered renderer actually replaced the last presented
+// frame (false when it yields to the emulated output).
+bool IsNativeGuestOutputActive();
+// native_render_suppress_emulated_draws && IsNativeGuestOutputActive():
+// command processors skip emulated draw/resolve execution (memexport draws,
+// fences, queries and PM4 parsing still run).
+bool ShouldSuppressEmulatedDraws();
+
 }  // namespace rex::graphics

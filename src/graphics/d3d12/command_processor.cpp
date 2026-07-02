@@ -2770,6 +2770,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       PROFILE_DRAW_FINGERPRINT(fingerprint);
     }
 #endif
+    if (ShouldSuppressEmulatedDraws()) {
+      // Native output active: skip the resolve. Suppressed draws leave only
+      // garbage in the EDRAM buffer; copying it out would overwrite guest
+      // texture payloads (e.g. previously composed CAS textures) that the
+      // native renderer still samples.
+      return true;
+    }
     return IssueCopy();
   }
 
@@ -2815,6 +2822,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+
+  // Native guest-output renderer active: the emulated frame is never shown,
+  // so skip the draw entirely (pipeline setup, texture cache, render target
+  // cache, GPU work). Memexport draws still execute; the game reads their
+  // results back from memory. Fences, queries and PM4 processing are
+  // unaffected. Menus/pause flip the native renderer inactive, so emulated
+  // rendering (and CAS texture composition) works normally there.
+  if (!memexport_used && ShouldSuppressEmulatedDraws()) {
+    return true;
+  }
 
   if (!BeginSubmission(true)) {
     return false;

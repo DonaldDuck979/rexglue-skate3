@@ -135,6 +135,9 @@ enum class ApplyMode : uint32_t {
 uint64_t HashKey(const TargetKey& key);
 void NotifySkate3GameplayContext(uint32_t user_index, uint32_t context_id, uint32_t value);
 bool IsSkate3GameplayUltrawideActive();
+// Live value of the Skate 3 presence context 0x8001 (1 = in gameplay,
+// 0 = frontend / pause menu / loading).
+uint32_t Skate3GameplayContextValue();
 bool ShouldApplyAndRecord(const TargetKey& key, bool default_enabled);
 uint32_t ShadowMapCandidateLevel(const TargetKey& key);
 bool IsShadowMapCandidate(const TargetKey& key, uint32_t mode = 1);
