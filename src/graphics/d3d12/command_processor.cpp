@@ -2770,11 +2770,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       PROFILE_DRAW_FINGERPRINT(fingerprint);
     }
 #endif
-    if (ShouldSuppressEmulatedDraws()) {
-      // Native output active: skip the resolve. Suppressed draws leave only
-      // garbage in the EDRAM buffer; copying it out would overwrite guest
-      // texture payloads (e.g. previously composed CAS textures) that the
-      // native renderer still samples.
+    if (ShouldSuppressEmulatedDraws() &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= 1280) {
+      // Native output active: skip the resolve of the SUPPRESSED
+      // (framebuffer-sized) passes only. Their draws left garbage in EDRAM;
+      // copying it out would overwrite guest texture payloads the native
+      // renderer still samples. Small-surface passes (lightmap page
+      // composition at 1024-wide pages, CAS outfit composites, other RTT)
+      // now EXECUTE under suppression, so their resolves must run: skipping
+      // lightpage composition left never-composed pages sampling garbage:
+      // the light/dark checkerboard ground.
       return true;
     }
     return IssueCopy();
@@ -2828,8 +2833,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // cache, GPU work). Memexport draws still execute; the game reads their
   // results back from memory. Fences, queries and PM4 processing are
   // unaffected. Menus/pause flip the native renderer inactive, so emulated
-  // rendering (and CAS texture composition) works normally there.
-  if (!memexport_used && ShouldSuppressEmulatedDraws()) {
+  // rendering works normally there.
+  //
+  // Only FRAMEBUFFER-SIZED passes (surface pitch >= 1280: main pass,
+  // z-prepass, HUD overlay RTT) are suppressed. Passes into smaller
+  // surfaces keep executing: lightmap PAGE COMPOSITION renders into
+  // 1024-wide pages whose CPU payloads the native renderer samples;
+  // suppressing it left pages that streamed in during native play
+  // uncomposed (garbage), the light/dark checkerboard ground. CAS outfit
+  // composition mid-gameplay is covered by the same rule.
+  if (!memexport_used && ShouldSuppressEmulatedDraws() &&
+      regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= 1280) {
     return true;
   }
 
