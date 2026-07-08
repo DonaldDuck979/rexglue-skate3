@@ -74,7 +74,13 @@ function(rexglue_configure_target target_name)
         REXGLUE_BUILD_CONFIG="$<CONFIG>")
 
     if(TARGET imgui::imgui)
-        target_link_libraries(${target_name} PRIVATE imgui::imgui)
+        # Headers only. The ImGui implementation lives inside the runtime
+        # library (which exports it); linking the object library here would
+        # give the host its own second copy of ImGui with a separate,
+        # never-initialized context (GImGui == nullptr), so any host-side
+        # ImGuiDialog subclass would crash on its first ImGui:: call.
+        target_include_directories(${target_name} PRIVATE
+            $<TARGET_PROPERTY:imgui::imgui,INTERFACE_INCLUDE_DIRECTORIES>)
     endif()
     target_include_directories(${target_name} PRIVATE
         ${CMAKE_CURRENT_BINARY_DIR}/rexglue-sdk/include)

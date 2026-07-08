@@ -435,6 +435,27 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return write_fake_result(REXCVAR_GET(skate3_ultrawide_fake_occlusion_sample_count));
   }
 
+  // Native guest-output renderer active: the framebuffer-sized draws between
+  // query begin/end are suppressed, so a real host occlusion query reports 0
+  // samples. The game gates world rendering on these results; event-ad
+  // placements poll their poster quads' visibility and stop submitting the
+  // overlay geometry entirely (the native frame then shows the default poster
+  // art where the emulated frame shows the current ad). Report the fake
+  // positive count instead: the suppressed draws are exactly the ones the
+  // native renderer is drawing in their place.
+  if (ShouldSuppressEmulatedDraws()) {
+    if (active_occlusion_query_.valid) {
+      uint32_t host_index = active_occlusion_query_.host_index;
+      active_occlusion_query_ = {};
+      if (occlusion_query_heap_ && BeginSubmission(true)) {
+        deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                           host_index);
+        EndSubmission(false);
+      }
+    }
+    return write_fake_result(REXCVAR_GET(query_occlusion_fake_sample_count));
+  }
+
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
