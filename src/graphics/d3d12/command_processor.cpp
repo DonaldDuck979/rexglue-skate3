@@ -39,9 +39,48 @@
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(native_render_suppress_mode, 2, "GPU",
+                     "Which emulated passes to suppress while the native guest-output "
+                     "renderer is active. 0 = framebuffer-sized passes only (surface "
+                     "pitch >= 1280); the game's whole postfx chain then still executes "
+                     "at 1152x640 x resolution scale EVERY frame and paces the pipeline "
+                     "(~half the achievable frame rate). 1 = suppress everything (perf "
+                     "probing; mid-gameplay lightmap page composition breaks). 2 = "
+                     "suppress everything EXCEPT the memory-composition passes whose "
+                     "outputs the native renderer samples from guest memory: lightmap "
+                     "page composition (pitch 1024) and small composite surfaces (pitch "
+                     "<= 512, CAS outfit pieces). Menus/pause/loading always render "
+                     "fully (the native renderer yields there), so shop/outfit "
+                     "composition is unaffected by any mode.")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+// While the native guest-output renderer is active: should the emulated pass
+// currently targeting `surface_pitch`-wide surfaces be suppressed? See
+// native_render_suppress_mode. Draw and resolve suppression must agree:
+// executed passes need their resolves, suppressed passes leave garbage EDRAM
+// that must never be copied out.
+bool ShouldSuppressPassAtPitch(uint32_t surface_pitch) {
+  switch (REXCVAR_GET(native_render_suppress_mode)) {
+    case 0:
+      return surface_pitch >= 1280;
+    case 1:
+      return true;
+    default:
+      // Execute only the memory-composition passes the native renderer
+      // samples: lightmap page composition (1024) and small composite
+      // surfaces (<= 512, CAS outfit pieces). The <= 512 window also lets a
+      // few tiny postfx pyramid mips through, negligible, and safer than
+      // guessing which small surfaces matter.
+      return !(surface_pitch == 1024 || surface_pitch <= 512);
+  }
+}
+}  // namespace
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
@@ -2792,13 +2831,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
 #endif
     if (ShouldSuppressEmulatedDraws() &&
-        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= 1280) {
-      // Native output active: skip the resolve of the SUPPRESSED
-      // (framebuffer-sized) passes only. Their draws left garbage in EDRAM;
-      // copying it out would overwrite guest texture payloads the native
-      // renderer still samples. Small-surface passes (lightmap page
-      // composition at 1024-wide pages, CAS outfit composites, other RTT)
-      // now EXECUTE under suppression, so their resolves must run: skipping
+        ShouldSuppressPassAtPitch(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch)) {
+      // Native output active: skip the resolves of SUPPRESSED passes; their
+      // draws left garbage in EDRAM, and copying it out would overwrite
+      // guest texture payloads the native renderer still samples. Passes
+      // that EXECUTE under the current suppression mode (lightmap page
+      // composition, CAS composites) must keep their resolves: skipping
       // lightpage composition left never-composed pages sampling garbage:
       // the light/dark checkerboard ground.
       return true;
@@ -2863,9 +2901,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // suppressing it left pages that streamed in during native play
   // uncomposed (garbage), the light/dark checkerboard ground. CAS outfit
   // composition mid-gameplay is covered by the same rule.
-  if (!memexport_used && ShouldSuppressEmulatedDraws() &&
-      regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= 1280) {
-    return true;
+  if (!memexport_used && ShouldSuppressEmulatedDraws()) {
+    const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    if (ShouldSuppressPassAtPitch(pitch)) {
+      return true;
+    }
+    // Census of the passes still EXECUTING under suppression (each distinct
+    // surface pitch logged once): the data for tightening the filter; these
+    // passes pace the whole pipeline (the ~160 fps ceiling was the game's
+    // postfx chain executing at 1152x640 x resolution scale every frame;
+    // gameplay census on Skate 3: pitches 1200/800/640/600/560/320/280/80).
+    static std::atomic<uint32_t> logged_pitch_mask[8192 / 32] = {};
+    if (pitch < 8192) {
+      const uint32_t bit = 1u << (pitch % 32);
+      if ((logged_pitch_mask[pitch / 32].fetch_or(bit) & bit) == 0) {
+        REXGPU_INFO("suppression census: executing draws at surface_pitch={}", pitch);
+      }
+    }
   }
 
   if (!BeginSubmission(true)) {
