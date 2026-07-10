@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include <rex/ui/graphics_device_list.h>
 #include <rex/ui/imgui_dialog.h>
 
 namespace rex::ui {
@@ -66,6 +67,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   RestartGameCallback restart_game_;
   SimpleProfileState profiles_;
   bool visible_ = false;
+  GraphicsDeviceList device_list_;
+  int device_index_ = 0;
   int resolution_scale_index_ = 0;
   int frame_cap_index_ = 0;
   int aspect_ratio_index_ = 0;

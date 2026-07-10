@@ -41,8 +41,16 @@ bool HasCvar(std::string_view name) {
 
 std::vector<std::string_view> GetSimpleSettingsCvars() {
   std::vector<std::string_view> cvars;
-  cvars.reserve(14);
+  cvars.reserve(15);
   cvars.insert(cvars.end(), kCoreSimpleSettingsCvars.begin(), kCoreSimpleSettingsCvars.end());
+  // Literal names rather than the registry's string to keep the string_views
+  // pointing at static storage.
+  const std::string device_cvar = GetGraphicsDeviceList().cvar_name;
+  if (device_cvar == "d3d12_adapter" && HasCvar("d3d12_adapter")) {
+    cvars.push_back("d3d12_adapter");
+  } else if (device_cvar == "vulkan_device" && HasCvar("vulkan_device")) {
+    cvars.push_back("vulkan_device");
+  }
   if (HasCvar("skate3_ultrawide")) {
     cvars.push_back("skate3_ultrawide");
   }
@@ -68,6 +76,18 @@ std::vector<std::string_view> GetSimpleSettingsCvars() {
     cvars.push_back("vulkan_allow_present_mode_fifo_relaxed");
   }
   return cvars;
+}
+
+// 0 = automatic selection (cvar -1); i+1 = the list's device i.
+int DeviceIndexFromCvar(const GraphicsDeviceList& device_list) {
+  if (device_list.device_names.empty() || !HasCvar(device_list.cvar_name)) {
+    return 0;
+  }
+  int32_t current = rex::cvar::Query<int32_t>(device_list.cvar_name);
+  if (current >= 0 && current < static_cast<int32_t>(device_list.device_names.size())) {
+    return current + 1;
+  }
+  return 0;
 }
 
 int ResolutionIndexFromCvar() {
@@ -233,6 +253,8 @@ void SimpleSettingsDialog::Show() {
 }
 
 void SimpleSettingsDialog::LoadSettingsFromCvars() {
+  device_list_ = GetGraphicsDeviceList();
+  device_index_ = DeviceIndexFromCvar(device_list_);
   resolution_scale_index_ = ResolutionIndexFromCvar();
   frame_cap_index_ = FrameCapIndexFromCvar();
   aspect_ratio_index_ =
@@ -246,7 +268,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
-  return resolution_scale_index_ != ResolutionIndexFromCvar() ||
+  return device_index_ != DeviceIndexFromCvar(device_list_) ||
+         resolution_scale_index_ != ResolutionIndexFromCvar() ||
          frame_cap_index_ != FrameCapIndexFromCvar() ||
          (HasCvar("skate3_ultrawide") &&
           (aspect_ratio_index_ != 0) != rex::cvar::Query<bool>("skate3_ultrawide")) ||
@@ -297,6 +320,12 @@ void SimpleSettingsDialog::SaveVideo() {
   aspect_ratio_index_ =
       std::clamp(aspect_ratio_index_, 0, static_cast<int>(kAspectRatioLabels.size()) - 1);
   field_of_view_ = std::clamp(field_of_view_, 40.0f, 120.0f);
+  if (!device_list_.device_names.empty() && HasCvar(device_list_.cvar_name)) {
+    device_index_ =
+        std::clamp(device_index_, 0, static_cast<int>(device_list_.device_names.size()));
+    rex::cvar::SetFlagByName(device_list_.cvar_name,
+                             device_index_ == 0 ? "-1" : std::to_string(device_index_ - 1));
+  }
   const auto scale = std::to_string(kResolutionScales[resolution_scale_index_]);
   rex::cvar::SetFlagByName("resolution_scale", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_x", scale);
@@ -429,6 +458,27 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   const bool has_settings_changes = HasSettingsChanges();
   if (selected_tab_ == 0) {
     SectionTitle("Video");
+
+    if (!device_list_.device_names.empty() && HasCvar(device_list_.cvar_name)) {
+      BeginFieldRow("Graphics Device");
+      // Index-prefixed labels: virtual display drivers (Parsec etc.) make the
+      // same physical GPU enumerate several times, and the index is what the
+      // device cvar and the startup log speak in.
+      std::vector<std::string> device_label_storage;
+      device_label_storage.reserve(device_list_.device_names.size());
+      for (size_t i = 0; i < device_list_.device_names.size(); ++i) {
+        device_label_storage.push_back(std::to_string(i) + ": " + device_list_.device_names[i]);
+      }
+      std::vector<const char*> device_labels;
+      device_labels.reserve(device_label_storage.size() + 1);
+      device_labels.push_back("Auto (recommended)");
+      for (const auto& label : device_label_storage) {
+        device_labels.push_back(label.c_str());
+      }
+      ImGui::Combo("##graphics_device", &device_index_, device_labels.data(),
+                   static_cast<int>(device_labels.size()));
+      EndFieldRow();
+    }
 
     BeginFieldRow("Resolution Scale");
     ImGui::Combo("##resolution_scale", &resolution_scale_index_, kResolutionLabels.data(),

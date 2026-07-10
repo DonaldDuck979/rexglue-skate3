@@ -14,6 +14,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/ui/graphics_device_list.h>
 #include <rex/ui/vulkan/immediate_drawer.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
@@ -67,12 +68,18 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
   REXLOG_WARN(
       "Available Vulkan physical devices (use the 'vulkan_device' "
       "configuration variable to force a specific device):");
-  for (size_t physical_device_index = 0; physical_device_index < physical_devices.size();
-       ++physical_device_index) {
-    VkPhysicalDeviceProperties physical_device_properties;
-    ifn.vkGetPhysicalDeviceProperties(physical_devices[physical_device_index],
-                                      &physical_device_properties);
-    REXLOG_WARN("* {}: {}", physical_device_index, physical_device_properties.deviceName);
+  {
+    GraphicsDeviceList device_list;
+    device_list.cvar_name = "vulkan_device";
+    for (size_t physical_device_index = 0; physical_device_index < physical_devices.size();
+         ++physical_device_index) {
+      VkPhysicalDeviceProperties physical_device_properties;
+      ifn.vkGetPhysicalDeviceProperties(physical_devices[physical_device_index],
+                                        &physical_device_properties);
+      REXLOG_WARN("* {}: {}", physical_device_index, physical_device_properties.deviceName);
+      device_list.device_names.push_back(physical_device_properties.deviceName);
+    }
+    SetGraphicsDeviceList(std::move(device_list));
   }
 
   if (REXCVAR_GET(vulkan_device) >= 0 &&
@@ -88,9 +95,7 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
     bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
-    if (with_gpu_emulation && physical_devices.size() > 1 &&
-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
-         prefer_fill_mode_non_solid)) {
+    if (physical_devices.size() > 1) {
       struct PhysicalDeviceScore {
         VkPhysicalDevice physical_device;
         uint32_t score;
@@ -98,20 +103,34 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
       std::vector<PhysicalDeviceScore> scored_devices;
       scored_devices.reserve(physical_devices.size());
       for (const VkPhysicalDevice physical_device : physical_devices) {
-        VkPhysicalDeviceFeatures supported_features = {};
-        ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
         uint32_t score = 0;
-        if (prefer_geometry_shader && supported_features.geometryShader) {
-          ++score;
+        if (with_gpu_emulation) {
+          VkPhysicalDeviceFeatures supported_features = {};
+          ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
+          if (prefer_geometry_shader && supported_features.geometryShader) {
+            score += 4;
+          }
+          if (prefer_fragment_stores && supported_features.fragmentStoresAndAtomics) {
+            score += 4;
+          }
+          if (prefer_vertex_stores && supported_features.vertexPipelineStoresAndAtomics) {
+            score += 4;
+          }
+          if (prefer_fill_mode_non_solid && supported_features.fillModeNonSolid) {
+            score += 4;
+          }
         }
-        if (prefer_fragment_stores && supported_features.fragmentStoresAndAtomics) {
-          ++score;
-        }
-        if (prefer_vertex_stores && supported_features.vertexPipelineStoresAndAtomics) {
-          ++score;
-        }
-        if (prefer_fill_mode_non_solid && supported_features.fillModeNonSolid) {
-          ++score;
+        // Prefer the discrete GPU on hybrid-graphics systems. Weighted below
+        // the emulation feature bits so feature support still wins, but it
+        // breaks the tie that previously left device choice to enumeration
+        // order (typically the integrated GPU first on laptops).
+        VkPhysicalDeviceProperties physical_device_properties;
+        ifn.vkGetPhysicalDeviceProperties(physical_device, &physical_device_properties);
+        if (physical_device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+          score += 2;
+        } else if (physical_device_properties.deviceType ==
+                   VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+          score += 1;
         }
         scored_devices.push_back({physical_device, score});
       }

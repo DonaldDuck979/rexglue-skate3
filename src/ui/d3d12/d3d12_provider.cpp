@@ -14,6 +14,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/ui/graphics_device_list.h>
 #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -250,10 +251,63 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
+  // Log all adapters so GPU-selection problems are diagnosable from user logs,
+  // and publish them for the settings UI device picker (indices match the
+  // 'd3d12_adapter' cvar).
+  {
+    GraphicsDeviceList device_list;
+    device_list.cvar_name = "d3d12_adapter";
+    IDXGIAdapter1* logged_adapter;
+    for (uint32_t i = 0; dxgi_factory->EnumAdapters1(i, &logged_adapter) == S_OK; ++i) {
+      std::string device_name = "Adapter " + std::to_string(i);
+      DXGI_ADAPTER_DESC1 logged_desc;
+      if (SUCCEEDED(logged_adapter->GetDesc1(&logged_desc))) {
+        char logged_name_mb[512] = {};
+        WideCharToMultiByte(CP_UTF8, 0, logged_desc.Description, -1, logged_name_mb,
+                            sizeof(logged_name_mb) - 1, nullptr, nullptr);
+        if (logged_name_mb[0]) {
+          device_name = logged_name_mb;
+        }
+        REXGPU_INFO("DXGI adapter {}: {} (vendor 0x{:04X}, device 0x{:04X}){}", i, logged_name_mb,
+                    logged_desc.VendorId, logged_desc.DeviceId,
+                    (logged_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " [software]" : "");
+      }
+      device_list.device_names.push_back(std::move(device_name));
+      logged_adapter->Release();
+    }
+    SetGraphicsDeviceList(std::move(device_list));
+  }
+
   // Choose the adapter.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  // With no explicit adapter requested, ask DXGI for adapters sorted by GPU
+  // preference so hybrid-graphics systems (laptop Optimus / PowerXpress) pick
+  // the discrete GPU instead of whichever adapter enumerates first (usually
+  // the integrated one the display is wired to). IDXGIFactory6 requires
+  // Windows 10 1803+; fall back to plain enumeration order without it.
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    IDXGIFactory6* dxgi_factory6 = nullptr;
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6)))) {
+      while (dxgi_factory6->EnumAdapterByGpuPreference(adapter_index,
+                                                       DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                       IID_PPV_ARGS(&adapter)) == S_OK) {
+        DXGI_ADAPTER_DESC1 adapter_desc;
+        if (SUCCEEDED(adapter->GetDesc1(&adapter_desc)) &&
+            !(adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
+                                               _uuidof(ID3D12Device), nullptr))) {
+          break;
+        }
+        adapter->Release();
+        adapter = nullptr;
+        ++adapter_index;
+      }
+      dxgi_factory6->Release();
+    }
+  }
+  adapter_index = 0;
+  while (adapter == nullptr && dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
