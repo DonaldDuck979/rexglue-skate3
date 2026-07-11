@@ -75,6 +75,12 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void SetupFontTexture();
 
+  void SetupFonts();
+
+  // Services ImGui's texture create/update/destroy requests when
+  // ImGuiBackendFlags_RendererHasTextures is active.
+  void ProcessImGuiTextureRequests(ImDrawData* data);
+
   void RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context);
 
   void AddDialogImpl(ImGuiDialog* dialog);
@@ -111,6 +117,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
   std::unique_ptr<ImmediateTexture> font_texture_;
+  // Textures created on ImGui's request when ImGuiBackendFlags_RendererHasTextures
+  // is active (dynamic glyph rasterization); keyed back to ImGui via TexID.
+  std::vector<std::unique_ptr<ImmediateTexture>> imgui_managed_textures_;
 
   // Bit mask of ImGui mouse buttons the drawer has seen pressed, used for
   // window mouse capture bookkeeping (io.MouseDown can't be used - input is

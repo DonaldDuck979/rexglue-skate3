@@ -27,7 +27,12 @@ constexpr uint32_t kDefaultDpi = 96;
 constexpr uint32_t kDefaultCursorAutoHideMilliseconds = 1000;
 constexpr uint32_t kCursorAutoHideEvent = SDL_EVENT_USER + 1;
 
-REXCVAR_DEFINE_BOOL(sdl_high_pixel_density, !REX_PLATFORM_MAC, "UI/SDL",
+// Enabled on macOS: without a high-DPI backing the Metal drawable stays at
+// logical point size and CoreAnimation upscales the whole window to the Retina
+// panel, blurring everything (the settings UI most visibly). Internal 3D render
+// cost is governed separately by the resolution-scale cvars, so this only makes
+// the final composite and UI render at native panel resolution.
+REXCVAR_DEFINE_BOOL(sdl_high_pixel_density, true, "UI/SDL",
                     "Request high-DPI backing pixels for SDL windows")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 

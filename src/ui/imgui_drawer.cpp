@@ -130,38 +130,17 @@ void ImGuiDrawer::Initialize() {
   // Windows.
   io.IniFilename = nullptr;
 
-  // Setup the font glyphs.
-  ImFontConfig font_config;
-  font_config.OversampleH = font_config.OversampleV = 1;
-  font_config.PixelSnapH = true;
-  static const ImWchar font_glyph_ranges[] = {
-      0x0020,
-      0x00FF,  // Basic Latin + Latin Supplement
-      0,
-  };
-  io.Fonts->AddFontFromMemoryCompressedBase85TTF(kProggyTinyCompressedDataBase85, 10.0f,
-                                                 &font_config, font_glyph_ranges);
+  SetupFonts();
 
-#if REX_PLATFORM_WIN32
-  // TODO(benvanik): jp font on other platforms?
-  // https://github.com/Koruri/kibitaki looks really good, but is 1.5MiB.
-  const char* jp_font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
-  if (std::filesystem::exists(jp_font_path)) {
-    ImFontConfig jp_font_config;
-    jp_font_config.MergeMode = true;
-    jp_font_config.OversampleH = jp_font_config.OversampleV = 1;
-    jp_font_config.PixelSnapH = true;
-    jp_font_config.FontNo = 0;
-    io.Fonts->AddFontFromFileTTF(jp_font_path, 12.0f, &jp_font_config,
-                                 io.Fonts->GetGlyphRangesJapanese());
-  } else {
-    REXLOG_WARN("Unable to load Japanese font; JP characters will be boxes");
-  }
+#if defined(__APPLE__)
+  // Dialogs push runtime font sizes (PushFont(nullptr, 18..22)); the legacy
+  // prebaked atlas can only bitmap-scale its 10px bake to serve them, which
+  // blurs, doubly so under the Retina logical->physical magnification in
+  // RenderDrawLists. With this flag glyphs rasterize on demand at the drawn
+  // size, and io.DisplayFramebufferScale (set per-frame in Draw) additionally
+  // rasterizes them at display pixel density while layout stays logical.
+  io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
 #endif
-
-  if (font_setup_) {
-    font_setup_(io.Fonts);
-  }
 
   auto& style = ImGui::GetStyle();
   style.ScrollbarRounding = 0;
@@ -343,11 +322,53 @@ std::optional<ImGuiKey> ImGuiDrawer::VirtualKeyToImGuiKey(VirtualKey vkey) {
   }
 }
 
+void ImGuiDrawer::SetupFonts() {
+  ImGuiIO& io = GetIO();
+  io.Fonts->Clear();
+
+  ImFontConfig font_config;
+  font_config.OversampleH = font_config.OversampleV = 1;
+  font_config.PixelSnapH = true;
+  static const ImWchar font_glyph_ranges[] = {
+      0x0020,
+      0x00FF,  // Basic Latin + Latin Supplement
+      0,
+  };
+  io.Fonts->AddFontFromMemoryCompressedBase85TTF(kProggyTinyCompressedDataBase85, 10.0f,
+                                                 &font_config, font_glyph_ranges);
+
+#if REX_PLATFORM_WIN32
+  // TODO(benvanik): jp font on other platforms?
+  // https://github.com/Koruri/kibitaki looks really good, but is 1.5MiB.
+  const char* jp_font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
+  if (std::filesystem::exists(jp_font_path)) {
+    ImFontConfig jp_font_config;
+    jp_font_config.MergeMode = true;
+    jp_font_config.OversampleH = jp_font_config.OversampleV = 1;
+    jp_font_config.PixelSnapH = true;
+    jp_font_config.FontNo = 0;
+    io.Fonts->AddFontFromFileTTF(jp_font_path, 12.0f, &jp_font_config,
+                                 io.Fonts->GetGlyphRangesJapanese());
+  } else {
+    REXLOG_WARN("Unable to load Japanese font; JP characters will be boxes");
+  }
+#endif
+
+  if (font_setup_) {
+    font_setup_(io.Fonts);
+  }
+}
+
 void ImGuiDrawer::SetupFontTexture() {
   if (font_texture_ || !immediate_drawer_) {
     return;
   }
   ImGuiIO& io = GetIO();
+  if (io.BackendFlags & ImGuiBackendFlags_RendererHasTextures) {
+    // Textures are created on demand in ProcessImGuiTextureRequests; the
+    // legacy whole-atlas prebake must not run.
+    return;
+  }
   unsigned char* pixels;
   int width, height;
   io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
@@ -379,8 +400,20 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
     return;
   }
   if (immediate_drawer_) {
-    GetIO().Fonts->TexID = ImTextureID{};
+    ImGuiIO& io = GetIO();
+    io.Fonts->TexID = ImTextureID{};
     font_texture_.reset();
+    if (io.BackendFlags & ImGuiBackendFlags_RendererHasTextures) {
+      // Hand dynamic textures back to ImGui as destroyed so it re-requests
+      // creation from the next immediate drawer.
+      for (ImTextureData* tex : ImGui::GetPlatformIO().Textures) {
+        if (tex->TexID != ImTextureID_Invalid) {
+          tex->SetTexID(ImTextureID_Invalid);
+          tex->SetStatus(ImTextureStatus_Destroyed);
+        }
+      }
+      imgui_managed_textures_.clear();
+    }
   }
   immediate_drawer_ = new_immediate_drawer;
   if (immediate_drawer_) {
@@ -404,6 +437,14 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   ImGui::SetCurrentContext(internal_state_);
 
   ImGuiIO& io = ImGui::GetIO();
+
+#if defined(__APPLE__)
+  // Retina: glyphs must rasterize at display pixel density to survive the
+  // logical->physical magnification in RenderDrawLists. Per-frame because the
+  // window can move between displays with different densities.
+  float fb_scale = float(window_->GetDpi()) / float(window_->GetMediumDpi());
+  io.DisplayFramebufferScale = ImVec2(fb_scale, fb_scale);
+#endif
 
   uint64_t current_frame_time_ticks = rex::chrono::Clock::QueryHostTickCount();
   io.DeltaTime =
@@ -458,8 +499,54 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   }
 }
 
+void ImGuiDrawer::ProcessImGuiTextureRequests(ImDrawData* data) {
+  if (!data->Textures) {
+    return;
+  }
+  for (ImTextureData* tex : *data->Textures) {
+    switch (tex->Status) {
+      case ImTextureStatus_WantCreate:
+      case ImTextureStatus_WantUpdates: {
+        // The ImmediateDrawer has no partial-update API - recreate the whole
+        // texture from ImGui's CPU-side copy. This only happens when new
+        // glyph sizes/densities are first drawn, then the atlas settles.
+        assert_true(tex->Format == ImTextureFormat_RGBA32);
+        auto texture = immediate_drawer_->CreateTexture(
+            uint32_t(tex->Width), uint32_t(tex->Height), ImmediateTextureFilter::kLinear, true,
+            static_cast<const uint8_t*>(tex->GetPixels()));
+        if (tex->TexID != ImTextureID_Invalid) {
+          auto* old_texture = reinterpret_cast<ImmediateTexture*>(tex->TexID);
+          std::erase_if(imgui_managed_textures_,
+                        [old_texture](const auto& t) { return t.get() == old_texture; });
+        }
+        tex->SetTexID(reinterpret_cast<ImTextureID>(texture.get()));
+        tex->SetStatus(ImTextureStatus_OK);
+        imgui_managed_textures_.push_back(std::move(texture));
+        break;
+      }
+      case ImTextureStatus_WantDestroy: {
+        if (tex->UnusedFrames < 1) {
+          break;
+        }
+        auto* old_texture = reinterpret_cast<ImmediateTexture*>(tex->TexID);
+        std::erase_if(imgui_managed_textures_,
+                      [old_texture](const auto& t) { return t.get() == old_texture; });
+        tex->SetTexID(ImTextureID_Invalid);
+        tex->SetStatus(ImTextureStatus_Destroyed);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+
 void ImGuiDrawer::RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context) {
   ImGuiIO& io = ImGui::GetIO();
+
+  if (io.BackendFlags & ImGuiBackendFlags_RendererHasTextures) {
+    ProcessImGuiTextureRequests(data);
+  }
 
   immediate_drawer_->Begin(ui_draw_context, io.DisplaySize.x, io.DisplaySize.y);
 
