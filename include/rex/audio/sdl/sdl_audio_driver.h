@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <queue>
@@ -41,8 +42,9 @@ class SDLAudioDriver : public AudioDriver {
   // drains the stream faster than real time (e.g. a Bluetooth device in a
   // broken state) would otherwise release credits at an unbounded rate,
   // speeding up the guest's whole audio clock and anything paced by it (such
-  // as video playback). Called only from the SDL audio thread.
-  void ReleasePacedCredits(uint32_t new_credits);
+  // as video playback). Called only from the SDL audio thread. Returns the
+  // number of credits actually released to the guest.
+  uint64_t ReleasePacedCredits(uint32_t new_credits);
 
   rex::thread::Semaphore* semaphore_ = nullptr;
 
@@ -58,6 +60,10 @@ class SDLAudioDriver : public AudioDriver {
   std::queue<float*> frames_queued_ = {};
   std::stack<float*> frames_unused_ = {};
   std::mutex frames_mutex_ = {};
+  // Signaled by SubmitFrame; lets the device callback briefly wait for frames
+  // the guest is mixing right now instead of splicing silence when a large
+  // device quantum outruns the queue depth.
+  std::condition_variable frames_available_cv_ = {};
 
   // Credit pacing state - only touched on the SDL audio thread. The allowance
   // accumulates with wall time (slightly above real time to tolerate device
@@ -65,6 +71,16 @@ class SDLAudioDriver : public AudioDriver {
   double pace_allowance_frames_ = 4.0;
   uint64_t pace_last_ns_ = 0;
   uint64_t pace_deferred_credits_ = 0;
+
+  // audio_stats window counters - only touched on the SDL audio thread.
+  uint64_t stats_window_start_ns_ = 0;
+  uint64_t stats_last_callback_ns_ = 0;
+  uint64_t stats_max_callback_gap_ns_ = 0;
+  uint32_t stats_callbacks_ = 0;
+  uint32_t stats_frames_ = 0;
+  uint32_t stats_silence_chunks_ = 0;
+  size_t stats_queue_min_ = SIZE_MAX;
+  size_t stats_queue_max_ = 0;
 };
 
 }  // namespace rex::audio::sdl

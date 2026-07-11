@@ -35,6 +35,13 @@ REXCVAR_DEFINE_BOOL(audio_realtime_credit_pacing, true, "Audio",
                     "times too fast.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(audio_stats, false, "Audio",
+                    "Log a 5-second audio pipeline stats line: device callback rate/gaps, "
+                    "frames consumed vs real time, silence insertions (underruns), queue "
+                    "depth and pacing state. Turn on when diagnosing robotic/slowed/"
+                    "crackling audio reports.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(audio_device_sample_frames, 0, "Audio",
                      "Requested audio device buffer size in sample frames (0 = backend default). "
                      "Larger values (e.g. 1024 or 2048) add latency but tolerate scheduling "
@@ -161,6 +168,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     frames_queued_.push(output_frame);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
   }
+  frames_available_cv_.notify_one();
 }
 
 void SDLAudioDriver::Shutdown() {
@@ -199,13 +207,52 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     REXAPU_ERROR("SDLAudioDriver::SDLCallback failed to allocate {} samples", sample_count);
     return;
   }
+  const bool stats_enabled = REXCVAR_GET(audio_stats);
+  if (stats_enabled) {
+    const uint64_t now_ns = AudioNowNs();
+    if (!driver->stats_window_start_ns_) {
+      driver->stats_window_start_ns_ = now_ns;
+    }
+    if (driver->stats_last_callback_ns_) {
+      driver->stats_max_callback_gap_ns_ =
+          std::max(driver->stats_max_callback_gap_ns_, now_ns - driver->stats_last_callback_ns_);
+    }
+    driver->stats_last_callback_ns_ = now_ns;
+    driver->stats_callbacks_++;
+    {
+      std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+      const size_t depth = driver->frames_queued_.size();
+      driver->stats_queue_min_ = std::min(driver->stats_queue_min_, depth);
+      driver->stats_queue_max_ = std::max(driver->stats_queue_max_, depth);
+    }
+  }
+  // Bounded budget for waiting on frames the guest owes us: a large device
+  // quantum (PipeWire force-quantum / Bluetooth / HDMI sinks) can request more
+  // audio per callback than the credit pool depth, so the queue legitimately
+  // runs dry mid-request while the guest is mixing the frames we just
+  // credited. Waiting a few ms for those beats splicing silence. Scaled to
+  // half the request duration so small-buffer backends never risk their own
+  // deadline; only spent when credits were released this callback (an idle
+  // guest - loading screens, shutdown - never engages it).
+  const int64_t request_chunks = (int64_t(additional_amount) + len - 1) / len;
+  int64_t wait_budget_ns =
+      std::min<int64_t>(15000000, request_chunks * int64_t(channel_samples_) * 1000000000ll /
+                                      int64_t(frame_frequency_) / 2);
   // Grant credits deferred by the real-time pacer once enough time has passed.
-  driver->ReleasePacedCredits(0);
+  uint64_t credits_released = driver->ReleasePacedCredits(0);
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     float* buffer = nullptr;
     {
       std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+      if (driver->frames_queued_.empty() && credits_released && wait_budget_ns > 0) {
+        const auto wait_start = std::chrono::steady_clock::now();
+        driver->frames_available_cv_.wait_for(guard, std::chrono::nanoseconds(wait_budget_ns),
+                                              [&] { return !driver->frames_queued_.empty(); });
+        wait_budget_ns -= std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - wait_start)
+                              .count();
+      }
       if (!driver->frames_queued_.empty()) {
         buffer = driver->frames_queued_.front();
         driver->frames_queued_.pop();
@@ -217,6 +264,9 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
       if (sdl_callback_count < 10) {
         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
         sdl_callback_count++;
+      }
+      if (stats_enabled) {
+        driver->stats_silence_chunks_++;
       }
       std::memset(data, 0, len);
       if (!SDL_PutAudioStreamData(stream, data, len)) {
@@ -250,18 +300,46 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         break;
       }
 
-      driver->ReleasePacedCredits(1);
+      credits_released += driver->ReleasePacedCredits(1);
+      if (stats_enabled) {
+        driver->stats_frames_++;
+      }
       additional_amount -= len;
+    }
+  }
+
+  if (stats_enabled) {
+    const uint64_t now_ns = AudioNowNs();
+    const uint64_t window_ns = now_ns - driver->stats_window_start_ns_;
+    if (window_ns >= 5000000000ull) {
+      const double window_s = double(window_ns) * 1e-9;
+      REXAPU_INFO(
+          "Audio stats ({:.1f}s): callbacks={} frames={} ({:.1f}/s, real-time={:.1f}/s) "
+          "silence_chunks={} queue_depth={}..{} deferred_credits={} allowance={:.1f} "
+          "max_callback_gap={}ms",
+          window_s, driver->stats_callbacks_, driver->stats_frames_,
+          double(driver->stats_frames_) / window_s,
+          double(frame_frequency_) / double(channel_samples_), driver->stats_silence_chunks_,
+          driver->stats_queue_min_ == SIZE_MAX ? 0 : driver->stats_queue_min_,
+          driver->stats_queue_max_, driver->pace_deferred_credits_,
+          driver->pace_allowance_frames_, driver->stats_max_callback_gap_ns_ / 1000000ull);
+      driver->stats_window_start_ns_ = now_ns;
+      driver->stats_callbacks_ = 0;
+      driver->stats_frames_ = 0;
+      driver->stats_silence_chunks_ = 0;
+      driver->stats_queue_min_ = SIZE_MAX;
+      driver->stats_queue_max_ = 0;
+      driver->stats_max_callback_gap_ns_ = 0;
     }
   }
 
   SDL_stack_free(data);
 }
 
-void SDLAudioDriver::ReleasePacedCredits(uint32_t new_credits) {
+uint64_t SDLAudioDriver::ReleasePacedCredits(uint32_t new_credits) {
   pace_deferred_credits_ += new_credits;
   if (!pace_deferred_credits_) {
-    return;
+    return 0;
   }
   uint64_t releasable = pace_deferred_credits_;
   if (REXCVAR_GET(audio_realtime_credit_pacing)) {
@@ -275,19 +353,35 @@ void SDLAudioDriver::ReleasePacedCredits(uint32_t new_credits) {
                                 (double(frame_frequency_) / double(channel_samples_)) * 1.01;
     }
     pace_last_ns_ = now_ns;
-    constexpr double kMaxBankedFrames = 8.0;
+    // The bank must cover the largest burst a HEALTHY device consumes in one
+    // callback cluster, or steady-state playback is throttled below real time
+    // (the guest audio clock slows down and the queue underruns into
+    // interleaved 5.3ms silence chunks - reported as "robotic"/"slowed down"
+    // audio). PipeWire fires the callback once per graph quantum, which
+    // force-quantum / Bluetooth / HDMI sinks can raise to 8192 device frames
+    // (~170ms = 32 guest frames); loaded low-spec machines can delay the
+    // audio thread similarly. 64 frames covers those with margin. Runaway
+    // devices are still bounded by the 1.01x real-time accrual above - the
+    // bank only sizes the transient catch-up burst after a stall (<=340ms of
+    // guest audio clock, and the release is further clamped by the credit
+    // pool depth).
+    constexpr double kMaxBankedFrames = 64.0;
     pace_allowance_frames_ = std::min(pace_allowance_frames_, kMaxBankedFrames);
     releasable = std::min(releasable, uint64_t(pace_allowance_frames_));
   }
   if (releasable) {
     auto ret = semaphore_->Release(int(releasable), nullptr);
     assert_true(ret);
+    if (!ret) {
+      return 0;
+    }
     pace_deferred_credits_ -= releasable;
     pace_allowance_frames_ -= double(releasable);
     if (pace_allowance_frames_ < 0.0) {
       pace_allowance_frames_ = 0.0;
     }
   }
+  return releasable;
 }
 
 }  // namespace rex::audio::sdl
