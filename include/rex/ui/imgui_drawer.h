@@ -77,8 +77,12 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context);
 
+  void AddDialogImpl(ImGuiDialog* dialog);
+  void RemoveDialogImpl(ImGuiDialog* dialog);
+
   void ClearInput();
   void OnKey(KeyEvent& e, bool is_down);
+  static int MouseEventButtonToImGui(const MouseEvent& e);
   void UpdateMousePosition(float x, float y);
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
 
@@ -107,6 +111,15 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
   std::unique_ptr<ImmediateTexture> font_texture_;
+
+  // Bit mask of ImGui mouse buttons the drawer has seen pressed, used for
+  // window mouse capture bookkeeping (io.MouseDown can't be used - input is
+  // queued via the ImGui event API and only reflected at NewFrame).
+  uint32_t mouse_buttons_down_ = 0;
+
+  // Whether the platform window has been asked to activate text input
+  // (character event delivery / IME) because a text widget is active.
+  bool text_input_active_ = false;
 
   // If there's an active pointer, the ImGui mouse is controlled by this touch.
   // If it's TouchEvent::kPointerIDNone, the ImGui mouse is controlled by the

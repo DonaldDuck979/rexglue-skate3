@@ -311,6 +311,14 @@ class Window {
   // the cursor instantly.
   void SetCursorVisibility(CursorVisibility new_cursor_visibility);
 
+  // Enables or disables platform text input (character event delivery / IME)
+  // while a text widget is active. Characters are delivered to input listeners
+  // via OnKeyChar. On some platforms character events are always delivered
+  // (Win32 WM_CHAR, GTK) and this is a no-op; on SDL, character events are
+  // only delivered while text input is started, so this must be kept in sync
+  // by whoever hosts text widgets (done by ImGuiDrawer).
+  virtual void SetTextInputActive(bool /*active*/) {}
+
   bool HasFocus() const { return HasActualState() ? has_focus_ : false; }
   // May be applied in a delayed way or dropped at all, HasFocus will not
   // necessarily be true immediately.

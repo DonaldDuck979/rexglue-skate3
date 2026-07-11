@@ -377,7 +377,9 @@ class KeyboardInputDialog : public XamDialog {
       }
       if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
                            ImGuiInputTextFlags_EnterReturnsTrue)) {
-        text_ = std::string(text_buffer_.data(), text_buffer_.size());
+        // Note: constructing from the pointer only - the buffer is
+        // NUL-padded to max_length, and (data, size) would keep the padding.
+        text_ = std::string(text_buffer_.data());
         cancelled_ = false;
         ImGui::CloseCurrentPopup();
         Close();
@@ -390,7 +392,7 @@ class KeyboardInputDialog : public XamDialog {
         }
       }
       if (ImGui::Button("OK")) {
-        text_ = std::string(text_buffer_.data(), text_buffer_.size());
+        text_ = std::string(text_buffer_.data());
         cancelled_ = false;
         ImGui::CloseCurrentPopup();
         Close();
