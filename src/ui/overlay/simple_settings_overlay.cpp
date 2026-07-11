@@ -22,10 +22,11 @@ constexpr std::array<int32_t, 3> kResolutionScales = {1, 2, 3};
 constexpr std::array<const char*, 3> kResolutionLabels = {"720p (1x)", "1440p (2x)",
                                                           "2160p (3x)"};
 constexpr std::array<const char*, 2> kAspectRatioLabels = {"16:9", "21:9 (Experimental)"};
-constexpr std::array<double, 6> kFrameCapRates = {60.0, 90.0, 120.0, 144.0, 165.0, 240.0};
-constexpr std::array<const char*, 7> kFrameCapLabels = {"Unlimited", "60 FPS", "90 FPS",
-                                                        "120 FPS", "144 FPS", "165 FPS",
-                                                        "240 FPS"};
+constexpr std::array<double, 7> kFrameCapRates = {60.0,  90.0,  120.0, 140.0,
+                                                  144.0, 165.0, 240.0};
+constexpr std::array<const char*, 8> kFrameCapLabels = {"Unlimited", "60 FPS",  "90 FPS",
+                                                        "120 FPS",   "140 FPS", "144 FPS",
+                                                        "165 FPS",   "240 FPS"};
 constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
     "resolution_scale",
     "draw_resolution_scale_x",
@@ -56,6 +57,9 @@ std::vector<std::string_view> GetSimpleSettingsCvars() {
   }
   if (HasCvar("skate3_field_of_view")) {
     cvars.push_back("skate3_field_of_view");
+  }
+  if (HasCvar("skate3_guest_fps_cap")) {
+    cvars.push_back("skate3_guest_fps_cap");
   }
   if (HasCvar("d3d12_present_frame_limiter")) {
     cvars.push_back("d3d12_present_frame_limiter");
@@ -105,18 +109,35 @@ int ResolutionIndexFromCvar() {
   return best;
 }
 
-bool HasFrameCapCvars() {
+bool HasHostFrameCapCvars() {
   return HasCvar("d3d12_present_frame_limiter") && HasCvar("d3d12_present_frame_limiter_fps");
 }
 
+// The guest-side cap paces the game's render loop at the swap boundary, so
+// both content production and present cadence land on an even beat (the VRR
+// case the host present limiter can't fix: it only delays presents of frames
+// whose content was already produced on an irregular schedule). It works on
+// any backend, but only when the native-render hook layer that implements it
+// is active; otherwise fall back to the host present limiter.
+bool UseGuestFrameCap() {
+  return HasCvar("skate3_guest_fps_cap") && HasCvar("skate3_native_render") &&
+         rex::cvar::Query<bool>("skate3_native_render");
+}
+
+bool HasFrameCapControl() {
+  return UseGuestFrameCap() || HasHostFrameCapCvars();
+}
+
 int FrameCapIndexFromCvar() {
-  if (!HasFrameCapCvars()) {
+  double current = 0.0;
+  if (UseGuestFrameCap()) {
+    current = rex::cvar::Query<double>("skate3_guest_fps_cap");
+  } else if (HasHostFrameCapCvars() && rex::cvar::Query<bool>("d3d12_present_frame_limiter")) {
+    current = rex::cvar::Query<double>("d3d12_present_frame_limiter_fps");
+  }
+  if (current < 1.0) {
     return 0;
   }
-  if (!rex::cvar::Query<bool>("d3d12_present_frame_limiter")) {
-    return 0;
-  }
-  double current = rex::cvar::Query<double>("d3d12_present_frame_limiter_fps");
   int best = 1;
   double best_delta = 1000.0;
   for (int i = 0; i < static_cast<int>(kFrameCapRates.size()); ++i) {
@@ -330,12 +351,21 @@ void SimpleSettingsDialog::SaveVideo() {
   rex::cvar::SetFlagByName("resolution_scale", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_x", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_y", scale);
-  if (HasFrameCapCvars()) {
+  if (UseGuestFrameCap()) {
+    const double cap_fps = frame_cap_index_ != 0 ? kFrameCapRates[frame_cap_index_ - 1] : 0.0;
+    rex::cvar::SetFlagByName("skate3_guest_fps_cap", std::to_string(cap_fps));
+    // Never run both pacers: the host limiter waits on the paint thread
+    // without backpressuring the guest, so presents drop frames on an
+    // irregular beat: the judder the guest cap exists to remove.
+    if (HasHostFrameCapCvars()) {
+      SetBoolCvar("d3d12_present_frame_limiter", false);
+    }
+  } else if (HasHostFrameCapCvars()) {
     SetBoolCvar("d3d12_present_frame_limiter", frame_cap_index_ != 0);
-  }
-  if (HasFrameCapCvars() && frame_cap_index_ != 0) {
-    rex::cvar::SetFlagByName("d3d12_present_frame_limiter_fps",
-                             std::to_string(kFrameCapRates[frame_cap_index_ - 1]));
+    if (frame_cap_index_ != 0) {
+      rex::cvar::SetFlagByName("d3d12_present_frame_limiter_fps",
+                               std::to_string(kFrameCapRates[frame_cap_index_ - 1]));
+    }
   }
   SetBoolCvar("fullscreen", fullscreen_);
   if (HasCvar("skate3_ultrawide")) {
@@ -485,7 +515,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
                  static_cast<int>(kResolutionLabels.size()));
     EndFieldRow();
 
-    if (HasFrameCapCvars()) {
+    if (HasFrameCapControl()) {
       BeginFieldRow("Framerate Cap");
       ImGui::Combo("##frame_cap", &frame_cap_index_, kFrameCapLabels.data(),
                    static_cast<int>(kFrameCapLabels.size()));
