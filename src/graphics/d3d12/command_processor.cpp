@@ -51,8 +51,13 @@ REXCVAR_DEFINE_INT32(native_render_suppress_mode, 2, "GPU",
                      "page composition (pitch 1024) and small composite surfaces (pitch "
                      "<= 512, CAS outfit pieces). Menus/pause/loading always render "
                      "fully (the native renderer yields there), so shop/outfit "
-                     "composition is unaffected by any mode.")
-    .range(0, 2)
+                     "composition is unaffected by any mode. 3 = portrait-window mode: "
+                     "like 0 the sub-framebuffer RTT passes execute (one-shot frontend "
+                     "portrait renders, census pitches 560-1200), but the 1152-wide "
+                     "main scene + postfx band stays suppressed; that band is the "
+                     "whole-pipeline cost at scaled resolutions and portraits never "
+                     "need it.")
+    .range(0, 3)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
@@ -71,6 +76,13 @@ bool ShouldSuppressPassAtPitch(uint32_t surface_pitch) {
       return surface_pitch >= 1280;
     case 1:
       return true;
+    case 3:
+      // Portrait-window mode: the one-shot frontend portrait RTTs (Skate 3
+      // census during the window: 1200/800/640/600/560 + small mips)
+      // execute, while the 1152-wide main scene/postfx band, the
+      // whole-pipeline cost at scaled resolutions, stays suppressed like
+      // the framebuffer.
+      return surface_pitch >= 1280 || surface_pitch == 1152;
     default:
       // Execute only the memory-composition passes the native renderer
       // samples: lightmap page composition (1024) and small composite
