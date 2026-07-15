@@ -30,6 +30,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
+#include <rex/chrono/clock.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 #include <rex/system/kernel_state.h>
@@ -2851,6 +2852,30 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // composition, CAS composites) must keep their resolves: skipping
       // lightpage composition left never-composed pages sampling garbage:
       // the light/dark checkerboard ground.
+      if (REXCVAR_GET(native_render_force_resolve_readback_max_length) > 0) {
+        // App-armed window diagnostics (Skate 3 photo flows): while the
+        // window is armed, show which resolves the suppression filter drops
+        // - pins passes (e.g. the photo display-card compose) whose output
+        // never reaches guest memory. Throttled.
+        static uint64_t s_drop_log_ms = 0;
+        static uint32_t s_drop_log_count = 0;
+        const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+        if (now_ms - s_drop_log_ms >= 1000) {
+          if (s_drop_log_count > 8) {
+            REXLOG_INFO("readback-window: (+{} more dropped resolves)",
+                        s_drop_log_count - 8);
+          }
+          s_drop_log_ms = now_ms;
+          s_drop_log_count = 0;
+        }
+        if (++s_drop_log_count <= 8) {
+          REXLOG_INFO(
+              "readback-window: resolve DROPPED with suppressed pass "
+              "(surface_pitch={} copy_dest=0x{:08X})",
+              regs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
+              uint32_t(regs[XE_GPU_REG_RB_COPY_DEST_BASE]));
+        }
+      }
       return true;
     }
     return IssueCopy();
@@ -3730,9 +3755,35 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     // framebuffer-sized resolves stay excluded.
     const int32_t force_readback_max_length =
         REXCVAR_GET(native_render_force_resolve_readback_max_length);
+    const int32_t force_readback_min_length =
+        REXCVAR_GET(native_render_force_resolve_readback_min_length);
     const bool force_window_cpu_copy =
         force_readback_max_length > 0 &&
-        written_length <= uint32_t(force_readback_max_length);
+        written_length <= uint32_t(force_readback_max_length) &&
+        (force_readback_min_length <= 0 ||
+         written_length >= uint32_t(force_readback_min_length));
+    if (force_readback_max_length > 0) {
+      // App-armed window diagnostics (Skate 3 photo flows): every resolve
+      // that executes while the window is armed, and whether it takes the
+      // CPU-copy path. Throttled.
+      static uint64_t s_seen_log_ms = 0;
+      static uint32_t s_seen_log_count = 0;
+      const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+      if (now_ms - s_seen_log_ms >= 1000) {
+        if (s_seen_log_count > 8) {
+          REXLOG_INFO("readback-window: (+{} more resolves seen)",
+                      s_seen_log_count - 8);
+        }
+        s_seen_log_ms = now_ms;
+        s_seen_log_count = 0;
+      }
+      if (++s_seen_log_count <= 8) {
+        REXLOG_INFO("readback-window: resolve dest=0x{:08X} len=0x{:X}{}",
+                    written_address, written_length,
+                    force_window_cpu_copy ? " -> CPU copy (kFull)"
+                                          : " (above window cap - GPU only)");
+      }
+    }
     if (!force_scaled_resolve_cpu_copy && !force_window_cpu_copy) {
       return true;
     }

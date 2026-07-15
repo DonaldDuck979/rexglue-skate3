@@ -101,6 +101,18 @@ REXCVAR_DEFINE_INT32(native_render_force_resolve_readback_max_length, 0, "GPU",
     .range(0, 16 * 1024 * 1024)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(native_render_force_resolve_readback_min_length, 0, "GPU",
+                     "Lower bound companion to "
+                     "native_render_force_resolve_readback_max_length: when > 0, resolves "
+                     "SHORTER than this skip the forced CPU copy (they still execute "
+                     "GPU-side). Each forced copy is a synchronous GPU drain; the Skate 3 "
+                     "photo-flow compose window uses this to skip the ~18 small per-frame "
+                     "resolves (64 KB lightmap pages, postfx aux) that made the window a "
+                     "stutter-fest, while still copying the display-card compose. 0 "
+                     "disables (default).")
+    .range(0, 16 * 1024 * 1024)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(readback_memexport, false, "GPU",
                     "Enable CPU readback of shader memexport writes for guest memory "
                     "coherency (can reduce correctness issues, but may add GPU/CPU sync cost)")
