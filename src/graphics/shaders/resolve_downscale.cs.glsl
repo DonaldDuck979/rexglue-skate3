@@ -13,10 +13,38 @@
 // Operates on 32x32 tiled data format used by Xbox 360.
 // Each thread handles one output pixel (one 32x32 tile = 1024 threads).
 //
-// By default, picks the top-left pixel of each scale_x * scale_y block.
-// When xe_downscale_half_pixel_offset is set, samples from (scale/2, scale/2)
-// within each block to compensate for the half-pixel offset becoming a
-// full-pixel offset at higher resolutions.
+// Scaled resolve buffer layout (established from the resolve write shaders,
+// e.g. resolve_fast_32bpp_1x2xmsaa_scaled, and the scaled texture load
+// shaders; they must agree, and both use this):
+//
+//   scaled_byte_address = guest_unit_byte_address * (scale_x * scale_y)
+//                       + (sub_x * scale_y + sub_y) * 16
+//                       + byte_within_scaled_unit
+//
+// where a "unit" is a 16-byte span of the guest tiled layout, holding
+// W = 16 >> pixel_size_log2 texels that are consecutive along X for
+// 16/32/64bpp (a property of the Xbox 360 tiled address function's low
+// 4 bits); sub_x selects among the scale_x duplicated 16-byte blocks the
+// unit expands to along X of the SCALED image, and sub_y among the scale_y
+// duplicated rows. Note the (x-major, y-minor) sub ordering and the 16-BYTE
+// duplication granularity: the scaled image texel for guest texel t of a
+// unit, at sub-position (ox, oy) within its scale_x * scale_y block, is
+//
+//   q = scale_x * t + ox;  sub_x = q / W;  texel_in_scaled_unit = q % W.
+//
+// (The previous version of this shader assumed per-PIXEL contiguous
+// duplication with y-major sub ordering, which sampled alternating wrong
+// rows/columns and produced a sawtooth weave in every readback, visible in
+// e.g. the Skate 3 photo grab.)
+//
+// For 8bpp the guest 16-byte unit is not purely consecutive along X (it
+// spans an extra Y bit), so the X mapping below is approximate for half of
+// the bytes there; no current readback consumer uses 8bpp surfaces.
+//
+// By default, picks the top-left host pixel of each scale_x * scale_y block.
+// When xe_downscale_half_pixel_offset is set, samples from
+// (scale_x/2, scale_y/2) within each block to compensate for the D3D9-style
+// half-pixel offset becoming a multi-pixel offset at higher resolutions.
 
 layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 
@@ -27,10 +55,7 @@ layout(push_constant) uniform ResolveDownscaleConstants {
   uint xe_downscale_tile_count;        // Number of 32x32 tiles to process
   uint xe_downscale_source_offset_bytes;   // Byte offset into source buffer
   // When non-zero, apply half-pixel offset correction by sampling from
-  // (scale/2, scale/2) within each scaled block instead of (0, 0).
-  // This compensates for the D3D9-style half-pixel offset used by Xbox 360
-  // games, which at Nx resolution scaling shifts rendered content by
-  // (N/2, N/2) host pixels.
+  // (scale_x/2, scale_y/2) within each scaled block instead of (0, 0).
   uint xe_downscale_half_pixel_offset;
 };
 
@@ -62,32 +87,36 @@ void main() {
   uint pixel_size = 1u << xe_downscale_pixel_size_log2;
   uint tile_size_1x = 32u * 32u * pixel_size;
   uint scale_xy = xe_downscale_scale_x * xe_downscale_scale_y;
-  uint tile_size_scaled = tile_size_1x * scale_xy;
 
-  // Compute offset within each scaled block to sample from.
-  // Without half-pixel correction: sample from (0, 0) = linear offset 0.
-  // With half-pixel correction: sample from (scale/2, scale/2) to compensate
-  // for the D3D9-style half-pixel offset shifting content by (N/2, N/2) pixels
-  // at Nx resolution.
-  uint block_sample_offset = 0u;
+  // Sub-position within each scale_x * scale_y block to sample from.
+  uint offset_x = 0u;
+  uint offset_y = 0u;
   if (xe_downscale_half_pixel_offset != 0u && scale_xy > 1u) {
-    uint offset_x = xe_downscale_scale_x >> 1u;
-    uint offset_y = xe_downscale_scale_y >> 1u;
-    block_sample_offset = offset_x + offset_y * xe_downscale_scale_x;
+    offset_x = xe_downscale_scale_x >> 1u;
+    offset_y = xe_downscale_scale_y >> 1u;
   }
 
-  // Source offset: base of the scaled block plus offset within block
-  // Add source_offset_bytes to handle buffer-relative addressing
-  // This must be done before division to preserve sub-dword byte position
+  // Guest-relative tiled byte address of this output pixel. Both the source
+  // range (scaled by scale_xy) and the destination range start at the same
+  // guest address, so all addressing below is range-relative.
+  uint guest_byte_offset = tile_index * tile_size_1x + pixel_index * pixel_size;
+  // Its 16-byte unit and texel index within the unit.
+  uint unit = guest_byte_offset >> 4u;
+  uint texel_in_unit = (guest_byte_offset & 15u) >> xe_downscale_pixel_size_log2;
+  // Representative scaled texel within the unit's (W * scale_x)-texel span.
+  uint unit_texels_log2 = 4u - xe_downscale_pixel_size_log2;  // W = 16 / pixel_size
+  uint q = xe_downscale_scale_x * texel_in_unit + offset_x;
+  uint sub_x = q >> unit_texels_log2;
+  uint texel_in_scaled_unit = q & ((1u << unit_texels_log2) - 1u);
+
   uint src_byte_offset = xe_downscale_source_offset_bytes +
-                         tile_index * tile_size_scaled +
-                         pixel_index * pixel_size * scale_xy +
-                         block_sample_offset * pixel_size;
+                         unit * (scale_xy << 4u) +
+                         (sub_x * xe_downscale_scale_y + offset_y) * 16u +
+                         (texel_in_scaled_unit << xe_downscale_pixel_size_log2);
   uint src_offset = src_byte_offset >> 2u;
 
   // Destination offset in 1x buffer
-  uint dst_byte_offset = tile_index * tile_size_1x +
-                         pixel_index * pixel_size;
+  uint dst_byte_offset = guest_byte_offset;
   uint dst_offset = dst_byte_offset >> 2u;
 
   // Copy pixel based on size

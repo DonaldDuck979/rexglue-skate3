@@ -89,6 +89,18 @@ REXCVAR_DEFINE_INT32(scaled_resolve_small_texture_readback_max_length, 0x2D0000,
     .range(0, 16 * 1024 * 1024)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(native_render_force_resolve_readback_max_length, 0, "GPU",
+                     "When > 0, render-to-texture resolves up to this unscaled byte length are "
+                     "read back synchronously into CPU-visible guest memory even when "
+                     "readback_resolve is disabled and regardless of gameplay state. Intended "
+                     "to be ARMED TEMPORARILY by the app layer around flows where the game "
+                     "reads resolved pixels on the CPU (Skate 3 photo grab: "
+                     "ScreenshotBackEnd::GrabScreenshot JPEG-encodes a 1152x640 PostFX "
+                     "screenshot target from guest memory; without readback the saved photo "
+                     "is black). 0 disables (default).")
+    .range(0, 16 * 1024 * 1024)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(readback_memexport, false, "GPU",
                     "Enable CPU readback of shader memexport writes for guest memory "
                     "coherency (can reduce correctness issues, but may add GPU/CPU sync cost)")

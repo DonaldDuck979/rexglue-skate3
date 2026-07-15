@@ -3665,7 +3665,12 @@ bool D3D12CommandProcessor::IssueCopy() {
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   const bool gameplay_state_active = IsGameplayStateActive(kernel_state_);
-  if (readback_mode == ReadbackResolveMode::kDisabled &&
+  // The app layer arms this around CPU screenshot grabs (Skate 3 photo flow);
+  // resolves within its length bound must take the readback path regardless
+  // of gameplay/scaling state.
+  const bool force_readback_window =
+      REXCVAR_GET(native_render_force_resolve_readback_max_length) > 0;
+  if (readback_mode == ReadbackResolveMode::kDisabled && !force_readback_window &&
       (!texture_cache_->IsDrawResolutionScaled() || gameplay_state_active)) {
     uint32_t written_address, written_length;
     // Time the whole resolve (render target dump, copy and clear) for the GPU
@@ -3706,7 +3711,17 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         !IsGameplayStateActive(kernel_state_) && is_scaled &&
         written_address == kImportSkaterPreviewResolveAddress &&
         written_length == kImportSkaterPreviewResolveLength;
-    if (!force_scaled_resolve_cpu_copy) {
+    // App-armed readback window (Skate 3 photo grab): the game CPU-reads the
+    // resolved 1152x640 PostFX screenshot target (also 0x04911000) while the
+    // gameplay presence context is still 1 (photo missions), so the targeted
+    // Import-Skater branch above never fires there. Bounded by length so
+    // framebuffer-sized resolves stay excluded.
+    const int32_t force_readback_max_length =
+        REXCVAR_GET(native_render_force_resolve_readback_max_length);
+    const bool force_window_cpu_copy =
+        force_readback_max_length > 0 &&
+        written_length <= uint32_t(force_readback_max_length);
+    if (!force_scaled_resolve_cpu_copy && !force_window_cpu_copy) {
       return true;
     }
     readback_mode = ReadbackResolveMode::kFull;

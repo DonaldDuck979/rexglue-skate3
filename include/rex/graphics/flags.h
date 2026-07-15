@@ -35,6 +35,7 @@ REXCVAR_DECLARE(bool, scaled_resolve_texture_loads_update_guest_memory);
 REXCVAR_DECLARE(int32_t, scaled_resolve_small_texture_readback_max_length);
 REXCVAR_DECLARE(std::string, readback_resolve);
 REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
+REXCVAR_DECLARE(int32_t, native_render_force_resolve_readback_max_length);
 REXCVAR_DECLARE(bool, readback_memexport);
 REXCVAR_DECLARE(bool, readback_memexport_fast);
 REXCVAR_DECLARE(bool, occlusion_query_enable);

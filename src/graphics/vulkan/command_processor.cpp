@@ -5214,7 +5214,12 @@ bool VulkanCommandProcessor::IssueCopy() {
       ResolveAutoReadbackMode(GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve)),
                               kernel_state_);
   const bool gameplay_state_active = IsGameplayStateActive(kernel_state_);
-  if (readback_mode == ReadbackResolveMode::kDisabled &&
+  // The app layer arms this around CPU screenshot grabs (Skate 3 photo flow);
+  // resolves within its length bound must take the readback path regardless
+  // of gameplay/scaling state.
+  const bool force_readback_window =
+      REXCVAR_GET(native_render_force_resolve_readback_max_length) > 0;
+  if (readback_mode == ReadbackResolveMode::kDisabled && !force_readback_window &&
       (!texture_cache_->IsDrawResolutionScaled() || gameplay_state_active)) {
     uint32_t written_address = 0;
     uint32_t written_length = 0;
@@ -5543,6 +5548,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                               kernel_state_);
   bool force_scaled_resolve_sync_only = false;
   bool force_scaled_resolve_cpu_copy = false;
+  bool force_window_cpu_copy = false;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     constexpr uint32_t kImportSkaterPreviewResolveAddress = UINT32_C(0x04911000);
     constexpr uint32_t kImportSkaterPreviewResolveLength = UINT32_C(0x2D0000);
@@ -5550,14 +5556,26 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
         !IsGameplayStateActive(kernel_state_) && is_scaled &&
         written_address == kImportSkaterPreviewResolveAddress &&
         written_length == kImportSkaterPreviewResolveLength;
-    if (!force_scaled_resolve_cpu_copy) {
+    // App-armed readback window (Skate 3 photo grab): the game CPU-reads the
+    // resolved 1152x640 PostFX screenshot target (also 0x04911000) while the
+    // gameplay presence context is still 1 (photo missions), so the targeted
+    // Import-Skater branch above never fires there. Bounded by length so
+    // framebuffer-sized resolves stay excluded.
+    const int32_t force_readback_max_length =
+        REXCVAR_GET(native_render_force_resolve_readback_max_length);
+    force_window_cpu_copy = force_readback_max_length > 0 &&
+                            written_length <= uint32_t(force_readback_max_length);
+    if (!force_scaled_resolve_cpu_copy && !force_window_cpu_copy) {
       log_readback_decision("disabled-after-resolve", readback_mode);
       return true;
     }
     readback_mode = ReadbackResolveMode::kFull;
     force_scaled_resolve_sync_only = true;
-    log_readback_decision("targeted-scaled-resolve-full", readback_mode, false, true,
-                          kImportSkaterPreviewResolveLength);
+    log_readback_decision(
+        force_scaled_resolve_cpu_copy ? "targeted-scaled-resolve-full" : "forced-window-full",
+        readback_mode, false, true,
+        force_scaled_resolve_cpu_copy ? kImportSkaterPreviewResolveLength
+                                      : uint32_t(force_readback_max_length));
   }
 
   const int32_t max_readback_length = REXCVAR_GET(vulkan_readback_resolve_max_length);
@@ -5842,7 +5860,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   bool should_copy =
-      (!force_scaled_resolve_sync_only || force_scaled_resolve_cpu_copy) &&
+      (!force_scaled_resolve_sync_only || force_scaled_resolve_cpu_copy ||
+       force_window_cpu_copy) &&
       ((readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true);
   log_readback_decision(should_copy ? "copy-guest-memory" : "cache-hit-skip", readback_mode,
                         is_cache_miss, should_copy, uint32_t(resolve_key));
