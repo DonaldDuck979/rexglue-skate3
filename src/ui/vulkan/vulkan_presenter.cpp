@@ -197,9 +197,6 @@ VulkanPresenter::PaintContext::Submission::~Submission() {
     dfn.vkDestroyCommandPool(device, draw_command_pool_, nullptr);
   }
 
-  if (present_semaphore_ != VK_NULL_HANDLE) {
-    dfn.vkDestroySemaphore(device, present_semaphore_, nullptr);
-  }
   if (acquire_semaphore_ != VK_NULL_HANDLE) {
     dfn.vkDestroySemaphore(device, acquire_semaphore_, nullptr);
   }
@@ -220,13 +217,8 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
         "semaphore");
     return false;
   }
-  if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &present_semaphore_) !=
-      VK_SUCCESS) {
-    REXLOG_ERROR(
-        "VulkanPresenter: Failed to create a swapchain image presentation "
-        "semaphore");
-    return false;
-  }
+  // Note: the presentation-wait semaphores are per-swapchain-image, not
+  // per-submission - see PaintContext::swapchain_present_semaphores.
 
   VkCommandPoolCreateInfo command_pool_create_info;
   command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -281,6 +273,17 @@ VulkanPresenter::~VulkanPresenter() {
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+
+  // All paint submissions have completed and the swapchains (whose pending
+  // present operations' semaphore waits are assumed to be tracked internally
+  // by the WSI, as described above) have been destroyed - the present-wait
+  // semaphores of the current and all retired swapchains
+  // (PrepareForSwapchainRetirement moves the current ones into the retired
+  // list) can now be destroyed.
+  for (VkSemaphore retired_present_semaphore : paint_context_.retired_present_semaphores) {
+    dfn.vkDestroySemaphore(device, retired_present_semaphore, nullptr);
+  }
+  paint_context_.retired_present_semaphores.clear();
 
   if (paint_context_.swapchain_render_pass != VK_NULL_HANDLE) {
     dfn.vkDestroyRenderPass(device, paint_context_.swapchain_render_pass, nullptr);
@@ -1099,6 +1102,32 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain_framebuffers.emplace_back(image_view, framebuffer);
   }
 
+  // Create one presentation-wait semaphore per swapchain image, always fresh
+  // for a new swapchain (the previous swapchain's semaphores were moved to
+  // retired_present_semaphores by PrepareForSwapchainRetirement). The paint
+  // submission signals the semaphore of the acquired image, and
+  // vkQueuePresentKHR waits on it - re-signaling is safe because the image
+  // index has just been re-acquired, proving its previous present (and thus
+  // the presentation engine's wait on this semaphore) has completed.
+  assert_true(paint_context_.swapchain_present_semaphores.empty());
+  paint_context_.swapchain_present_semaphores.reserve(paint_context_.swapchain_images.size());
+  VkSemaphoreCreateInfo present_semaphore_create_info;
+  present_semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  present_semaphore_create_info.pNext = nullptr;
+  present_semaphore_create_info.flags = 0;
+  for (size_t i = 0; i < paint_context_.swapchain_images.size(); ++i) {
+    VkSemaphore present_semaphore;
+    if (dfn.vkCreateSemaphore(device, &present_semaphore_create_info, nullptr,
+                              &present_semaphore) != VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to create a swapchain image presentation "
+          "semaphore");
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    paint_context_.swapchain_present_semaphores.push_back(present_semaphore);
+  }
+
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
   return SurfacePaintConnectResult::kSuccess;
 }
@@ -1500,6 +1529,22 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
     dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
   }
   swapchain_framebuffers.clear();
+  // The retired swapchain may still have presents in flight, and
+  // vkQueuePresentKHR provides no host-visible signal for the completion of
+  // its semaphore wait operations (the submission fences awaited above only
+  // cover the vkQueueSubmit that signaled them). Retire the per-image
+  // present-wait semaphores instead of destroying or reusing them - a new set
+  // is created for the new swapchain, so no stale pending signal can ever be
+  // carried over into it (that carry-over caused
+  // SYNC-HAZARD-PRESENT-AFTER-WRITE: a present pairing with an old signal
+  // leaves the new frame's swapchain image writes unordered against
+  // presentation). Semaphores are tiny and swapchain recreations are rare, so
+  // the retired list stays small; it's destroyed in ~VulkanPresenter once all
+  // submissions have completed and the swapchains have been destroyed.
+  retired_present_semaphores.insert(retired_present_semaphores.end(),
+                                    swapchain_present_semaphores.begin(),
+                                    swapchain_present_semaphores.end());
+  swapchain_present_semaphores.clear();
   swapchain_images.clear();
   swapchain_extent.width = 0;
   swapchain_extent.height = 0;
@@ -2249,7 +2294,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     paint_context_.ui_setup_command_buffer_current_index = SIZE_MAX;
   }
   command_buffers[command_buffer_count++] = draw_command_buffer;
-  VkSemaphore present_semaphore = paint_submission.present_semaphore();
+  // Signal the presentation-wait semaphore belonging to the acquired swapchain
+  // image (not a per-submission one - the submission ring's fence can't prove
+  // the presentation engine has finished waiting on a present semaphore, only
+  // re-acquisition of the same image can, so per-image semaphores are the only
+  // safe pooling; see PaintContext::swapchain_present_semaphores).
+  assert_true(size_t(swapchain_image_index) < paint_context_.swapchain_present_semaphores.size());
+  VkSemaphore present_semaphore =
+      paint_context_.swapchain_present_semaphores[swapchain_image_index];
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.pNext = nullptr;

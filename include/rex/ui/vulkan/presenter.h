@@ -281,7 +281,6 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
-      VkSemaphore present_semaphore() const { return present_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
 
@@ -291,8 +290,14 @@ class VulkanPresenter final : public Presenter {
       bool Initialize();
 
       const VulkanDevice* vulkan_device_;
+      // Swapchain image acquisition semaphore. Safe to pool per-submission:
+      // reuse is gated by the paint submission fence (kSubmissionCount frames
+      // back), and that fence covers the vkQueueSubmit that waits on this
+      // semaphore, which is what returns it to the unsignaled state.
+      // The present-wait semaphores, however, are NOT per-submission - they
+      // are per-swapchain-image (PaintContext::swapchain_present_semaphores),
+      // because no fence covers the presentation engine's wait on them.
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
-      VkSemaphore present_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -416,6 +421,28 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_is_fifo = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+    // One presentation-wait ("draw complete") semaphore per swapchain image,
+    // indexed by the acquired image index. Signaled by the paint vkQueueSubmit
+    // that writes the image, waited on by vkQueuePresentKHR. Binary present
+    // semaphores must not be re-signaled while the presentation engine may
+    // still be waiting on them, and vkQueuePresentKHR provides no host-visible
+    // completion signal - the only host-observable proof that the previous
+    // present of an image (and therefore its semaphore wait) has completed is
+    // vkAcquireNextImageKHR returning that same image again. Keying the
+    // semaphore by the acquired image index makes every re-signal follow such
+    // a re-acquisition, which is the standard validation-clean discipline
+    // (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+    std::vector<VkSemaphore> swapchain_present_semaphores;
+    // Present-wait semaphores of retired swapchains. A retired swapchain may
+    // still have presents in flight whose semaphore waits can't be proven
+    // complete from the host, so the semaphores are neither destroyed nor
+    // reused with the new swapchain (a carried-over pending/stale signal would
+    // let a later vkQueuePresentKHR wait pair with an old signal, leaving the
+    // new frame's writes unordered against presentation - the
+    // SYNC-HAZARD-PRESENT-AFTER-WRITE case). Destroyed in ~VulkanPresenter
+    // after all submissions have completed and the swapchain releasing them
+    // has been destroyed.
+    std::vector<VkSemaphore> retired_present_semaphores;
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
