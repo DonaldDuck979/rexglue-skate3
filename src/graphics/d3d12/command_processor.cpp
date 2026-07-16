@@ -21,6 +21,7 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/d3d12/native_rhi_d3d12.h>
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
@@ -40,60 +41,9 @@
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(native_render_suppress_mode, 2, "GPU",
-                     "Which emulated passes to suppress while the native guest-output "
-                     "renderer is active. 0 = framebuffer-sized passes only (surface "
-                     "pitch >= 1280); the game's whole postfx chain then still executes "
-                     "at 1152x640 x resolution scale EVERY frame and paces the pipeline "
-                     "(~half the achievable frame rate). 1 = suppress everything (perf "
-                     "probing; mid-gameplay lightmap page composition breaks). 2 = "
-                     "suppress everything EXCEPT the memory-composition passes whose "
-                     "outputs the native renderer samples from guest memory: lightmap "
-                     "page composition (pitch 1024) and small composite surfaces (pitch "
-                     "<= 512, CAS outfit pieces). Menus/pause/loading always render "
-                     "fully (the native renderer yields there), so shop/outfit "
-                     "composition is unaffected by any mode. 3 = portrait-window mode: "
-                     "like 0 the sub-framebuffer RTT passes execute (one-shot frontend "
-                     "portrait renders, census pitches 560-1200), but the 1152-wide "
-                     "main scene + postfx band stays suppressed; that band is the "
-                     "whole-pipeline cost at scaled resolutions and portraits never "
-                     "need it.")
-    .range(0, 3)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-namespace {
-// While the native guest-output renderer is active: should the emulated pass
-// currently targeting `surface_pitch`-wide surfaces be suppressed? See
-// native_render_suppress_mode. Draw and resolve suppression must agree:
-// executed passes need their resolves, suppressed passes leave garbage EDRAM
-// that must never be copied out.
-bool ShouldSuppressPassAtPitch(uint32_t surface_pitch) {
-  switch (REXCVAR_GET(native_render_suppress_mode)) {
-    case 0:
-      return surface_pitch >= 1280;
-    case 1:
-      return true;
-    case 3:
-      // Portrait-window mode: the one-shot frontend portrait RTTs (Skate 3
-      // census during the window: 1200/800/640/600/560 + small mips)
-      // execute, while the 1152-wide main scene/postfx band, the
-      // whole-pipeline cost at scaled resolutions, stays suppressed like
-      // the framebuffer.
-      return surface_pitch >= 1280 || surface_pitch == 1152;
-    default:
-      // Execute only the memory-composition passes the native renderer
-      // samples: lightmap page composition (1024) and small composite
-      // surfaces (<= 512, CAS outfit pieces). The <= 512 window also lets a
-      // few tiny postfx pyramid mips through, negligible, and safer than
-      // guessing which small surfaces matter.
-      return !(surface_pitch == 1024 || surface_pitch <= 512);
-  }
-}
-}  // namespace
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
@@ -2036,6 +1986,11 @@ void D3D12CommandProcessor::ShutdownContext() {
   ShutdownGpuTimestampResources();
   ShutdownOcclusionQueryResources();
 
+  if (native_rhi_device_ != nullptr) {
+    DestroyNativeRhiDevice(native_rhi_device_);
+    native_rhi_device_ = nullptr;
+  }
+
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
   for (auto& resolve_readback_pair : readback_buffers_) {
@@ -2457,142 +2412,26 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
                 .resource_uav_capable();
 
-        NativeGuestOutputRenderContext native_context;
-        native_context.backend = NativeGuestOutputBackend::kD3D12;
-        native_context.guest_output_width = guest_output_width;
-        native_context.guest_output_height = guest_output_height;
-        native_context.display_width = display_width;
-        native_context.display_height = display_height;
-        native_context.d3d12.command_processor = this;
-        native_context.d3d12.command_processor_user_data = this;
-        native_context.d3d12.device = device;
-        native_context.d3d12.guest_output_resource = guest_output_resource;
-        native_context.d3d12.guest_output_format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
-        native_context.d3d12.guest_output_initial_state =
-            ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
-        native_context.d3d12.request_one_use_view_descriptor =
-            [](void* user_data, D3D12_CPU_DESCRIPTOR_HANDLE* cpu_out,
-               D3D12_GPU_DESCRIPTOR_HANDLE* gpu_out) -> bool {
-          auto* command_processor = static_cast<D3D12CommandProcessor*>(user_data);
-          ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
-          if (!command_processor->RequestOneUseSingleViewDescriptors(1, &descriptor)) {
-            return false;
+        if (HasNativeGuestOutputRenderer()) {
+          NativeGuestOutputRenderContext native_context;
+          native_context.backend = NativeGuestOutputBackend::kD3D12;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          if (native_rhi_device_ == nullptr) {
+            native_rhi_device_ = CreateNativeRhiDevice(this);
           }
-          *cpu_out = descriptor.first;
-          *gpu_out = descriptor.second;
-          return true;
-        };
-        native_context.d3d12.create_root_signature =
-            [](void* user_data, const D3D12_ROOT_SIGNATURE_DESC* desc,
-               ID3D12RootSignature** root_signature_out) -> bool {
-          auto* command_processor = static_cast<D3D12CommandProcessor*>(user_data);
-          *root_signature_out =
-              ui::d3d12::util::CreateRootSignature(command_processor->GetD3D12Provider(), *desc);
-          return *root_signature_out != nullptr;
-        };
-        native_context.d3d12.push_transition_barrier =
-            [](void* user_data, ID3D12Resource* resource, D3D12_RESOURCE_STATES old_state,
-               D3D12_RESOURCE_STATES new_state) -> bool {
-          return static_cast<D3D12CommandProcessor*>(user_data)->PushTransitionBarrier(
-              resource, old_state, new_state);
-        };
-        native_context.d3d12.submit_barriers = [](void* user_data) {
-          static_cast<D3D12CommandProcessor*>(user_data)->SubmitBarriers();
-        };
-        native_context.d3d12.copy_texture_region =
-            [](void* user_data, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT dst_x, UINT dst_y,
-               UINT dst_z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* src_box) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DCopyTextureRegion(dst, dst_x, dst_y, dst_z, src, src_box);
-        };
-        native_context.d3d12.clear_render_target_view =
-            [](void* user_data, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4]) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DClearRenderTargetView(rtv, color, 0, nullptr);
-        };
-        native_context.d3d12.clear_unordered_access_view_float =
-            [](void* user_data, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
-               D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource* resource,
-               const FLOAT values[4]) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, resource, values, 0,
-                                                nullptr);
-        };
-        native_context.d3d12.set_graphics_root_signature =
-            [](void* user_data, ID3D12RootSignature* root_signature) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DSetGraphicsRootSignature(root_signature);
-        };
-        native_context.d3d12.set_graphics_root_32bit_constants =
-            [](void* user_data, UINT root_parameter_index, UINT num_32bit_values_to_set,
-               const void* src_data, UINT dest_offset_in_32bit_values) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DSetGraphicsRoot32BitConstants(root_parameter_index, num_32bit_values_to_set,
-                                                src_data, dest_offset_in_32bit_values);
-        };
-        native_context.d3d12.set_graphics_root_descriptor_table =
-            [](void* user_data, UINT root_parameter_index,
-               D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DSetGraphicsRootDescriptorTable(root_parameter_index, base_descriptor);
-        };
-        native_context.d3d12.set_pipeline_state =
-            [](void* user_data, ID3D12PipelineState* pipeline_state) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DSetPipelineState(pipeline_state);
-        };
-        native_context.d3d12.ia_set_primitive_topology =
-            [](void* user_data, D3D12_PRIMITIVE_TOPOLOGY primitive_topology) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DIASetPrimitiveTopology(primitive_topology);
-        };
-        native_context.d3d12.ia_set_vertex_buffers =
-            [](void* user_data, UINT start_slot, UINT num_views,
-               const D3D12_VERTEX_BUFFER_VIEW* views) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DIASetVertexBuffers(start_slot, num_views, views);
-        };
-        native_context.d3d12.om_set_render_targets =
-            [](void* user_data, UINT num_render_target_descriptors,
-               const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
-               BOOL rts_single_handle_to_descriptor_range,
-               const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DOMSetRenderTargets(num_render_target_descriptors, render_target_descriptors,
-                                     rts_single_handle_to_descriptor_range,
-                                     depth_stencil_descriptor);
-        };
-        native_context.d3d12.rs_set_viewport = [](void* user_data,
-                                                  const D3D12_VIEWPORT* viewport) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .RSSetViewport(*viewport);
-        };
-        native_context.d3d12.rs_set_scissor_rect = [](void* user_data, const D3D12_RECT* rect) {
-          static_cast<D3D12CommandProcessor*>(user_data)->GetDeferredCommandList().RSSetScissorRect(
-              *rect);
-        };
-        native_context.d3d12.draw_instanced =
-            [](void* user_data, UINT vertex_count_per_instance, UINT instance_count,
-               UINT start_vertex_location, UINT start_instance_location) {
-          static_cast<D3D12CommandProcessor*>(user_data)
-              ->GetDeferredCommandList()
-              .D3DDrawInstanced(vertex_count_per_instance, instance_count, start_vertex_location,
-                                start_instance_location);
-        };
-        if (TryRenderNativeGuestOutput(native_context)) {
-          EndSubmission(true);
-          return true;
+          native_context.device = native_rhi_device_;
+          native_context.cmd = NativeRhiBeginFrame(
+              native_rhi_device_, guest_output_resource,
+              ui::d3d12::D3D12Presenter::kGuestOutputFormat,
+              ui::d3d12::D3D12Presenter::kGuestOutputInternalState, guest_output_width,
+              guest_output_height, &native_context.guest_output);
+          if (TryRenderNativeGuestOutput(native_context)) {
+            EndSubmission(true);
+            return true;
+          }
         }
 
         // Upload the new gamma ramp, using the upload buffer for the current
@@ -2941,6 +2780,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!memexport_used && ShouldSuppressEmulatedDraws()) {
     const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
     if (ShouldSuppressPassAtPitch(pitch)) {
+      return true;
+    }
+    // Depth/stencil-only draws (no pixel shader) inside the EXEMPT passes:
+    // shadow-map casters and z-prepasses whose output feeds only the
+    // suppressed scene passes (the native renderer builds its own shadows).
+    // Mirrors the Vulkan gate, where this stream was the dominant remaining
+    // emulated GPU cost (the bimodal-FPS slow state).
+    if (pixel_shader == nullptr && ShouldSuppressExemptDepthOnlyDraws()) {
       return true;
     }
     // Census of the passes still EXECUTING under suppression (each distinct

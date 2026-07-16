@@ -14,6 +14,39 @@ REXCVAR_DEFINE_BOOL(native_render_suppress_emulated_draws, false, "GPU",
                     "normally.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(native_render_suppress_mode, 2, "GPU",
+                     "Which emulated passes to suppress while the native guest-output "
+                     "renderer is active. 0 = framebuffer-sized passes only (surface "
+                     "pitch >= 1280); the game's whole postfx chain then still executes "
+                     "at 1152x640 x resolution scale EVERY frame and paces the pipeline "
+                     "(~half the achievable frame rate). 1 = suppress everything (perf "
+                     "probing; mid-gameplay lightmap page composition breaks). 2 = "
+                     "suppress everything EXCEPT the memory-composition passes whose "
+                     "outputs the native renderer samples from guest memory: lightmap "
+                     "page composition (pitch 1024) and small composite surfaces (pitch "
+                     "<= 512, CAS outfit pieces). Menus/pause/loading always render "
+                     "fully (the native renderer yields there), so shop/outfit "
+                     "composition is unaffected by any mode. 3 = portrait-window mode: "
+                     "like 0 the sub-framebuffer RTT passes execute (one-shot frontend "
+                     "portrait renders, census pitches 560-1200), but the 1152-wide "
+                     "main scene + postfx band stays suppressed; that band is the "
+                     "whole-pipeline cost at scaled resolutions and portraits never "
+                     "need it.")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(native_render_suppress_exempt_depth_only, true, "GPU",
+                    "Within the suppression-EXEMPT passes (see "
+                    "native_render_suppress_mode), also skip draws with no pixel shader "
+                    "(depth/stencil-only: shadow-map casters, z-prepasses). Their output "
+                    "feeds only the suppressed scene passes; the native renderer builds "
+                    "its own shadows, and on Vulkan this stream is the dominant "
+                    "remaining emulated GPU cost (2-12 ms/frame at 3x, the bimodal-FPS "
+                    "slow state). Disable if lightmap-page or CAS composition content "
+                    "regresses (a composition pass depth/stencil-testing against its own "
+                    "no-PS lay-down would need this off).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 namespace {
 
@@ -42,6 +75,10 @@ bool TryRenderNativeGuestOutput(const NativeGuestOutputRenderContext& context) {
   return rendered;
 }
 
+bool HasNativeGuestOutputRenderer() {
+  return g_renderer.load(std::memory_order_acquire) != nullptr;
+}
+
 bool IsNativeGuestOutputActive() {
   return g_native_output_active.load(std::memory_order_relaxed);
 }
@@ -49,6 +86,33 @@ bool IsNativeGuestOutputActive() {
 bool ShouldSuppressEmulatedDraws() {
   return REXCVAR_GET(native_render_suppress_emulated_draws) &&
          g_native_output_active.load(std::memory_order_relaxed);
+}
+
+bool ShouldSuppressExemptDepthOnlyDraws() {
+  return REXCVAR_GET(native_render_suppress_exempt_depth_only);
+}
+
+bool ShouldSuppressPassAtPitch(uint32_t surface_pitch) {
+  switch (REXCVAR_GET(native_render_suppress_mode)) {
+    case 0:
+      return surface_pitch >= 1280;
+    case 1:
+      return true;
+    case 3:
+      // Portrait-window mode: the one-shot frontend portrait RTTs (Skate 3
+      // census during the window: 1200/800/640/600/560 + small mips)
+      // execute, while the 1152-wide main scene/postfx band, the
+      // whole-pipeline cost at scaled resolutions, stays suppressed like
+      // the framebuffer.
+      return surface_pitch >= 1280 || surface_pitch == 1152;
+    default:
+      // Execute only the memory-composition passes the native renderer
+      // samples: lightmap page composition (1024) and small composite
+      // surfaces (<= 512, CAS outfit pieces). The <= 512 window also lets a
+      // few tiny postfx pyramid mips through, negligible, and safer than
+      // guessing which small surfaces matter.
+      return !(surface_pitch == 1024 || surface_pitch <= 512);
+  }
 }
 
 }  // namespace rex::graphics

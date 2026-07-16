@@ -2,13 +2,7 @@
 
 #include <cstdint>
 
-#if REX_HAS_D3D12
-#include <rex/ui/d3d12/d3d12_api.h>
-#endif
-
-namespace rex::graphics::d3d12 {
-class D3D12CommandProcessor;
-}
+#include <rex/graphics/native_rhi.h>
 
 namespace rex::graphics {
 
@@ -18,6 +12,10 @@ enum class NativeGuestOutputBackend : uint32_t {
   kVulkan,
 };
 
+// Per-frame context handed to the registered native guest-output renderer.
+// Backend-agnostic: all device access and command recording goes through the
+// native-render RHI (rex/graphics/native_rhi.h); the command processor owns
+// the nrhi::Device and the per-frame nrhi::Cmd.
 struct NativeGuestOutputRenderContext {
   NativeGuestOutputBackend backend = NativeGuestOutputBackend::kUnknown;
   uint32_t guest_output_width = 0;
@@ -25,59 +23,18 @@ struct NativeGuestOutputRenderContext {
   uint32_t display_width = 0;
   uint32_t display_height = 0;
 
-#if REX_HAS_D3D12
-  struct D3D12Context {
-    d3d12::D3D12CommandProcessor* command_processor = nullptr;
-    void* command_processor_user_data = nullptr;
-    ID3D12Device* device = nullptr;
-    ID3D12Resource* guest_output_resource = nullptr;
-    DXGI_FORMAT guest_output_format = DXGI_FORMAT_UNKNOWN;
-    D3D12_RESOURCE_STATES guest_output_initial_state = D3D12_RESOURCE_STATE_COMMON;
-    bool (*request_one_use_view_descriptor)(void* user_data,
-                                            D3D12_CPU_DESCRIPTOR_HANDLE* cpu_out,
-                                            D3D12_GPU_DESCRIPTOR_HANDLE* gpu_out) = nullptr;
-    bool (*create_root_signature)(void* user_data, const D3D12_ROOT_SIGNATURE_DESC* desc,
-                                  ID3D12RootSignature** root_signature_out) = nullptr;
-    bool (*push_transition_barrier)(void* user_data, ID3D12Resource* resource,
-                                    D3D12_RESOURCE_STATES old_state,
-                                    D3D12_RESOURCE_STATES new_state) = nullptr;
-    void (*submit_barriers)(void* user_data) = nullptr;
-    void (*copy_texture_region)(void* user_data, const D3D12_TEXTURE_COPY_LOCATION* dst,
-                                UINT dst_x, UINT dst_y, UINT dst_z,
-                                const D3D12_TEXTURE_COPY_LOCATION* src,
-                                const D3D12_BOX* src_box) = nullptr;
-    void (*clear_render_target_view)(void* user_data, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
-                                     const FLOAT color[4]) = nullptr;
-    void (*clear_unordered_access_view_float)(void* user_data,
-                                              D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
-                                              D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle,
-                                              ID3D12Resource* resource,
-                                              const FLOAT values[4]) = nullptr;
-    void (*set_graphics_root_signature)(void* user_data,
-                                        ID3D12RootSignature* root_signature) = nullptr;
-    void (*set_graphics_root_32bit_constants)(void* user_data, UINT root_parameter_index,
-                                              UINT num_32bit_values_to_set,
-                                              const void* src_data,
-                                              UINT dest_offset_in_32bit_values) = nullptr;
-    void (*set_graphics_root_descriptor_table)(void* user_data, UINT root_parameter_index,
-                                               D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) =
-        nullptr;
-    void (*set_pipeline_state)(void* user_data, ID3D12PipelineState* pipeline_state) = nullptr;
-    void (*ia_set_primitive_topology)(void* user_data,
-                                      D3D12_PRIMITIVE_TOPOLOGY primitive_topology) = nullptr;
-    void (*ia_set_vertex_buffers)(void* user_data, UINT start_slot, UINT num_views,
-                                  const D3D12_VERTEX_BUFFER_VIEW* views) = nullptr;
-    void (*om_set_render_targets)(void* user_data, UINT num_render_target_descriptors,
-                                  const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
-                                  BOOL rts_single_handle_to_descriptor_range,
-                                  const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor) =
-        nullptr;
-    void (*rs_set_viewport)(void* user_data, const D3D12_VIEWPORT* viewport) = nullptr;
-    void (*rs_set_scissor_rect)(void* user_data, const D3D12_RECT* rect) = nullptr;
-    void (*draw_instanced)(void* user_data, UINT vertex_count_per_instance, UINT instance_count,
-                           UINT start_vertex_location, UINT start_instance_location) = nullptr;
-  } d3d12;
-#endif
+  // Device-level RHI: resource/pipeline creation, submission counters.
+  // Stable across frames for the lifetime of the graphics system.
+  nrhi::Device* device = nullptr;
+  // Frame-scoped command recording into the command processor's deferred
+  // command list. Only valid during the callback.
+  nrhi::Cmd* cmd = nullptr;
+  // The presenter's guest output image, wrapped as an RHI texture. In
+  // nrhi::ResourceState::kGuestOutput at entry (or kCommon the very first
+  // frame it exists); must be returned to kGuestOutput before the callback
+  // returns true. The pointer is stable while the underlying image is (it
+  // changes on output resize).
+  nrhi::Texture* guest_output = nullptr;
 };
 
 using NativeGuestOutputRenderer = bool (*)(const NativeGuestOutputRenderContext& context,
@@ -85,6 +42,9 @@ using NativeGuestOutputRenderer = bool (*)(const NativeGuestOutputRenderContext&
 
 void SetNativeGuestOutputRenderer(NativeGuestOutputRenderer renderer, void* user_data);
 bool TryRenderNativeGuestOutput(const NativeGuestOutputRenderContext& context);
+// Whether a renderer is registered at all; command processors skip RHI
+// setup entirely when none is (non-Skate titles / renderer disabled).
+bool HasNativeGuestOutputRenderer();
 
 // True while the registered renderer actually replaced the last presented
 // frame (false when it yields to the emulated output).
@@ -93,5 +53,19 @@ bool IsNativeGuestOutputActive();
 // command processors skip emulated draw/resolve execution (memexport draws,
 // fences, queries and PM4 parsing still run).
 bool ShouldSuppressEmulatedDraws();
+
+// While the native guest-output renderer is active: should the emulated pass
+// currently targeting `surface_pitch`-wide surfaces be suppressed? Driven by
+// the native_render_suppress_mode cvar; shared by both command processors.
+// Draw and resolve suppression must agree: executed passes need their
+// resolves, suppressed passes leave garbage EDRAM that must never be copied
+// out.
+bool ShouldSuppressPassAtPitch(uint32_t surface_pitch);
+
+// Within a suppression-EXEMPT pass: should a draw with no pixel shader
+// (depth/stencil-only: shadow casters, z-prepasses) be skipped anyway?
+// Driven by native_render_suppress_exempt_depth_only; their output feeds
+// only suppressed scene passes (the native renderer shadows itself).
+bool ShouldSuppressExemptDepthOnlyDraws();
 
 }  // namespace rex::graphics

@@ -51,6 +51,7 @@ set(REXGRAPHICS_VULKAN_SOURCES
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
     vulkan/command_processor.cpp
+    vulkan/native_rhi_vulkan.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp
@@ -80,6 +81,7 @@ if(REXGLUE_USE_D3D12)
     set(REXGRAPHICS_D3D12_SOURCES
         d3d12/graphics_system.cpp
         d3d12/command_processor.cpp
+        d3d12/native_rhi_d3d12.cpp
         d3d12/primitive_processor.cpp
         d3d12/render_target_cache.cpp
         d3d12/shader.cpp
@@ -146,6 +148,7 @@ if(REXGLUE_USE_D3D12)
         d3d12
         dxgi
         dxguid
+        d3dcompiler  # native-render RHI runtime HLSL compilation
     )
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_D3D12=1)
 endif()

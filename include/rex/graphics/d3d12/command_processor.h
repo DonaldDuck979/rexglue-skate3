@@ -43,6 +43,10 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+namespace rex::graphics::nrhi {
+class Device;
+}
+
 namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor : public CommandProcessor {
@@ -594,6 +598,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint8_t* gamma_ramp_upload_buffer_mapping_ = nullptr;
   bool gamma_ramp_256_entry_table_up_to_date_ = false;
   bool gamma_ramp_pwl_up_to_date_ = false;
+
+  // Native-render RHI device (rex/graphics/native_rhi.h), created lazily on
+  // the first swap with a native guest-output renderer registered.
+  nrhi::Device* native_rhi_device_ = nullptr;
 
   struct ApplyGammaConstants {
     uint32_t size[2];

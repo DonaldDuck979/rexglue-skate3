@@ -44,6 +44,10 @@
 #include <rex/ui/vulkan/provider.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
+namespace rex::graphics::nrhi {
+class Device;
+}
+
 namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor : public CommandProcessor {
@@ -611,6 +615,10 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
 
+  // Native-render RHI device (rex/graphics/native_rhi.h), created lazily on
+  // the first swap with a native guest-output renderer registered.
+  nrhi::Device* native_rhi_device_ = nullptr;
+
   // Descriptor set layouts used by different shaders.
   VkDescriptorSetLayout descriptor_set_layout_empty_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptor_set_layout_constants_ = VK_NULL_HANDLE;
@@ -842,6 +850,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // timestamps are enabled.
   static constexpr uint32_t kGpuProfileLogFrameInterval = 120;
   uint64_t gpu_profile_bucket_us_[size_t(rex::perf::DrawBucket::kCount)] = {};
+  // Interval counts per bucket over the same logging window (distinguishes
+  // "more intervals" from "same intervals, slower").
+  uint64_t gpu_profile_bucket_n_[size_t(rex::perf::DrawBucket::kCount)] = {};
   uint64_t gpu_profile_span_us_ = 0;
   uint64_t gpu_profile_submissions_ = 0;
   uint32_t gpu_profile_frames_ = 0;

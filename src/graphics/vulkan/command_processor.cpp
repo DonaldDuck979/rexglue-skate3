@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -29,14 +30,17 @@
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/graphics/native_guest_renderer.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/vulkan/native_rhi_vulkan.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
@@ -1029,6 +1033,49 @@ void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
 
 bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                                 uint32_t packet, uint32_t count) {
+  // Native guest-output renderer active: the framebuffer-sized draws between
+  // query begin/end are suppressed, so a real host occlusion query reports 0
+  // samples. The game gates world rendering on these results - event-ad
+  // placements poll their poster quads' visibility and stop submitting the
+  // overlay geometry entirely (the native frame then shows the default poster
+  // art where the emulated frame shows the current ad). Report the fake
+  // positive count instead: the suppressed draws are exactly the ones the
+  // native renderer is drawing in their place. (Mirrors the D3D12 gate.)
+  if (ShouldSuppressEmulatedDraws()) {
+    if (active_occlusion_query_.valid) {
+      // End the host query cleanly so its pool slot is not left active.
+      uint32_t host_index = active_occlusion_query_.host_index;
+      active_occlusion_query_ = {};
+      if (occlusion_query_pool_ != VK_NULL_HANDLE && BeginSubmission(true)) {
+        EndRenderPass();
+        deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_, host_index);
+        EndSubmission(false);
+      }
+    }
+    // Set by D3D as BE but struct ABI is LE.
+    const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
+    assert_true(count == 1);
+    uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+    uint32_t sample_count_addr = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+    auto* sample_counts =
+        memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
+    if (!sample_counts) {
+      return true;
+    }
+    int32_t fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
+    bool is_end_via_z_pass =
+        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+    bool is_end_via_z_fail =
+        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
+    if (is_end_via_z_pass || is_end_via_z_fail) {
+      sample_counts->ZPass_A = fake_sample_count;
+      sample_counts->Total_A = fake_sample_count;
+    }
+    return true;
+  }
+
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
@@ -2302,6 +2349,11 @@ void VulkanCommandProcessor::ShutdownContext() {
   ShutdownGpuTimestampResources();
   ShutdownOcclusionQueryResources();
 
+  if (native_rhi_device_ != nullptr) {
+    DestroyNativeRhiDevice(native_rhi_device_);
+    native_rhi_device_ = nullptr;
+  }
+
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -2871,8 +2923,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
-       swap_post_effect,
+      [this, guest_output_width, guest_output_height, display_width, display_height,
+       frontbuffer_format, swap_texture_view, swap_post_effect,
        swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
@@ -2900,6 +2952,49 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         bool use_pwl_gamma_ramp =
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
+
+        // Native guest-output renderer hook - mirrors the D3D12 refresher
+        // block: right after the backend refresh context is obtained,
+        // before any gamma-ramp/FXAA work. On success the whole gamma pass
+        // is skipped and the presenter's paint path consumes the natively
+        // rendered guest image unchanged. Set the 8bpc flag the way the
+        // D3D12 hook sees it (the emulated decision for the non-FXAA case);
+        // the emulated path below overwrites it if the renderer yields.
+        if (HasNativeGuestOutputRenderer()) {
+          context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+          NativeGuestOutputRenderContext native_context;
+          native_context.backend = NativeGuestOutputBackend::kVulkan;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          if (native_rhi_device_ == nullptr) {
+            native_rhi_device_ = CreateNativeRhiDevice(this);
+          }
+          native_context.device = native_rhi_device_;
+          native_context.cmd = NativeRhiBeginFrame(
+              native_rhi_device_, vulkan_context.image(), vulkan_context.image_view(),
+              vulkan_context.image_ever_written_previously(), guest_output_width,
+              guest_output_height, &native_context.guest_output);
+          // Attribute the native pass's GPU time to its own profile bucket
+          // (it otherwise smears into the last emulated draw's bucket).
+          BeginGpuTimestampedRegion(rex::perf::DrawBucket::kNativeScene);
+          if (TryRenderNativeGuestOutput(native_context)) {
+            NativeRhiEndFrame(native_rhi_device_);
+            // Need to submit all the commands before giving the image back
+            // to the presenter (it submits its own for displaying it), and
+            // the release barrier to the presenter's internal state must be
+            // recorded.
+            EndSubmission(true);
+            return true;
+          }
+          // The renderer yielded to the emulated path: close anything the
+          // callback may have left open (render pass, pending clears) -
+          // the gamma pass below records into the same deferred command
+          // buffer.
+          NativeRhiEndFrame(native_rhi_device_);
+        }
+
         bool swap_source_requires_compute_rb_swap =
             !vulkan_device->properties().imageViewFormatSwizzle && swap_source_needs_rb_swap;
         auto select_swap_apply_gamma_compute_pipeline = [&](bool use_pwl,
@@ -4118,6 +4213,42 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       fingerprint.primitive_count = primitive_count;
       PROFILE_DRAW_FINGERPRINT(fingerprint);
     }
+    if (ShouldSuppressEmulatedDraws() &&
+        ShouldSuppressPassAtPitch(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch)) {
+      // Native output active: skip the resolves of SUPPRESSED passes - their
+      // draws left garbage in EDRAM, and copying it out would overwrite
+      // guest texture payloads the native renderer still samples. Passes
+      // that EXECUTE under the current suppression mode (lightmap page
+      // composition, CAS composites) must keep their resolves: skipping
+      // lightpage composition left never-composed pages sampling garbage -
+      // the light/dark checkerboard ground. (Mirrors the D3D12 gate: draw
+      // and resolve suppression must agree.)
+      if (REXCVAR_GET(native_render_force_resolve_readback_max_length) > 0) {
+        // App-armed window diagnostics (Skate 3 photo flows): while the
+        // window is armed, show which resolves the suppression filter drops
+        // - pins passes (e.g. the photo display-card compose) whose output
+        // never reaches guest memory. Throttled.
+        static uint64_t s_drop_log_ms = 0;
+        static uint32_t s_drop_log_count = 0;
+        const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+        if (now_ms - s_drop_log_ms >= 1000) {
+          if (s_drop_log_count > 8) {
+            REXLOG_INFO("readback-window: (+{} more dropped resolves)",
+                        s_drop_log_count - 8);
+          }
+          s_drop_log_ms = now_ms;
+          s_drop_log_count = 0;
+        }
+        if (++s_drop_log_count <= 8) {
+          REXLOG_INFO(
+              "readback-window: resolve DROPPED with suppressed pass "
+              "(surface_pitch={} copy_dest=0x{:08X})",
+              regs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
+              uint32_t(regs[XE_GPU_REG_RB_COPY_DEST_BASE]));
+        }
+      }
+      return true;
+    }
     uint32_t gpu_timestamp_start =
         BeginGpuTimestampedDraw(rex::perf::DrawBucket::kCopyResolve);
     bool copy_result = IssueCopy();
@@ -4213,6 +4344,48 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
   bool draw_samplers_reused = false;
+
+  // Native guest-output renderer active: the emulated frame is never shown,
+  // so skip the draw entirely (pipeline setup, texture cache, render target
+  // cache, GPU work). Memexport draws still execute - the game reads their
+  // results back from memory. Fences, queries and PM4 processing are
+  // unaffected. Menus/pause flip the native renderer inactive, so emulated
+  // rendering works normally there.
+  //
+  // Only FRAMEBUFFER-SIZED passes (surface pitch >= 1280: main pass,
+  // z-prepass, HUD overlay RTT) are suppressed. Passes into smaller
+  // surfaces keep executing: lightmap PAGE COMPOSITION renders into
+  // 1024-wide pages whose CPU payloads the native renderer samples -
+  // suppressing it left pages that streamed in during native play
+  // uncomposed (garbage), the light/dark checkerboard ground. CAS outfit
+  // composition mid-gameplay is covered by the same rule. (Mirrors the
+  // D3D12 gate; agreement with the resolve gate above is an invariant.)
+  if (!memexport_writes_possible && ShouldSuppressEmulatedDraws()) {
+    const uint32_t suppress_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    if (ShouldSuppressPassAtPitch(suppress_pitch)) {
+      return true;
+    }
+    // Depth/stencil-only draws (no pixel shader) inside the EXEMPT passes:
+    // shadow-map casters and z-prepasses whose output feeds only the
+    // suppressed scene passes (the native renderer builds its own shadows).
+    // This stream is the dominant remaining emulated GPU cost at 3x on
+    // Vulkan (2-12 ms/frame - the bimodal-FPS slow state).
+    if (pixel_shader == nullptr && ShouldSuppressExemptDepthOnlyDraws()) {
+      return true;
+    }
+    // Census of the passes still EXECUTING under suppression (each distinct
+    // surface pitch logged once): the data for tightening the filter - these
+    // passes pace the whole pipeline (gameplay census on Skate 3: pitches
+    // 1200/800/640/600/560/320/280/80).
+    static std::atomic<uint32_t> logged_pitch_mask[8192 / 32] = {};
+    if (suppress_pitch < 8192) {
+      const uint32_t bit = 1u << (suppress_pitch % 32);
+      if ((logged_pitch_mask[suppress_pitch / 32].fetch_or(bit) & bit) == 0) {
+        REXGPU_INFO("suppression census: executing draws at surface_pitch={}", suppress_pitch);
+      }
+    }
+  }
+
   analyze_stage_timer.Stop();
 
   // Two iterations because a submission (even the current one - in which case
@@ -5265,7 +5438,7 @@ bool VulkanCommandProcessor::DownscaleScaledResolveToSharedMemory(uint32_t start
   uint64_t scaled_length = 0;
   if (!texture_cache_->GetScaledResolveRange(start_unscaled, length_unscaled, 0, scaled_start,
                                              scaled_length) ||
-      !scaled_length || scaled_start > uint64_t(UINT32_MAX)) {
+      !scaled_length) {
     return false;
   }
 
@@ -5383,10 +5556,25 @@ bool VulkanCommandProcessor::DownscaleScaledResolveToSharedMemory(uint32_t start
     return false;
   }
 
+  // Bind the source as a bounded sub-range of the scaled resolve buffer, not
+  // the whole buffer: at 3x3 scaling the buffer is kBufferSize * 9 = 4.5 GB,
+  // and a storage buffer descriptor of that size exceeds maxStorageBufferRange
+  // (at most 4 GB - 1) - drivers' robust-access bound then wraps to
+  // (4.5 GB mod 4 GB) = 512 MB, so the downscale compute read ZEROS for every
+  // scaled address >= 0x20000000 (proven by the Skate 3 photo-grab readback
+  // window: only the one resolve whose scaled range straddled 0x20000000
+  // delivered content, everything above was 100% zeros). Mirrors the D3D12
+  // path, which creates the source SRV at the resolve's own offset with a
+  // small range; the shader receives only the intra-binding residual.
+  const VkDeviceSize source_offset_alignment = std::max(
+      vulkan_device->properties().minStorageBufferOffsetAlignment, VkDeviceSize(4));
+  const VkDeviceSize source_binding_offset =
+      VkDeviceSize(scaled_start) & ~(source_offset_alignment - 1);
+  const uint32_t source_offset_residual = uint32_t(scaled_start - source_binding_offset);
   VkDescriptorBufferInfo buffer_infos[2] = {};
   buffer_infos[0].buffer = scaled_resolve_buffer;
-  buffer_infos[0].offset = 0;
-  buffer_infos[0].range = VK_WHOLE_SIZE;
+  buffer_infos[0].offset = source_binding_offset;
+  buffer_infos[0].range = VkDeviceSize(source_offset_residual) + scaled_length;
   buffer_infos[1].buffer = resolve_downscale_buffer_;
   buffer_infos[1].offset = 0;
   buffer_infos[1].range = length_unscaled;
@@ -5428,7 +5616,8 @@ bool VulkanCommandProcessor::DownscaleScaledResolveToSharedMemory(uint32_t start
   constants.scale_y = texture_cache_->draw_resolution_scale_y();
   constants.pixel_size_log2 = pixel_size_log2;
   constants.tile_count = tile_count;
-  constants.source_offset_bytes = uint32_t(scaled_start);
+  // Relative to the descriptor's binding offset (see buffer_infos[0] above).
+  constants.source_offset_bytes = source_offset_residual;
   constants.half_pixel_offset =
       (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
        (constants.scale_x > 1 || constants.scale_y > 1))
@@ -5576,6 +5765,14 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
         readback_mode, false, true,
         force_scaled_resolve_cpu_copy ? kImportSkaterPreviewResolveLength
                                       : uint32_t(force_readback_max_length));
+    // Unconditional (the debug counters are boot-zeroed by the app): the
+    // app-armed shutter-burst window is ~1.5 s and the photo display card
+    // composes from exactly these CPU copies; visibility here is the whole
+    // diagnosis when the card is wrong (mirrors the D3D12 readback-window
+    // log).
+    REXLOG_INFO("readback-window: resolve dest=0x{:08X} len=0x{:X} -> CPU copy (kFull{})",
+                written_address, written_length,
+                force_scaled_resolve_cpu_copy ? ", targeted" : ", forced window");
   }
 
   const int32_t max_readback_length = REXCVAR_GET(vulkan_readback_resolve_max_length);
@@ -5701,7 +5898,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
 
     VkBuffer scaled_resolve_buffer = texture_cache_->scaled_resolve_buffer();
-    if (scaled_resolve_buffer == VK_NULL_HANDLE || scaled_start > uint64_t(UINT32_MAX)) {
+    if (scaled_resolve_buffer == VK_NULL_HANDLE) {
       return true;
     }
 
@@ -5745,10 +5942,27 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
+    // Bind the source as a bounded sub-range of the scaled resolve buffer,
+    // not the whole buffer: at 3x3 scaling the buffer is kBufferSize * 9 =
+    // 4.5 GB, and a storage buffer descriptor of that size exceeds
+    // maxStorageBufferRange (at most 4 GB - 1) - drivers' robust-access bound
+    // then wraps to (4.5 GB mod 4 GB) = 512 MB, so the downscale compute read
+    // ZEROS for every scaled address >= 0x20000000. This is what broke the
+    // Skate 3 photo-grab readback window at scale 3 (skate3_1525: dest
+    // 0x03855000, scaled 0x1FAFD000, delivered content with exactly the
+    // above-boundary 44% tail zeroed; every dest whose scaled range sat
+    // entirely above 0x20000000 read 100% zeros). Mirrors the D3D12 path,
+    // which creates the source SRV at the resolve's own offset with a small
+    // range; the shader receives only the intra-binding residual.
+    const VkDeviceSize source_offset_alignment = std::max(
+        vulkan_device->properties().minStorageBufferOffsetAlignment, VkDeviceSize(4));
+    const VkDeviceSize source_binding_offset =
+        VkDeviceSize(scaled_start) & ~(source_offset_alignment - 1);
+    const uint32_t source_offset_residual = uint32_t(scaled_start - source_binding_offset);
     VkDescriptorBufferInfo buffer_infos[2] = {};
     buffer_infos[0].buffer = scaled_resolve_buffer;
-    buffer_infos[0].offset = 0;
-    buffer_infos[0].range = VK_WHOLE_SIZE;
+    buffer_infos[0].offset = source_binding_offset;
+    buffer_infos[0].range = VkDeviceSize(source_offset_residual) + scaled_length;
     buffer_infos[1].buffer = resolve_downscale_buffer_;
     buffer_infos[1].offset = 0;
     buffer_infos[1].range = written_length;
@@ -5790,7 +6004,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     constants.scale_y = texture_cache_->draw_resolution_scale_y();
     constants.pixel_size_log2 = pixel_size_log2;
     constants.tile_count = tile_count;
-    constants.source_offset_bytes = uint32_t(scaled_start);
+    // Relative to the descriptor's binding offset (see buffer_infos[0] above).
+    constants.source_offset_bytes = source_offset_residual;
     constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
                                    (constants.scale_x > 1 || constants.scale_y > 1))
                                       ? 1u
@@ -5881,6 +6096,24 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
         texture_cache_->DebugRecordResolveReadback(written_address, written_length, is_scaled);
         DebugDumpResolveReadback(written_address, written_length, is_scaled,
                                  readback.mapped_data[read_index]);
+      }
+      if (force_window_cpu_copy || force_scaled_resolve_cpu_copy) {
+        // App-armed window content probe (the photo display card composes
+        // from exactly these bytes): strided sample of hash + zero fraction
+        // so a broken scaled-readback path is visible in the log.
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(readback.mapped_data[read_index]);
+        const uint32_t word_count = written_length >> 2;
+        uint64_t hash = 1469598103934665603ull;
+        uint32_t zero_words = 0;
+        const uint32_t samples = std::min(word_count, 4096u);
+        for (uint32_t i = 0; i < samples; ++i) {
+          const uint32_t w = words[uint64_t(word_count - 1) * i / std::max(samples - 1, 1u)];
+          hash = (hash ^ w) * 1099511628211ull;
+          zero_words += w == 0 ? 1 : 0;
+        }
+        REXLOG_INFO("readback-window: content dest=0x{:08X} len=0x{:X} hash={:016X} zero={}%",
+                    written_address, written_length, hash,
+                    samples != 0 ? zero_words * 100 / samples : 100);
       }
     }
   }
@@ -6242,6 +6475,7 @@ void VulkanCommandProcessor::ProcessGpuTimestampResults() {
       }
       if (size_t(frame.buckets[i]) < size_t(rex::perf::DrawBucket::kCount)) {
         gpu_profile_bucket_us_[size_t(frame.buckets[i])] += uint64_t(elapsed_us);
+        ++gpu_profile_bucket_n_[size_t(frame.buckets[i])];
       }
       rex::perf::CounterId counter_id;
       switch (frame.buckets[i]) {
@@ -6314,8 +6548,10 @@ void VulkanCommandProcessor::ProcessGpuTimestampResults() {
           if (!total_us) {
             continue;
           }
-          breakdown += fmt::format(" {}={}", rex::perf::DrawBucketName(rex::perf::DrawBucket(bucket)),
-                                   total_us / gpu_profile_frames_);
+          breakdown += fmt::format(" {}={}({})",
+                                   rex::perf::DrawBucketName(rex::perf::DrawBucket(bucket)),
+                                   total_us / gpu_profile_frames_,
+                                   gpu_profile_bucket_n_[bucket] / gpu_profile_frames_);
         }
         uint64_t span_avg_us = gpu_profile_span_us_ / gpu_profile_frames_;
         uint64_t sum_avg_us = buckets_sum_us / gpu_profile_frames_;
@@ -6327,6 +6563,7 @@ void VulkanCommandProcessor::ProcessGpuTimestampResults() {
             gpu_profile_submissions_ / gpu_profile_frames_, frame.query_count,
             kMaxGpuTimestampQueriesPerFrame, breakdown);
         std::memset(gpu_profile_bucket_us_, 0, sizeof(gpu_profile_bucket_us_));
+        std::memset(gpu_profile_bucket_n_, 0, sizeof(gpu_profile_bucket_n_));
         gpu_profile_span_us_ = 0;
         gpu_profile_submissions_ = 0;
         gpu_profile_frames_ = 0;

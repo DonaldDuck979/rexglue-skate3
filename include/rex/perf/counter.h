@@ -60,6 +60,9 @@ enum class DrawBucket : uint8_t {
   // The buffer-to-image copy phase of a texture upload (kTextureUpload then
   // covers only the load compute dispatches and their barriers).
   kTextureUploadCopy,
+  // The native guest-output renderer's whole GPU pass (scene + 2D replay +
+  // resolve), recorded inside IssueSwap. Runs until frame end.
+  kNativeScene,
   kCount,
 };
 
@@ -98,6 +101,8 @@ inline const char* DrawBucketName(DrawBucket bucket) {
       return "ResolveGap";
     case DrawBucket::kTextureUploadCopy:
       return "TexUpCopy";
+    case DrawBucket::kNativeScene:
+      return "Native";
     default:
       return "Unknown";
   }
