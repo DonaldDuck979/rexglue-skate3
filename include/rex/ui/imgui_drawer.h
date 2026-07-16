@@ -25,6 +25,7 @@
 #include <rex/ui/window_listener.h>
 
 struct ImDrawData;
+struct ImFont;
 struct ImFontAtlas;
 struct ImGuiContext;
 struct ImGuiIO;
@@ -44,6 +45,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   ImGuiIO& GetIO();
   bool HasDialogs() const { return !dialogs_.empty(); }
+
+  // Proportional system UI font for styled overlays (and a heavier weight for
+  // headings), loaded in SetupFonts from per-platform system font paths.
+  // Nullptr when no suitable system font was found - callers fall back to the
+  // default font (PushFont(nullptr, size)).
+  ImFont* ui_font() const { return ui_font_; }
+  ImFont* ui_font_semibold() const { return ui_font_semibold_; }
 
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
@@ -102,6 +110,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   FontSetupCallback font_setup_;
 
   ImGuiContext* internal_state_ = nullptr;
+
+  // System UI fonts (see ui_font()). Owned by the ImGui font atlas.
+  ImFont* ui_font_ = nullptr;
+  ImFont* ui_font_semibold_ = nullptr;
 
   // All currently-attached dialogs that get drawn.
   std::vector<ImGuiDialog*> dialogs_;

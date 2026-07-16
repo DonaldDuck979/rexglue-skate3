@@ -209,6 +209,26 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   return X_ERROR_SUCCESS;
 }
 
+X_RESULT SDLInputDriver::GetStateUi(uint32_t user_index, X_INPUT_STATE* out_state) {
+  assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
+  if (user_index >= HID_SDL_USER_COUNT) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+
+  QueueControllerUpdate();
+
+  auto guard = DrainAndLock();
+
+  auto controller = GetControllerState(user_index);
+  if (!controller) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  // Raw state, no is_active gating, and no packet/state_changed bookkeeping -
+  // that belongs to the guest-facing GetState path.
+  std::memcpy(out_state, &controller->state, sizeof(*out_state));
+  return X_ERROR_SUCCESS;
+}
+
 X_RESULT SDLInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
   if (user_index >= HID_SDL_USER_COUNT) {

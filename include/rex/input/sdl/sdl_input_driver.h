@@ -39,6 +39,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps) override;
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
+  X_RESULT GetStateUi(uint32_t user_index, X_INPUT_STATE* out_state) override;
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;

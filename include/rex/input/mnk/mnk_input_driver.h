@@ -32,6 +32,11 @@ class MnkInputDriver final : public InputDriver,
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps) override;
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
+  // Keyboard/mouse reach the host UI directly; exposing the emulated pad here
+  // would double-apply every keypress in overlay navigation.
+  X_RESULT GetStateUi(uint32_t, X_INPUT_STATE*) override {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;

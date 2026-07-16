@@ -11,13 +11,17 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <string>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/logging.h>
+#include <rex/ui/fonts_inter.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/ui_event.h>
@@ -132,15 +136,14 @@ void ImGuiDrawer::Initialize() {
 
   SetupFonts();
 
-#if defined(__APPLE__)
-  // Dialogs push runtime font sizes (PushFont(nullptr, 18..22)); the legacy
+  // Dialogs push runtime font sizes (PushFont(font, 18..40)); the legacy
   // prebaked atlas can only bitmap-scale its 10px bake to serve them, which
-  // blurs, doubly so under the Retina logical->physical magnification in
-  // RenderDrawLists. With this flag glyphs rasterize on demand at the drawn
-  // size, and io.DisplayFramebufferScale (set per-frame in Draw) additionally
-  // rasterizes them at display pixel density while layout stays logical.
+  // blurs. With this flag glyphs rasterize on demand at the drawn size, and
+  // io.DisplayFramebufferScale (set per-frame in Draw on macOS) additionally
+  // rasterizes them at Retina display pixel density while layout stays
+  // logical. The texture create/update requests are serviced by
+  // ProcessImGuiTextureRequests through the platform-agnostic ImmediateDrawer.
   io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
-#endif
 
   auto& style = ImGui::GetStyle();
   style.ScrollbarRounding = 0;
@@ -357,6 +360,98 @@ void ImGuiDrawer::SetupFonts() {
   if (font_setup_) {
     font_setup_(io.Fonts);
   }
+
+  // UI fonts for styled overlays. Embedded Inter (OFL-licensed Latin subset,
+  // fonts_inter.cpp) so every platform renders identically; system fonts are
+  // only a fallback. With ImGuiBackendFlags_RendererHasTextures the size
+  // given here is only the default - glyphs rasterize at whatever size is
+  // pushed. MUST run after font_setup_: app callbacks (e.g. Skate3's
+  // OnConfigureFonts) may Clear() the atlas, which deletes every ImFont
+  // loaded before them - fonts cached here would dangle.
+  {
+    ImFontConfig config;
+    ui_font_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterRegularCompressedBase85(), 18.0f, &config);
+    ui_font_semibold_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterSemiBoldCompressedBase85(), 18.0f, &config);
+  }
+  auto add_first_available = [&io](const std::vector<std::string>& paths) -> ImFont* {
+    for (const std::string& path : paths) {
+      if (!std::filesystem::exists(path)) {
+        continue;
+      }
+      ImFontConfig config;
+      config.FontNo = 0;
+      if (ImFont* font = io.Fonts->AddFontFromFileTTF(path.c_str(), 18.0f, &config)) {
+        return font;
+      }
+    }
+    return nullptr;
+  };
+#if REX_PLATFORM_WIN32
+  // Helvetica family first (per-user font dir too - user-installed fonts land
+  // in %LOCALAPPDATA%, not C:\Windows\Fonts); Arial is a metric-compatible
+  // Helvetica clone every Windows ships, Segoe UI is the last resort.
+  std::string user_font_dir;
+  if (const char* local_appdata = std::getenv("LOCALAPPDATA")) {
+    user_font_dir = std::string(local_appdata) + "\\Microsoft\\Windows\\Fonts\\";
+  }
+  auto win_font_paths = [&user_font_dir](std::initializer_list<const char*> names) {
+    std::vector<std::string> paths;
+    for (const char* name : names) {
+      if (!user_font_dir.empty()) {
+        paths.push_back(user_font_dir + name);
+      }
+      paths.push_back(std::string("C:\\Windows\\Fonts\\") + name);
+    }
+    return paths;
+  };
+  if (!ui_font_) {
+    ui_font_ = add_first_available(win_font_paths(
+        {"HelveticaNowText-Regular.ttf", "HelveticaNowDisplay-Regular.ttf",
+         "HelveticaNow-Regular.ttf", "Helvetica.ttf", "HelveticaNeue.ttf", "arial.ttf",
+         "segoeui.ttf"}));
+  }
+  if (!ui_font_semibold_) {
+    ui_font_semibold_ = add_first_available(win_font_paths(
+        {"HelveticaNowText-Bold.ttf", "HelveticaNowDisplay-Bold.ttf", "HelveticaNow-Bold.ttf",
+         "Helvetica-Bold.ttf", "HelveticaNeue-Bold.ttf", "arialbd.ttf", "seguisb.ttf",
+         "segoeuib.ttf"}));
+  }
+#elif defined(__APPLE__)
+  if (!ui_font_) {
+    ui_font_ = add_first_available({"/System/Library/Fonts/Helvetica.ttc",
+                                    "/System/Library/Fonts/Supplemental/Arial.ttf"});
+  }
+  if (!ui_font_semibold_) {
+    ui_font_semibold_ =
+        add_first_available({"/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                             "/System/Library/Fonts/Helvetica.ttc"});
+  }
+#else
+  if (!ui_font_) {
+    ui_font_ = add_first_available(
+        {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+         "/usr/share/fonts/noto/NotoSans-Regular.ttf"});
+  }
+  if (!ui_font_semibold_) {
+    ui_font_semibold_ = add_first_available(
+        {"/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+         "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+         "/usr/share/fonts/noto/NotoSans-Bold.ttf"});
+  }
+#endif
+  if (!ui_font_) {
+    REXLOG_WARN("No system UI font found; styled overlays use the default font");
+  }
+  if (!ui_font_semibold_) {
+    ui_font_semibold_ = ui_font_;
+  }
+  REXLOG_INFO("imgui fonts: drawer={} atlas={} count={} ui={} uisb={}", (void*)this,
+              (void*)io.Fonts, io.Fonts->Fonts.Size, (void*)ui_font_, (void*)ui_font_semibold_);
 }
 
 void ImGuiDrawer::SetupFontTexture() {

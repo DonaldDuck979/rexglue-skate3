@@ -34,6 +34,15 @@ class InputDriver {
   virtual X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                                    X_INPUT_CAPABILITIES* out_caps) = 0;
   virtual X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) = 0;
+  // Raw pad state for host UI overlays (settings navigation). Unlike
+  // GetState, this must NOT be gated on is_active() - it is exactly the path
+  // used while guest input is suppressed by an open overlay. Drivers that
+  // self-gate GetState override this; drivers that emulate a pad from
+  // keyboard/mouse override it to report not-connected (the host UI already
+  // receives keyboard/mouse directly).
+  virtual X_RESULT GetStateUi(uint32_t user_index, X_INPUT_STATE* out_state) {
+    return GetState(user_index, out_state);
+  }
   virtual X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) = 0;
   virtual X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;

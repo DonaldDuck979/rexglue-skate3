@@ -10,8 +10,11 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
+#include <string>
+#include <string_view>
 
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -42,11 +45,57 @@ REXCVAR_DEFINE_STRING(input_backend, kDefaultInputBackend, "Input", "Input backe
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+// Back+Start is deliberately not the default: Steam Input uses View+Menu
+// (Back+Start) as its Guide-button chord on pads without a Guide button, so
+// opening our settings would also pop the Steam overlay.
+REXCVAR_DEFINE_STRING(menu_chord, "lb+rb+start", "Input",
+                      "Controller chord that toggles the settings menu. Buttons joined by '+': "
+                      "a, b, x, y, lb, rb, l3, r3, back, start, dpad_up, dpad_down, dpad_left, "
+                      "dpad_right. Empty disables the chord.");
 REXCVAR_DEFINE_BOOL(hid_rumble_enabled, true, "Input", "Enable controller vibration");
 REXCVAR_DEFINE_UINT32(hid_rumble_min_motor_speed, 0x1000, "Input",
                       "Minimum XInput motor speed forwarded to host controllers")
     .range(0, 0xFFFF);
 namespace rex::input {
+namespace {
+
+uint16_t ChordButtonFromToken(std::string_view token) {
+  if (token == "a") return X_INPUT_GAMEPAD_A;
+  if (token == "b") return X_INPUT_GAMEPAD_B;
+  if (token == "x") return X_INPUT_GAMEPAD_X;
+  if (token == "y") return X_INPUT_GAMEPAD_Y;
+  if (token == "lb") return X_INPUT_GAMEPAD_LEFT_SHOULDER;
+  if (token == "rb") return X_INPUT_GAMEPAD_RIGHT_SHOULDER;
+  if (token == "l3") return X_INPUT_GAMEPAD_LEFT_THUMB;
+  if (token == "r3") return X_INPUT_GAMEPAD_RIGHT_THUMB;
+  if (token == "back" || token == "select" || token == "view") return X_INPUT_GAMEPAD_BACK;
+  if (token == "start" || token == "menu") return X_INPUT_GAMEPAD_START;
+  if (token == "dpad_up") return X_INPUT_GAMEPAD_DPAD_UP;
+  if (token == "dpad_down") return X_INPUT_GAMEPAD_DPAD_DOWN;
+  if (token == "dpad_left") return X_INPUT_GAMEPAD_DPAD_LEFT;
+  if (token == "dpad_right") return X_INPUT_GAMEPAD_DPAD_RIGHT;
+  return 0;
+}
+
+// "lb+rb+start" -> button mask; 0 when empty or no token parses (chord off).
+uint16_t ChordMaskFromSpec(std::string_view spec) {
+  uint16_t mask = 0;
+  std::string token;
+  for (size_t i = 0; i <= spec.size(); ++i) {
+    char c = i < spec.size() ? spec[i] : '+';
+    if (c == '+' || c == ',' || c == ' ') {
+      if (!token.empty()) {
+        mask |= ChordButtonFromToken(token);
+        token.clear();
+      }
+      continue;
+    }
+    token.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return mask;
+}
+
+}  // namespace
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
@@ -154,9 +203,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  constexpr uint16_t kMenuChordButtons = X_INPUT_GAMEPAD_BACK | X_INPUT_GAMEPAD_START;
+  const uint16_t menu_chord_buttons = ChordMaskFromSpec(REXCVAR_GET(menu_chord));
   const bool menu_chord_down =
-      (static_cast<uint16_t>(merged.gamepad.buttons) & kMenuChordButtons) == kMenuChordButtons;
+      menu_chord_buttons != 0 &&
+      (static_cast<uint16_t>(merged.gamepad.buttons) & menu_chord_buttons) == menu_chord_buttons;
   if (menu_chord_down && !menu_chord_down_ && menu_chord_callback_) {
     menu_chord_callback_();
   }
@@ -170,6 +220,38 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     *out_state = merged;
   }
   return X_ERROR_SUCCESS;
+}
+
+bool InputSystem::GetUiGamepadState(X_INPUT_GAMEPAD* out_gamepad) {
+  X_INPUT_GAMEPAD merged = {};
+  bool any = false;
+
+  auto merge_axis = [](int16_t a, int16_t b) -> int16_t {
+    return (std::abs(static_cast<int>(a)) >= std::abs(static_cast<int>(b))) ? a : b;
+  };
+
+  for (auto& driver : drivers_) {
+    for (uint32_t user_index = 0; user_index < 4; ++user_index) {
+      X_INPUT_STATE state = {};
+      if (driver->GetStateUi(user_index, &state) != X_ERROR_SUCCESS) {
+        continue;
+      }
+      any = true;
+      merged.buttons = static_cast<uint16_t>(merged.buttons) |
+                       static_cast<uint16_t>(state.gamepad.buttons);
+      merged.left_trigger = std::max(merged.left_trigger, state.gamepad.left_trigger);
+      merged.right_trigger = std::max(merged.right_trigger, state.gamepad.right_trigger);
+      merged.thumb_lx = merge_axis(merged.thumb_lx, state.gamepad.thumb_lx);
+      merged.thumb_ly = merge_axis(merged.thumb_ly, state.gamepad.thumb_ly);
+      merged.thumb_rx = merge_axis(merged.thumb_rx, state.gamepad.thumb_rx);
+      merged.thumb_ry = merge_axis(merged.thumb_ry, state.gamepad.thumb_ry);
+    }
+  }
+
+  if (out_gamepad) {
+    *out_gamepad = merged;
+  }
+  return any;
 }
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {

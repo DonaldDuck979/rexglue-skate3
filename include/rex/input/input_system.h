@@ -41,6 +41,11 @@ class InputSystem : public system::IInputSystem {
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
+  // Merged raw pad state for host UI overlays: all connected pads across all
+  // drivers and user slots, bypassing the is_active suppression and the
+  // menu-chord edge tracking of the guest-facing GetState. Safe to call from
+  // the UI thread. Returns false when no pad is connected.
+  bool GetUiGamepadState(X_INPUT_GAMEPAD* out_gamepad);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 

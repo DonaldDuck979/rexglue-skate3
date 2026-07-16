@@ -5,6 +5,7 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -29,6 +30,15 @@ struct SimpleProfileState {
   int selected_index = 0;
 };
 
+// Raw pad snapshot for overlay navigation (host-side, already merged across
+// pads). Poll callback runs on the UI thread every drawn frame.
+struct SimpleSettingsGamepad {
+  bool connected = false;
+  uint16_t buttons = 0;  // X_INPUT_GAMEPAD_* bits
+  int16_t thumb_lx = 0;
+  int16_t thumb_ly = 0;
+};
+
 class SimpleSettingsDialog final : public ImGuiDialog {
  public:
   using LoadProfilesCallback = std::function<SimpleProfileState()>;
@@ -37,27 +47,42 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   using CloseSettingsCallback = std::function<void()>;
   using CloseGameCallback = std::function<void()>;
   using RestartGameCallback = std::function<void()>;
+  using PollGamepadCallback = std::function<SimpleSettingsGamepad()>;
 
   SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem::path config_path,
                        LoadProfilesCallback load_profiles, SaveProfileCallback save_profile,
                        CloseSettingsCallback close_settings, CloseGameCallback close_game,
-                       RestartGameCallback restart_game);
+                       RestartGameCallback restart_game,
+                       PollGamepadCallback poll_gamepad = nullptr);
   ~SimpleSettingsDialog();
 
   void Show();
   void Toggle();
   void Hide();
+  // One "back" step (Escape / pad B): text edit -> row focus -> category rail
+  // -> closed. The Escape keybind routes here so Escape backs out level by
+  // level instead of instantly closing.
+  void NavigateBack();
   bool visible() const { return visible_; }
 
  protected:
   void OnDraw(ImGuiIO& io) override;
 
  private:
+  enum class FocusZone { kRail, kContent };
+
+  struct RowSpec;
+  struct NavIntents;
+
   void LoadSettingsFromCvars();
   bool HasSettingsChanges() const;
   void ReloadProfiles();
   void SaveVideo();
   void SaveProfile();
+  void ApplyAndRestart();
+
+  void BuildRows(std::vector<RowSpec>& rows, int category);
+  NavIntents GatherInput(ImGuiIO& io);
 
   std::filesystem::path config_path_;
   LoadProfilesCallback load_profiles_;
@@ -65,8 +90,11 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   CloseSettingsCallback close_settings_;
   CloseGameCallback close_game_;
   RestartGameCallback restart_game_;
+  PollGamepadCallback poll_gamepad_;
   SimpleProfileState profiles_;
   bool visible_ = false;
+
+  // Staged setting values (committed by SaveVideo / SaveProfile).
   GraphicsDeviceList device_list_;
   int device_index_ = 0;
   int resolution_scale_index_ = 0;
@@ -78,9 +106,27 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool tearing_ = true;
   bool mnk_mode_ = false;
   bool mnk_capture_mouse_ = false;
-  int selected_tab_ = 0;
   bool profile_signed_in_ = true;
   char gamertag_buf_[32] = {};
+
+  // Navigation state.
+  FocusZone zone_ = FocusZone::kRail;
+  int category_ = 0;
+  int rail_sel_ = 0;  // 0..category count-1 = categories; count = the Close Game item
+  int row_index_ = 0;
+  bool editing_text_ = false;
+  bool text_edit_focus_pending_ = false;
+  bool pad_active_ = false;      // last nav input came from a pad -> pad legend
+  uint16_t prev_pad_buttons_ = 0;
+  int held_dir_x_ = 0;           // current held direction (-1/0/1), for repeat
+  int held_dir_y_ = 0;
+  float repeat_timer_x_ = 0.0f;
+  float repeat_timer_y_ = 0.0f;
+  float highlight_anim_y_ = -1.0f;  // smoothed selection highlight position
+  float rail_anim_y_ = -1.0f;
+  float content_scroll_ = 0.0f;
+  float mouse_x_ = -1.0f;        // last mouse position, to detect real motion
+  float mouse_y_ = -1.0f;
 };
 
 }  // namespace rex::ui

@@ -2,6 +2,7 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    fonts_inter.cpp
     graphics_device_list.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
