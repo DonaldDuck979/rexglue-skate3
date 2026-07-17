@@ -100,6 +100,11 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   int resolution_scale_index_ = 0;
   int frame_cap_index_ = 0;
   int aspect_ratio_index_ = 0;
+  int msaa_index_ = 2;
+  int shadow_quality_index_ = 2;
+  int monitor_index_ = 0;
+  int audio_buffer_index_ = 0;
+  int language_index_ = 0;
   float field_of_view_ = 60.0f;
   bool fullscreen_ = true;
   bool vsync_ = false;
@@ -108,6 +113,15 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool mnk_capture_mouse_ = false;
   bool profile_signed_in_ = true;
   char gamertag_buf_[32] = {};
+  // Live setting values (hot cvars, applied and saved on change).
+  bool renderer_native_ = true;
+  bool mode_indicator_ = true;
+  bool fps_counter_ = false;
+  bool audio_mute_ = false;
+  bool rumble_ = true;
+  float mnk_sensitivity_ = 1.0f;
+  int chord_index_ = 0;
+  std::string chord_custom_;
 
   // Navigation state.
   FocusZone zone_ = FocusZone::kRail;
@@ -124,7 +138,9 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   float repeat_timer_y_ = 0.0f;
   float highlight_anim_y_ = -1.0f;  // smoothed selection highlight position
   float rail_anim_y_ = -1.0f;
-  float content_scroll_ = 0.0f;
+  float content_scroll_ = 0.0f;       // scroll TARGET, locked to row boundaries
+  float content_scroll_anim_ = -1.0f;  // drawn scroll, chases the target
+  float wheel_accum_ = 0.0f;           // fractional wheel deltas -> whole notches
   // Swallow the first frame's cursor delta after Show: the pre-open cursor
   // position (or a cursor-mode warp) otherwise reads as mouse motion and
   // steals focus from the rail to whatever row it lands on.

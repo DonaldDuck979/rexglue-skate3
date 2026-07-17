@@ -48,6 +48,54 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
     "vsync",
     "mnk_mode",
     "mnk_capture_mouse"};
+// Optional cvars persisted when the host defines them (HasCvar-gated: app
+// cvars like the native-renderer knobs don't exist in every embedder, and
+// backend/platform cvars don't exist in every build).
+constexpr std::array<std::string_view, 13> kOptionalSimpleSettingsCvars = {
+    "skate3_native_render_scene",
+    "skate3_native_render_scene_msaa",
+    "skate3_native_render_scene_shadows",
+    "skate3_native_render_scene_shadow_tile",
+    "skate3_native_render_mode_indicator",
+    "show_fps_counter",
+    "monitor",
+    "mnk_sensitivity",
+    "hid_rumble_enabled",
+    "menu_chord",
+    "audio_mute",
+    "audio_device_sample_frames",
+    "user_language"};
+
+// MSAA sample counts for the native scene renderer.
+constexpr std::array<const char*, 4> kMsaaLabels = {"Off", "2x", "4x", "8x"};
+constexpr std::array<int32_t, 4> kMsaaSamples = {1, 2, 4, 8};
+
+// Shadow quality: dynamic-shadow toggle + cascade tile resolution. The
+// game's own atlas is three 512 tiles ("Console").
+constexpr std::array<const char*, 4> kShadowQualityLabels = {"Off", "Console (512)",
+                                                             "High (1024)", "Ultra (2048)"};
+constexpr std::array<int32_t, 4> kShadowQualityTiles = {512, 512, 1024, 2048};
+
+// Audio device buffer sizes in sample frames (0 = backend default).
+constexpr std::array<const char*, 4> kAudioBufferLabels = {
+    "Auto", "512 (low latency)", "1024", "2048 (most stable)"};
+constexpr std::array<int32_t, 4> kAudioBufferFrames = {0, 512, 1024, 2048};
+
+// Xbox 360 XLanguage ids 1..12 (user_language cvar).
+constexpr std::array<const char*, 12> kLanguageLabels = {
+    "English",    "Japanese",           "German",     "French",
+    "Spanish",    "Italian",            "Korean",     "Traditional Chinese",
+    "Portuguese", "Simplified Chinese", "Polish",     "Russian"};
+
+// Settings-menu controller chord presets (menu_chord cvar spec strings).
+// First entry matches the cvar default (the chord reset target).
+constexpr std::array<const char*, 4> kMenuChordSpecs = {"rb+start", "lb+rb+start", "back+start",
+                                                        "l3+r3"};
+constexpr std::array<const char*, 4> kMenuChordLabels = {"RB + Start", "LB + RB + Start",
+                                                         "Back + Start", "L3 + R3"};
+
+constexpr std::array<const char*, 5> kMonitorLabels = {"Auto", "Monitor 1", "Monitor 2",
+                                                       "Monitor 3", "Monitor 4"};
 
 // X_INPUT_GAMEPAD_* button bits, mirrored locally to keep the UI overlay
 // decoupled from the kernel input headers.
@@ -67,11 +115,12 @@ struct CategoryInfo {
   const char* name;
   const char* desc;
 };
-constexpr std::array<CategoryInfo, 4> kCategories = {{
-    {"Video", "Display, resolution and framerate settings."},
-    {"Controls", "Mouse and keyboard input settings."},
+constexpr std::array<CategoryInfo, 5> kCategories = {{
+    {"Video", "Display, resolution, framerate and renderer quality settings."},
+    {"Controls", "Controller, mouse and keyboard input settings."},
+    {"Audio", "Sound output settings."},
     {"Profile", "Local player profile and sign-in."},
-    {"System", "Apply or revert pending changes and close the settings."},
+    {"System", "Game language, pending changes and closing the settings."},
 }};
 
 // Navigation repeat pacing (seconds).
@@ -121,8 +170,13 @@ bool HasCvar(std::string_view name) {
 
 std::vector<std::string_view> GetSimpleSettingsCvars() {
   std::vector<std::string_view> cvars;
-  cvars.reserve(15);
+  cvars.reserve(32);
   cvars.insert(cvars.end(), kCoreSimpleSettingsCvars.begin(), kCoreSimpleSettingsCvars.end());
+  for (std::string_view name : kOptionalSimpleSettingsCvars) {
+    if (HasCvar(name)) {
+      cvars.push_back(name);
+    }
+  }
   // Literal names rather than the registry's string to keep the string_views
   // pointing at static storage.
   const std::string device_cvar = GetGraphicsDeviceList().cvar_name;
@@ -245,6 +299,107 @@ float FieldOfViewFromCvar() {
     return 60.0f;
   }
   return float(std::clamp(rex::cvar::Query<double>("skate3_field_of_view"), 40.0, 120.0));
+}
+
+bool HasMsaaCvar() { return HasCvar("skate3_native_render_scene_msaa"); }
+
+int MsaaIndexFromSamples(int32_t samples) {
+  int best = 0;
+  for (int i = 0; i < static_cast<int>(kMsaaSamples.size()); ++i) {
+    if (samples >= kMsaaSamples[i]) {
+      best = i;
+    }
+  }
+  return best;
+}
+
+int MsaaIndexFromCvar() {
+  if (!HasMsaaCvar()) {
+    return 2;
+  }
+  return MsaaIndexFromSamples(rex::cvar::Query<int32_t>("skate3_native_render_scene_msaa"));
+}
+
+bool HasShadowQualityCvars() {
+  return HasCvar("skate3_native_render_scene_shadows") &&
+         HasCvar("skate3_native_render_scene_shadow_tile");
+}
+
+int ShadowQualityIndexFrom(bool enabled, int32_t tile) {
+  if (!enabled) {
+    return 0;
+  }
+  if (tile <= 512) {
+    return 1;
+  }
+  return tile <= 1024 ? 2 : 3;
+}
+
+int ShadowQualityIndexFromCvar() {
+  if (!HasShadowQualityCvars()) {
+    return 2;
+  }
+  return ShadowQualityIndexFrom(
+      rex::cvar::Query<bool>("skate3_native_render_scene_shadows"),
+      rex::cvar::Query<int32_t>("skate3_native_render_scene_shadow_tile"));
+}
+
+// The native/emulated renderer choice only means anything while the native
+// hook layer (skate3_native_render, restart-scoped) is active.
+bool HasRendererChoice() {
+  return HasCvar("skate3_native_render_scene") && HasCvar("skate3_native_render") &&
+         rex::cvar::Query<bool>("skate3_native_render");
+}
+
+int MonitorIndexFromCvar() {
+  if (!HasCvar("monitor")) {
+    return 0;
+  }
+  return std::clamp(rex::cvar::Query<int32_t>("monitor"), 0,
+                    static_cast<int>(kMonitorLabels.size()) - 1);
+}
+
+int AudioBufferIndexFromFrames(int32_t frames) {
+  if (frames <= 0) {
+    return 0;
+  }
+  if (frames <= 512) {
+    return 1;
+  }
+  return frames <= 1024 ? 2 : 3;
+}
+
+int AudioBufferIndexFromCvar() {
+  if (!HasCvar("audio_device_sample_frames")) {
+    return 0;
+  }
+  return AudioBufferIndexFromFrames(rex::cvar::Query<int32_t>("audio_device_sample_frames"));
+}
+
+int LanguageIndexFromCvar() {
+  if (!HasCvar("user_language")) {
+    return 0;
+  }
+  // XLanguage ids are 1-based (1 = English .. 12 = Russian).
+  return std::clamp(static_cast<int>(rex::cvar::Query<uint32_t>("user_language")), 1,
+                    static_cast<int>(kLanguageLabels.size())) -
+         1;
+}
+
+// Preset index for the current menu_chord spec; kMenuChordSpecs.size() means
+// "custom" (a hand-edited spec the presets don't cover - kept as an extra
+// option so opening the menu never silently rewrites it).
+int MenuChordIndexFromCvar(std::string* custom_spec) {
+  std::string current = rex::cvar::Query<std::string>("menu_chord");
+  for (int i = 0; i < static_cast<int>(kMenuChordSpecs.size()); ++i) {
+    if (current == kMenuChordSpecs[i]) {
+      return i;
+    }
+  }
+  if (custom_spec) {
+    *custom_spec = std::move(current);
+  }
+  return static_cast<int>(kMenuChordSpecs.size());
 }
 
 // ---- CVar default parsing (Y / R "reset to default") ----------------------
@@ -604,6 +759,7 @@ void SimpleSettingsDialog::Show() {
   rail_sel_ = category_;
   row_index_ = 0;
   content_scroll_ = 0.0f;
+  content_scroll_anim_ = 0.0f;
   editing_text_ = false;
   highlight_anim_y_ = -1.0f;
   rail_anim_y_ = -1.0f;
@@ -618,12 +774,29 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   frame_cap_index_ = FrameCapIndexFromCvar();
   aspect_ratio_index_ =
       HasCvar("skate3_ultrawide") && rex::cvar::Query<bool>("skate3_ultrawide") ? 1 : 0;
+  msaa_index_ = MsaaIndexFromCvar();
+  shadow_quality_index_ = ShadowQualityIndexFromCvar();
+  monitor_index_ = MonitorIndexFromCvar();
+  audio_buffer_index_ = AudioBufferIndexFromCvar();
+  language_index_ = LanguageIndexFromCvar();
   field_of_view_ = FieldOfViewFromCvar();
   fullscreen_ = rex::cvar::Query<bool>("fullscreen");
   vsync_ = rex::cvar::Query<bool>("vsync");
   tearing_ = TearingFromCvar();
   mnk_mode_ = rex::cvar::Query<bool>("mnk_mode");
   mnk_capture_mouse_ = rex::cvar::Query<bool>("mnk_capture_mouse");
+  renderer_native_ =
+      HasCvar("skate3_native_render_scene") && rex::cvar::Query<bool>("skate3_native_render_scene");
+  mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
+                    rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
+  fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
+  audio_mute_ = HasCvar("audio_mute") && rex::cvar::Query<bool>("audio_mute");
+  rumble_ = HasCvar("hid_rumble_enabled") && rex::cvar::Query<bool>("hid_rumble_enabled");
+  mnk_sensitivity_ = HasCvar("mnk_sensitivity")
+                         ? float(std::clamp(rex::cvar::Query<double>("mnk_sensitivity"), 0.1, 5.0))
+                         : 1.0f;
+  chord_custom_.clear();
+  chord_index_ = HasCvar("menu_chord") ? MenuChordIndexFromCvar(&chord_custom_) : 0;
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
@@ -632,6 +805,12 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
          frame_cap_index_ != FrameCapIndexFromCvar() ||
          (HasCvar("skate3_ultrawide") &&
           (aspect_ratio_index_ != 0) != rex::cvar::Query<bool>("skate3_ultrawide")) ||
+         (HasMsaaCvar() && msaa_index_ != MsaaIndexFromCvar()) ||
+         (HasShadowQualityCvars() && shadow_quality_index_ != ShadowQualityIndexFromCvar()) ||
+         (HasCvar("monitor") && monitor_index_ != MonitorIndexFromCvar()) ||
+         (HasCvar("audio_device_sample_frames") &&
+          audio_buffer_index_ != AudioBufferIndexFromCvar()) ||
+         (HasCvar("user_language") && language_index_ != LanguageIndexFromCvar()) ||
          fullscreen_ != rex::cvar::Query<bool>("fullscreen") ||
          vsync_ != rex::cvar::Query<bool>("vsync") ||
          tearing_ != TearingFromCvar() ||
@@ -727,6 +906,35 @@ void SimpleSettingsDialog::SaveVideo() {
   }
   if (HasFieldOfViewCvar()) {
     rex::cvar::SetFlagByName("skate3_field_of_view", std::to_string(field_of_view_));
+  }
+  if (HasMsaaCvar()) {
+    msaa_index_ = std::clamp(msaa_index_, 0, static_cast<int>(kMsaaSamples.size()) - 1);
+    rex::cvar::SetFlagByName("skate3_native_render_scene_msaa",
+                             std::to_string(kMsaaSamples[msaa_index_]));
+  }
+  if (HasShadowQualityCvars()) {
+    shadow_quality_index_ =
+        std::clamp(shadow_quality_index_, 0, static_cast<int>(kShadowQualityTiles.size()) - 1);
+    SetBoolCvar("skate3_native_render_scene_shadows", shadow_quality_index_ != 0);
+    if (shadow_quality_index_ != 0) {
+      rex::cvar::SetFlagByName("skate3_native_render_scene_shadow_tile",
+                               std::to_string(kShadowQualityTiles[shadow_quality_index_]));
+    }
+  }
+  if (HasCvar("monitor")) {
+    monitor_index_ = std::clamp(monitor_index_, 0, static_cast<int>(kMonitorLabels.size()) - 1);
+    rex::cvar::SetFlagByName("monitor", std::to_string(monitor_index_));
+  }
+  if (HasCvar("audio_device_sample_frames")) {
+    audio_buffer_index_ =
+        std::clamp(audio_buffer_index_, 0, static_cast<int>(kAudioBufferFrames.size()) - 1);
+    rex::cvar::SetFlagByName("audio_device_sample_frames",
+                             std::to_string(kAudioBufferFrames[audio_buffer_index_]));
+  }
+  if (HasCvar("user_language")) {
+    language_index_ =
+        std::clamp(language_index_, 0, static_cast<int>(kLanguageLabels.size()) - 1);
+    rex::cvar::SetFlagByName("user_language", std::to_string(language_index_ + 1));
   }
   SetBoolCvar("vsync", vsync_);
   SetTearingCvars(tearing_);
@@ -852,6 +1060,20 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] { fullscreen_ = CvarDefaultBool("fullscreen", true); };
         rows.push_back(std::move(row));
       }
+      if (HasCvar("monitor")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Monitor";
+        row.desc = "Which display the game window opens on. Auto uses the primary display.";
+        for (const char* label : kMonitorLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &monitor_index_;
+        row.reset = [this] {
+          monitor_index_ = int(CvarDefaultDouble("monitor", 0.0));
+        };
+        rows.push_back(std::move(row));
+      }
       {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -877,6 +1099,64 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] { tearing_ = TearingDefault(); };
         rows.push_back(std::move(row));
       }
+      if (HasRendererChoice() || HasMsaaCvar() || HasShadowQualityCvars()) {
+        header("Quality");
+      }
+      if (HasRendererChoice()) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Renderer";
+        row.desc =
+            "Native renders the game directly on your GPU (much faster); Emulated "
+            "replays the console GPU exactly. Switches live, no restart needed.";
+        row.options = {"Emulated", "Native"};
+        row.flag = &renderer_native_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("skate3_native_render_scene", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          renderer_native_ = CvarDefaultBool("skate3_native_render_scene", false);
+          SetBoolCvar("skate3_native_render_scene", renderer_native_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasMsaaCvar()) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Anti-Aliasing (MSAA)";
+        row.desc =
+            "Multisampling for the native renderer. Smooths distant thin geometry "
+            "(railings, wires) that shimmers otherwise.";
+        for (const char* label : kMsaaLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &msaa_index_;
+        row.reset = [this] {
+          msaa_index_ =
+              MsaaIndexFromSamples(int32_t(CvarDefaultDouble("skate3_native_render_scene_msaa", 4.0)));
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasShadowQualityCvars()) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Shadow Quality";
+        row.desc =
+            "Dynamic character/prop shadow resolution in the native renderer. "
+            "Console matches the original game's shadow maps.";
+        for (const char* label : kShadowQualityLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &shadow_quality_index_;
+        row.reset = [this] {
+          shadow_quality_index_ = ShadowQualityIndexFrom(
+              CvarDefaultBool("skate3_native_render_scene_shadows", true),
+              int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 1024.0)));
+        };
+        rows.push_back(std::move(row));
+      }
       if (HasFieldOfViewCvar()) {
         header("Gameplay");
         RowSpec row;
@@ -895,6 +1175,47 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] {
           field_of_view_ = float(CvarDefaultDouble("skate3_field_of_view", 60.0));
           rex::cvar::SetFlagByName("skate3_field_of_view", std::to_string(field_of_view_));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("show_fps_counter") || HasCvar("skate3_native_render_mode_indicator")) {
+        header("Interface");
+      }
+      if (HasCvar("show_fps_counter")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "FPS Counter";
+        row.desc = "Show the framerate overlay in the corner. Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &fps_counter_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("show_fps_counter", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          fps_counter_ = CvarDefaultBool("show_fps_counter", false);
+          SetBoolCvar("show_fps_counter", fps_counter_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_native_render_mode_indicator")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Renderer Indicator";
+        row.desc =
+            "Small corner readout of which renderer produced the last frame "
+            "(NATIVE or EMULATED). Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &mode_indicator_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("skate3_native_render_mode_indicator", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          mode_indicator_ = CvarDefaultBool("skate3_native_render_mode_indicator", true);
+          SetBoolCvar("skate3_native_render_mode_indicator", mode_indicator_);
           SaveSimpleSettingsConfig(config_path_);
         };
         rows.push_back(std::move(row));
@@ -927,9 +1248,121 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
+      if (HasCvar("mnk_sensitivity")) {
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = "Mouse Sensitivity";
+        row.desc =
+            "Mouse-look speed while Mouse & Keyboard Mode is active. Applies "
+            "immediately.";
+        row.value = &mnk_sensitivity_;
+        row.min = 0.1f;
+        row.max = 5.0f;
+        row.step = 0.1f;
+        row.fmt = "%.1f";
+        row.on_value_change = [this] {
+          mnk_sensitivity_ = std::clamp(mnk_sensitivity_, 0.1f, 5.0f);
+          rex::cvar::SetFlagByName("mnk_sensitivity", std::to_string(mnk_sensitivity_));
+        };
+        row.reset = [this] {
+          mnk_sensitivity_ = float(CvarDefaultDouble("mnk_sensitivity", 1.0));
+          rex::cvar::SetFlagByName("mnk_sensitivity", std::to_string(mnk_sensitivity_));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("hid_rumble_enabled") || HasCvar("menu_chord")) {
+        header("Controller");
+      }
+      if (HasCvar("hid_rumble_enabled")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Vibration";
+        row.desc = "Controller rumble. Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &rumble_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("hid_rumble_enabled", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          rumble_ = CvarDefaultBool("hid_rumble_enabled", true);
+          SetBoolCvar("hid_rumble_enabled", rumble_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("menu_chord")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Settings Menu Shortcut";
+        row.desc =
+            "Controller button chord that opens this settings menu. Applies "
+            "immediately.";
+        for (const char* label : kMenuChordLabels) {
+          row.options.push_back(label);
+        }
+        if (!chord_custom_.empty()) {
+          row.options.push_back("Custom: " + chord_custom_);
+        }
+        row.index = &chord_index_;
+        row.on_enum_change = [this](int value) {
+          if (value < static_cast<int>(kMenuChordSpecs.size())) {
+            rex::cvar::SetFlagByName("menu_chord", kMenuChordSpecs[value]);
+          } else if (!chord_custom_.empty()) {
+            rex::cvar::SetFlagByName("menu_chord", chord_custom_);
+          }
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          chord_index_ = 0;
+          rex::cvar::SetFlagByName("menu_chord", kMenuChordSpecs[0]);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
       break;
     }
-    case 2: {  // Profile
+    case 2: {  // Audio
+      header("Output");
+      if (HasCvar("audio_mute")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Mute";
+        row.desc = "Silence all game audio. Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &audio_mute_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("audio_mute", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          audio_mute_ = CvarDefaultBool("audio_mute", false);
+          SetBoolCvar("audio_mute", audio_mute_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("audio_device_sample_frames")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Audio Buffer Size";
+        row.desc =
+            "Audio device buffer length. Larger buffers add a little latency but "
+            "fix crackling on machines with scheduling hiccups.";
+        for (const char* label : kAudioBufferLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &audio_buffer_index_;
+        row.reset = [this] {
+          audio_buffer_index_ = AudioBufferIndexFromFrames(
+              int32_t(CvarDefaultDouble("audio_device_sample_frames", 0.0)));
+        };
+        rows.push_back(std::move(row));
+      }
+      break;
+    }
+    case 3: {  // Profile
       header("Local Profile");
       {
         RowSpec row;
@@ -976,7 +1409,26 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       break;
     }
-    case 3: {  // System
+    case 4: {  // System
+      if (HasCvar("user_language")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Game Language";
+        row.desc =
+            "Language the game boots in. Skate 3 reads this once at startup, so "
+            "changing it needs Apply & Restart.";
+        for (const char* label : kLanguageLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &language_index_;
+        row.reset = [this] {
+          language_index_ =
+              std::clamp(int(CvarDefaultDouble("user_language", 1.0)), 1,
+                         static_cast<int>(kLanguageLabels.size())) -
+              1;
+        };
+        rows.push_back(std::move(row));
+      }
       header("Session");
       {
         RowSpec row;
@@ -1204,6 +1656,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     rail_sel_ = category_;
     row_index_ = 0;
     content_scroll_ = 0.0f;
+    content_scroll_anim_ = 0.0f;
     highlight_anim_y_ = -1.0f;
   }
   if (zone_ == FocusZone::kRail && in.move_y != 0) {
@@ -1212,6 +1665,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       category_ = rail_sel_;
       row_index_ = 0;
       content_scroll_ = 0.0f;
+      content_scroll_anim_ = 0.0f;
       highlight_anim_y_ = -1.0f;
     }
   }
@@ -1400,6 +1854,16 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // Description panel height - also anchors Close Game's bottom edge.
   const float desc_panel_h =
       Snap(std::min(content_bottom - columns_y, 320.0f * s));
+  // The content view holds an exact whole number of row slots: the
+  // bottom edge pulls UP to the last full slot, and the scroll target locks
+  // to the same pitch, so a resting list always shows complete rows evenly.
+  // One slot fewer than fits: playtest verdict - the list otherwise runs too
+  // close to the footer.
+  const float row_pitch = row_h + row_gap;
+  const int view_rows = std::max(
+      1, static_cast<int>((content_bottom - columns_y + row_gap) / row_pitch) - 1);
+  const float content_view_h = view_rows * row_pitch - row_gap;
+  const float content_view_bottom = columns_y + content_view_h;
 
   const ImVec2 mouse = io.MousePos;
   const bool mouse_moved =
@@ -1462,6 +1926,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       zone_ = FocusZone::kRail;
       row_index_ = 0;
       content_scroll_ = 0.0f;
+      content_scroll_anim_ = 0.0f;
       is_current = true;
     }
     if (is_current && zone_ == FocusZone::kRail && rail_sel_ == i) {
@@ -1507,8 +1972,12 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   // Close Game entry: below the categories, set apart by an extra gap.
   {
-    // Bottom edge aligned with the description panel's bottom.
-    float y0 = Snap(columns_y + desc_panel_h - rail_item_h);
+    // Bottom edge aligned with the description panel's bottom, but
+    // never closer to the last category than the 45*s gap the 4-category
+    // layout had - with more categories the rail wins and pushes it down.
+    const float rail_bottom = columns_y + category_count * (rail_item_h + row_gap) - row_gap;
+    float y0 = Snap(std::max(columns_y + desc_panel_h - rail_item_h,
+                             rail_bottom + 45.0f * s));
     float y1 = y0 + rail_item_h;
     bool focused = zone_ == FocusZone::kRail && rail_sel_ == quit_rail_index;
     bool hovered = mouse_in(rail_x, y0, rail_x + rail_w, y1);
@@ -1536,14 +2005,23 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       y += row_hgt[i] + row_gap;
     }
   }
-  const float content_view_h = content_bottom - columns_y;
   const float rows_total_h = rows.empty() ? 0.0f : row_y.back() + row_hgt.back();
   const float max_scroll = std::max(0.0f, rows_total_h - content_view_h);
 
-  // Wheel scroll while over the content column.
-  if (io.MouseWheel != 0.0f &&
-      mouse_in(content_x, columns_y, content_x + content_w, content_bottom)) {
-    content_scroll_ -= io.MouseWheel * 60.0f * s;
+  // Wheel scroll steps whole rows while over the content column. High-
+  // resolution wheels and touchpads report fractional deltas per event, so
+  // accumulate them into whole notches first - scaling each tiny delta by
+  // the row pitch and then locking to row boundaries would round every one
+  // of them straight back to the current position.
+  if (mouse_in(content_x, columns_y, content_x + content_w, content_view_bottom)) {
+    wheel_accum_ += io.MouseWheel;
+    const int notches = static_cast<int>(std::trunc(wheel_accum_));
+    if (notches != 0) {
+      content_scroll_ -= notches * row_pitch;
+      wheel_accum_ -= static_cast<float>(notches);
+    }
+  } else {
+    wheel_accum_ = 0.0f;
   }
   // Keep the focused row in view when navigating.
   if (zone_ == FocusZone::kContent && row_index_ >= 0 && (in.move_y != 0 || in.select)) {
@@ -1555,14 +2033,29 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       content_scroll_ = y1 - content_view_h;
     }
   }
+  // Lock the resting position onto whole-row boundaries (rows and the view
+  // share the same pitch, so max_scroll is itself a pitch multiple).
   content_scroll_ = std::clamp(content_scroll_, 0.0f, max_scroll);
-  const float scroll = Snap(content_scroll_);
+  content_scroll_ =
+      std::clamp(std::round(content_scroll_ / row_pitch) * row_pitch, 0.0f, max_scroll);
+  // The drawn offset chases the locked target so scrolling slides smoothly
+  // instead of rows popping between aligned positions.
+  if (content_scroll_anim_ < 0.0f) {
+    content_scroll_anim_ = content_scroll_;
+  }
+  content_scroll_anim_ +=
+      (content_scroll_ - content_scroll_anim_) * std::min(1.0f, io.DeltaTime * 16.0f);
+  if (std::abs(content_scroll_anim_ - content_scroll_) < 0.5f) {
+    content_scroll_anim_ = content_scroll_;  // settle exactly on the boundary
+  }
+  const float scroll = Snap(content_scroll_anim_);
 
   // Clip window padded by the focus-ring extent (6*s) so the ring can sit
   // fully OUTSIDE the focused row without being cut off at the edges.
   const float ring_pad = 6.0f * s;
   dl->PushClipRect(ImVec2(content_x - ring_pad, columns_y - ring_pad),
-                   ImVec2(content_x + content_w + ring_pad + 1.0f, content_bottom + ring_pad),
+                   ImVec2(content_x + content_w + ring_pad + 1.0f,
+                          content_view_bottom + ring_pad),
                    true);
 
   // Sliding selection highlight (white fill under the focused row).
@@ -1580,6 +2073,13 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   const float value_w = std::min(330.0f * s, content_w * 0.46f);
   const float chevron_r = 13.0f * s;
 
+  // Rows draw whenever they touch the view: at rest the pitch-locked scroll
+  // means nothing is ever cut, and mid-animation the edge rows slide in and
+  // out under the clip rect instead of popping.
+  auto row_in_view = [&](float y0, float y1) {
+    return y1 >= columns_y && y0 <= content_view_bottom;
+  };
+
   // Backgrounds first, then per-row content in TWO phases around the sliding
   // highlight: non-focused content below it, the focused row's content above
   // it - the ring overlaps neighbours (gap is 1 design px tighter than the
@@ -1591,7 +2091,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     }
     float y0 = columns_y + Snap(row_y[i]) - scroll;
     float y1 = y0 + row_hgt[i];
-    if (y1 < columns_y || y0 > content_bottom) {
+    if (!row_in_view(y0, y1)) {
       continue;
     }
     bool hovered = mouse_in(content_x, y0, content_x + content_w, y1);
@@ -1614,7 +2114,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     RowSpec& row = rows[i];
     float y0 = columns_y + Snap(row_y[i]) - scroll;
     float y1 = y0 + row_hgt[i];
-    if (y1 < columns_y || y0 > content_bottom) {
+    if (!row_in_view(y0, y1)) {
       return;
     }
     float cy = (y0 + y1) * 0.5f;
@@ -1808,7 +2308,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     float bar_x = content_x + content_w + 4.0f * s;
     float track_h = content_view_h;
     float bar_h = std::max(24.0f * s, track_h * (content_view_h / rows_total_h));
-    float bar_y = columns_y + (track_h - bar_h) * (content_scroll_ / max_scroll);
+    float bar_y = columns_y + (track_h - bar_h) * (content_scroll_anim_ / max_scroll);
     dl->AddRectFilled(ImVec2(bar_x, columns_y), ImVec2(bar_x + 3.0f * s, columns_y + track_h),
                       IM_COL32(255, 255, 255, 18), 0.0f);
     dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + 3.0f * s, bar_y + bar_h),

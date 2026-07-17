@@ -48,7 +48,7 @@ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-thro
 // Back+Start is deliberately not the default: Steam Input uses View+Menu
 // (Back+Start) as its Guide-button chord on pads without a Guide button, so
 // opening our settings would also pop the Steam overlay.
-REXCVAR_DEFINE_STRING(menu_chord, "lb+rb+start", "Input",
+REXCVAR_DEFINE_STRING(menu_chord, "rb+start", "Input",
                       "Controller chord that toggles the settings menu. Buttons joined by '+': "
                       "a, b, x, y, lb, rb, l3, r3, back, start, dpad_up, dpad_down, dpad_left, "
                       "dpad_right. Empty disables the chord.");
