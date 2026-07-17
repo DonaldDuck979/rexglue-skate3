@@ -97,9 +97,13 @@ void ApplySyntheticInput(X_INPUT_STATE* input_state) {
   }
 
   const auto& step = g_synthetic_input_steps[g_synthetic_input_step_index];
-  if (step.buttons != 0) {
+  if (step.buttons != 0 || step.left_trigger != 0 || step.right_trigger != 0) {
     input_state->gamepad.buttons =
         static_cast<uint16_t>(static_cast<uint16_t>(input_state->gamepad.buttons) | step.buttons);
+    input_state->gamepad.left_trigger =
+        std::max(input_state->gamepad.left_trigger, step.left_trigger);
+    input_state->gamepad.right_trigger =
+        std::max(input_state->gamepad.right_trigger, step.right_trigger);
     input_state->packet_number =
         static_cast<uint32_t>(static_cast<uint32_t>(input_state->packet_number) + 1);
   }
@@ -128,6 +132,12 @@ bool PopSyntheticKeystroke(X_INPUT_KEYSTROKE* out_keystroke) {
 
 void QueueSyntheticInput(uint16_t buttons, uint32_t poll_count) {
   SyntheticInputStep step{buttons, poll_count};
+  QueueSyntheticInputSequence(&step, 1);
+}
+
+void QueueSyntheticInput(uint16_t buttons, uint8_t left_trigger, uint8_t right_trigger,
+                         uint32_t poll_count) {
+  SyntheticInputStep step{buttons, poll_count, left_trigger, right_trigger};
   QueueSyntheticInputSequence(&step, 1);
 }
 
