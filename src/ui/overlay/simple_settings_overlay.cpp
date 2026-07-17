@@ -1918,9 +1918,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // ---- Layout ----
   // Positional metrics are snapped to whole pixels (see Snap).
   const float margin_x = Snap(std::max(56.0f * s, frame_size.x * 0.05f));
-  const float title_y = Snap(frame_pos.y + frame_size.y * 0.13f);
   const float title_size = font_px(42.0f * s);
-  const float columns_y = Snap(title_y + 74.0f * s);
   // Rail and description columns are equal-width.
   const float rail_w = Snap(300.0f * s);
   const float desc_w = Snap(300.0f * s);
@@ -1947,19 +1945,29 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   const float label_size = font_px(22.0f * s);
   const float value_size = font_px(22.0f * s);
   const float desc_size = font_px(20.0f * s);
-  // Description panel height - also anchors Close Game's bottom edge.
-  const float desc_panel_h =
-      Snap(std::min(content_bottom - columns_y, 320.0f * s));
   // The content view holds an exact whole number of row slots: the
   // bottom edge pulls UP to the last full slot, and the scroll target locks
   // to the same pitch, so a resting list always shows complete rows evenly.
   // One slot fewer than fits: playtest verdict - the list otherwise runs too
-  // close to the footer.
+  // close to the footer. Capacity is measured from the classic flow anchor
+  // (title at 13% of the frame) so the slot count keeps its tuned value...
   const float row_pitch = row_h + row_gap;
+  const float columns_y_flow = Snap(Snap(frame_pos.y + frame_size.y * 0.13f) + 74.0f * s);
   const int view_rows = std::max(
-      1, static_cast<int>((content_bottom - columns_y + row_gap) / row_pitch) - 1);
+      1, static_cast<int>((content_bottom - columns_y_flow + row_gap) / row_pitch) - 1);
   const float content_view_h = view_rows * row_pitch - row_gap;
+  // ...but the block itself is re-anchored so those slots sit vertically
+  // CENTERED in the frame (the flow layout read visibly low). The title rides
+  // 74*s above the block, the footer stays put; clamps keep the title
+  // on-screen and the block clear of the footer.
+  const float columns_y = Snap(std::clamp(
+      frame_pos.y + (frame_size.y - content_view_h) * 0.5f,
+      std::min(frame_pos.y + 98.0f * s, columns_y_flow), content_bottom - content_view_h));
+  const float title_y = Snap(columns_y - 74.0f * s);
   const float content_view_bottom = columns_y + content_view_h;
+  // Description panel height - also anchors Close Game's bottom edge.
+  const float desc_panel_h =
+      Snap(std::min(content_bottom - columns_y, 320.0f * s));
 
   const ImVec2 mouse = io.MousePos;
   const bool mouse_moved =
