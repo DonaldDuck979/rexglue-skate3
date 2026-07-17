@@ -2009,10 +2009,18 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       rail_focus_target = y0;
     }
     // The rounded focus fill covers this item while rail-focused; skip the
-    // square panel underneath so its corners don't poke past the radius.
+    // square panel underneath so its corners don't poke past the radius -
+    // but only once the sliding fill (last frame's position: the anim
+    // updates just below this loop) has ARRIVED. Skipping - or painting the
+    // black selected fill - the moment rail_sel_ changes blanked the target
+    // item out from under the still-traveling animation; in flight it keeps
+    // its normal teal panel and the fill visibly brings the selection over.
     bool rail_focused = zone_ == FocusZone::kRail && rail_sel_ == i;
-    if (!rail_focused) {
-      ImU32 bg = is_current ? kColSelFill : (hovered ? kColRailPanelHover : kColRailPanel);
+    bool fill_arrived = rail_anim_y_ >= 0.0f && std::abs(rail_anim_y_ - y0) < 0.5f;
+    if (!(rail_focused && fill_arrived)) {
+      ImU32 bg = (is_current && !rail_focused)
+                     ? kColSelFill
+                     : (hovered ? kColRailPanelHover : kColRailPanel);
       dl->AddRectFilled(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), bg, 0.0f);
       dl->AddRect(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), kColRailBorder, 0.0f);
     }
@@ -2024,6 +2032,9 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       rail_anim_y_ = rail_focus_target;
     }
     rail_anim_y_ += (rail_focus_target - rail_anim_y_) * std::min(1.0f, io.DeltaTime * 22.0f);
+    if (std::abs(rail_anim_y_ - rail_focus_target) < 0.5f) {
+      rail_anim_y_ = rail_focus_target;  // settle exactly so arrival tests are crisp
+    }
     const float fill_y = Snap(rail_anim_y_);
     DrawFocusHighlight(dl, ImVec2(rail_x, fill_y),
                        ImVec2(rail_x + rail_w, fill_y + rail_item_h), s);
@@ -2033,7 +2044,10 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   for (int i = 0; i < category_count; ++i) {
     float y0 = columns_y + i * (rail_item_h + row_gap);
     bool is_current = category_ == i;
-    bool focused = is_current && zone_ == FocusZone::kRail && rail_sel_ == i;
+    // Focused text styling waits for the sliding fill to mostly cover the
+    // item (same anti-vanish rule as the content rows).
+    bool focused = is_current && zone_ == FocusZone::kRail && rail_sel_ == i &&
+                   rail_anim_y_ >= 0.0f && std::abs(rail_anim_y_ - y0) < rail_item_h * 0.5f;
     ImU32 text_col = focused ? kColSelText : (is_current ? kColText : kColTextDim);
     AddTextVCentered(dl, bold, label_size, rail_x + 20.0f * s,
                      y0 + rail_item_h * 0.5f, text_col, kCategories[i].name);
@@ -2142,6 +2156,9 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       highlight_anim_y_ = target;
     }
     highlight_anim_y_ += (target - highlight_anim_y_) * std::min(1.0f, io.DeltaTime * 22.0f);
+    if (std::abs(highlight_anim_y_ - target) < 0.5f) {
+      highlight_anim_y_ = target;  // settle exactly so arrival tests are crisp
+    }
   } else {
     highlight_anim_y_ = -1.0f;
   }
@@ -2176,8 +2193,11 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       row_index_ = i;
     }
     // The rounded highlight covers the focused row's panel entirely; skip it
-    // so its square corners don't poke past the radius.
-    if (content_focus && row_index_ == i) {
+    // so its square corners don't poke past the radius - but only once the
+    // sliding fill has ARRIVED. Skipping the moment row_index_ changes
+    // blanked the target row out from under the still-traveling animation.
+    if (content_focus && row_index_ == i &&
+        std::abs(highlight_anim_y_ - row_y[i]) < 0.5f) {
       continue;
     }
     ImU32 bg = hovered && row.enabled ? kColPanelHover : kColPanel;
@@ -2205,7 +2225,11 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       return;
     }
 
-    const bool focused = content_focus && row_index_ == i;
+    // Focused STYLING (white text, polarity-matched weight) waits until the
+    // sliding fill mostly covers the row: flipping on row_index_ alone drew
+    // white-on-white while the black fill was still in flight.
+    const bool focused = content_focus && row_index_ == i &&
+                         std::abs(highlight_anim_y_ - row_y[i]) < row_hgt[i] * 0.5f;
     const bool hovered = mouse_in(content_x, y0, content_x + content_w, y1);
     ImFont* row_bold = focused ? bold : bold_ol;  // polarity-matched weight
     ImU32 label_col = focused ? kColSelText
