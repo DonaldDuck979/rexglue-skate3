@@ -1074,12 +1074,31 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         rows.push_back(std::move(row));
       }
       {
+        // Read-only: where frames are actually displayed, so the difference
+        // from Render Scale (the internal render size) is visible in the
+        // menu. Single option = the steppers grey out on their own; the row
+        // stays focusable so its description shows.
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "Resolution Scale";
+        row.label = "Output Resolution";
         row.desc =
-            "Render resolution as a multiple of the game's native 720p. Higher values are "
-            "sharper but cost GPU time.";
+            "The resolution frames are displayed at (informational): your "
+            "monitor's native resolution in fullscreen, the window size when "
+            "windowed. Rendering happens at the Render Scale setting and is "
+            "scaled to this.";
+        const ImVec2 out_size = ImGui::GetIO().DisplaySize;
+        row.options.push_back(std::to_string(int(out_size.x)) + " x " +
+                              std::to_string(int(out_size.y)));
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Render Scale";
+        row.desc =
+            "Internal 3D render resolution, as a multiple of the game's native 720p. "
+            "The image is always displayed at your monitor's native resolution - "
+            "higher settings supersample down to it.";
         for (const char* label : kResolutionLabels) {
           row.options.push_back(label);
         }
@@ -1222,13 +1241,13 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.label = "Shadow Quality";
         row.desc =
             "Dynamic character/prop shadow resolution in the native renderer. "
-            "Auto follows the Resolution Scale setting; 512 matches the "
-            "original game's shadow maps.";
+            "Auto follows the Render Scale setting; 512 matches the original "
+            "game's shadow maps.";
         for (size_t i = 0; i < kShadowQualityLabels.size(); ++i) {
           if (i == 1) {
             // Auto = the game's 512 tiles at the render resolution scale;
             // the renderer sizes the atlas from its scaled output (see the
-            // shadow_tile cvar), so the label follows the Resolution Scale
+            // shadow_tile cvar), so the label follows the Render Scale
             // row's STAGED selection: both apply on restart, and changing
             // the scale updates what Auto reads as immediately.
             const int scale_index = std::clamp(
