@@ -16,6 +16,15 @@
 
 namespace rex::audio {
 
+// Device buffer length (sample frames) the backend chose when
+// audio_device_sample_frames ran at 0 (= backend default). 0 while unknown:
+// before device init, on init failure, or when an explicit size was
+// requested (the device then just reflects the request). UI consumers use
+// this to display what "auto" resolves to on this machine; drivers publish
+// it at device init.
+int32_t AutoDeviceSampleFrames();
+void SetAutoDeviceSampleFrames(int32_t sample_frames);
+
 class AudioDriver {
  public:
   explicit AudioDriver(memory::Memory* memory);

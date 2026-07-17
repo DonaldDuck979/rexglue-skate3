@@ -137,6 +137,19 @@ bool SDLAudioDriver::Initialize() {
     return false;
   }
 
+  // Publish the buffer length the backend chose so the settings UI can show
+  // what "auto" resolves to, only meaningful when no explicit size was
+  // requested (the device otherwise just reflects the request). Queried
+  // after the stereo fallback so it reflects the device actually in use.
+  if (requested_sample_frames <= 0) {
+    SDL_AudioSpec active_spec = {};
+    int device_sample_frames = 0;
+    if (SDL_GetAudioDeviceFormat(sdl_device, &active_spec, &device_sample_frames) &&
+        device_sample_frames > 0) {
+      SetAutoDeviceSampleFrames(device_sample_frames);
+    }
+  }
+
   return true;
 }
 

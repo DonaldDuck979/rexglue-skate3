@@ -11,7 +11,21 @@
 
 #include <rex/audio/audio_driver.h>
 
+#include <atomic>
+
 namespace rex::audio {
+
+namespace {
+std::atomic<int32_t> g_auto_device_sample_frames{0};
+}  // namespace
+
+int32_t AutoDeviceSampleFrames() {
+  return g_auto_device_sample_frames.load(std::memory_order_relaxed);
+}
+
+void SetAutoDeviceSampleFrames(int32_t sample_frames) {
+  g_auto_device_sample_frames.store(sample_frames, std::memory_order_relaxed);
+}
 
 AudioDriver::AudioDriver(memory::Memory* memory) : memory_(memory) {}
 

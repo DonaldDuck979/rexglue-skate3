@@ -26,6 +26,7 @@
 #include <imgui.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/audio/audio_driver.h>
 #include <rex/ui/presenter.h>
 #include <toml++/toml.hpp>
 
@@ -72,10 +73,11 @@ constexpr std::array<const char*, 4> kMsaaLabels = {"Off", "2x", "4x", "8x"};
 constexpr std::array<int32_t, 4> kMsaaSamples = {1, 2, 4, 8};
 
 // Shadow quality: dynamic-shadow toggle + cascade tile resolution. The
-// game's own atlas is three 512 tiles ("Console").
-constexpr std::array<const char*, 4> kShadowQualityLabels = {"Off", "Console (512)",
-                                                             "High (1024)", "Ultra (2048)"};
-constexpr std::array<int32_t, 4> kShadowQualityTiles = {512, 512, 1024, 2048};
+// game's own atlas is three 512 tiles ("Console"); tile 0 = auto (512 x
+// the output resolution scale, the emulated renderer's effective raster).
+constexpr std::array<const char*, 6> kShadowQualityLabels = {
+    "Off", "Auto", "512 (console)", "1024", "1536", "2048"};
+constexpr std::array<int32_t, 6> kShadowQualityTiles = {0, 0, 512, 1024, 1536, 2048};
 
 // Audio device buffer sizes in sample frames (0 = backend default).
 constexpr std::array<const char*, 4> kAudioBufferLabels = {
@@ -332,15 +334,21 @@ int ShadowQualityIndexFrom(bool enabled, int32_t tile) {
   if (!enabled) {
     return 0;
   }
-  if (tile <= 512) {
-    return 1;
+  if (tile <= 0) {
+    return 1;  // auto
   }
-  return tile <= 1024 ? 2 : 3;
+  if (tile <= 512) {
+    return 2;
+  }
+  if (tile <= 1024) {
+    return 3;
+  }
+  return tile <= 1536 ? 4 : 5;
 }
 
 int ShadowQualityIndexFromCvar() {
   if (!HasShadowQualityCvars()) {
-    return 2;
+    return 1;
   }
   return ShadowQualityIndexFrom(
       rex::cvar::Query<bool>("skate3_native_render_scene_shadows"),
@@ -1214,15 +1222,30 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.label = "Shadow Quality";
         row.desc =
             "Dynamic character/prop shadow resolution in the native renderer. "
-            "Console matches the original game's shadow maps.";
-        for (const char* label : kShadowQualityLabels) {
-          row.options.push_back(label);
+            "Auto follows the Resolution Scale setting; 512 matches the "
+            "original game's shadow maps.";
+        for (size_t i = 0; i < kShadowQualityLabels.size(); ++i) {
+          if (i == 1) {
+            // Auto = the game's 512 tiles at the render resolution scale;
+            // the renderer sizes the atlas from its scaled output (see the
+            // shadow_tile cvar), so the label follows the Resolution Scale
+            // row's STAGED selection: both apply on restart, and changing
+            // the scale updates what Auto reads as immediately.
+            const int scale_index = std::clamp(
+                resolution_scale_index_, 0,
+                static_cast<int>(kResolutionScales.size()) - 1);
+            const uint32_t auto_tile = std::min(
+                512u * uint32_t(kResolutionScales[scale_index]), 4096u);
+            row.options.push_back("Auto (" + std::to_string(auto_tile) + ")");
+          } else {
+            row.options.push_back(kShadowQualityLabels[i]);
+          }
         }
         row.index = &shadow_quality_index_;
         row.reset = [this] {
           shadow_quality_index_ = ShadowQualityIndexFrom(
               CvarDefaultBool("skate3_native_render_scene_shadows", true),
-              int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 1024.0)));
+              int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 0.0)));
         };
         rows.push_back(std::move(row));
       }
@@ -1419,8 +1442,17 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.desc =
             "Audio device buffer length. Larger buffers add a little latency but "
             "fix crackling on machines with scheduling hiccups.";
-        for (const char* label : kAudioBufferLabels) {
-          row.options.push_back(label);
+        for (size_t i = 0; i < kAudioBufferLabels.size(); ++i) {
+          if (i == 0) {
+            // The backend publishes the buffer it chose when running in auto
+            // mode; 0 while unknown (explicit size active, or no device yet).
+            const int32_t auto_frames = rex::audio::AutoDeviceSampleFrames();
+            row.options.push_back(auto_frames > 0
+                                      ? "Auto (" + std::to_string(auto_frames) + ")"
+                                      : std::string("Auto"));
+          } else {
+            row.options.push_back(kAudioBufferLabels[i]);
+          }
         }
         row.index = &audio_buffer_index_;
         row.reset = [this] {
