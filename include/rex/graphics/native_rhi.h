@@ -59,6 +59,12 @@ enum class Format : uint32_t {
   kBC3_UNORM,
   kBC4_UNORM,
   kBC5_UNORM,
+  // Float color formats (HDR render targets), appended so existing values
+  // stay stable across exe/dll pairs. Both are color-renderable and
+  // blendable on every target backend (D3D12 FL11+, Vulkan core, MoltenVK);
+  // kR11G11B10_FLOAT has no alpha channel and stores no sign bits.
+  kR16G16B16A16_FLOAT,
+  kR11G11B10_FLOAT,
 };
 
 // Block dimensions/bytes for the copy math (1x1 for uncompressed).

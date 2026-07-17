@@ -76,6 +76,12 @@ VkFormat ToVkFormat(Format format) {
     case Format::kR10G10B10A2_UNORM:
       // Identical bit layout to DXGI_FORMAT_R10G10B10A2_UNORM.
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case Format::kR16G16B16A16_FLOAT:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case Format::kR11G11B10_FLOAT:
+      // Identical bit layout to DXGI_FORMAT_R11G11B10_FLOAT (R in the low
+      // bits of the packed 32).
+      return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case Format::kR32_FLOAT:
       return VK_FORMAT_R32_SFLOAT;
     case Format::kR32G32_FLOAT:
@@ -123,6 +129,9 @@ uint32_t FormatBytesPerBlock(Format format) {
     case Format::kR32_FLOAT:
     case Format::kD32_FLOAT:
       return 4;
+    case Format::kR11G11B10_FLOAT:
+      return 4;
+    case Format::kR16G16B16A16_FLOAT:
     case Format::kR32G32_FLOAT:
       return 8;
     case Format::kR32G32B32_FLOAT:

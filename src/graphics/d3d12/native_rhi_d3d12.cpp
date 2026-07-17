@@ -45,6 +45,10 @@ DXGI_FORMAT ToDxgi(Format format) {
       return DXGI_FORMAT_R16G16_UNORM;
     case Format::kR10G10B10A2_UNORM:
       return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case Format::kR16G16B16A16_FLOAT:
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case Format::kR11G11B10_FLOAT:
+      return DXGI_FORMAT_R11G11B10_FLOAT;
     case Format::kR32_FLOAT:
       return DXGI_FORMAT_R32_FLOAT;
     case Format::kR32G32_FLOAT:
