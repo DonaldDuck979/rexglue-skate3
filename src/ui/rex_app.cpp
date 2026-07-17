@@ -1,6 +1,6 @@
 /**
  * @file        ui/rex_app.cpp
- * @brief       ReXApp implementation — compiled as part of the consumer executable
+ * @brief       ReXApp implementation, compiled as part of the consumer executable
  *
  * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
  *              All rights reserved.
@@ -577,6 +577,28 @@ bool ReXApp::SetupPresentation() {
         if (REXCVAR_GET(show_fps_counter)) {
           fps_overlay_ = std::make_unique<ui::FpsOverlayDialog>(imgui_drawer_.get(), presenter);
         }
+        // The settings menu (and console/config reload) write show_fps_counter
+        // through cvar::SetFlagByName - without a change callback the value
+        // only stuck on disk and the overlay object never followed (the menu
+        // toggle looked dead). Add/RemoveDialog are safe mid-draw: the drawer
+        // iterates by index and adjusts it on removal. The F2 bind above
+        // already syncs the overlay itself before setting the cvar, so this
+        // callback no-ops for that path.
+        rex::cvar::RegisterChangeCallback(
+            "show_fps_counter", [this, presenter](std::string_view, std::string_view) {
+              const bool want = REXCVAR_GET(show_fps_counter);
+              if (want == (fps_overlay_ != nullptr)) {
+                return;
+              }
+              if (want) {
+                fps_overlay_ =
+                    std::make_unique<ui::FpsOverlayDialog>(imgui_drawer_.get(), presenter);
+              } else {
+                fps_overlay_.reset();
+              }
+              presenter->SetGuestFrameStatsEnabled(fps_overlay_ != nullptr ||
+                                                   debug_overlay_ != nullptr);
+            });
         rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
           if (debug_overlay_) {
             debug_overlay_.reset();
@@ -704,11 +726,15 @@ void ReXApp::OnDestroy() {
 #endif
 
   // Unregister overlay keybinds before destroying dialogs
+  rex::ui::UnregisterBind("bind_fps_counter");
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
+  // The show_fps_counter callback captures `this` - drop it before teardown.
+  rex::cvar::UnregisterChangeCallbacks("show_fps_counter");
 
   // ImGui cleanup (reverse of setup)
+  fps_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();
