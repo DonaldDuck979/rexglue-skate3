@@ -158,6 +158,8 @@ constexpr ImU32 kColDescPanel = IM_COL32(11, 46, 43, 140);
 constexpr ImU32 kColChevDisabled = IM_COL32(0, 0, 0, 56);
 // The disabled chevron on the FOCUSED (black) row needs a light variant -
 // black-alpha disappears there.
+// White-25% disc - keeps the disabled stepper
+// visible on the focused black row.
 constexpr ImU32 kColChevDisabledOnDark = IM_COL32(255, 255, 255, 64);
 constexpr ImU32 kColLegendChip = IM_COL32(238, 240, 240, 255);
 constexpr ImU32 kColLegendText = IM_COL32(15, 18, 20, 255);
@@ -615,21 +617,87 @@ float AddTextJustified(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, flo
   return y - pos.y;
 }
 
+constexpr float kPi = 3.14159265358979323846f;
+
+// Rounded ring band around [p_min,p_max] spanning inset e0..e1 outside the
+// rect. The browser rasterizes its stacked box-shadows with pixel-hard
+// straight edges (a 4px lime band is EXACTLY 4 full-coverage rows) and
+// antialiases only the corner arcs. ImGui's stroked AddRect can't do that:
+// PathRect offsets the centerline by 0.5px and thick AA polylines feather
+// 1px on both sides, so every horizontal band edge straddled two rows across
+// the full row width - measured as 5 soft rows spanning the whole focused
+// row (web: zero). Straight runs are therefore drawn as unrounded
+// AddRectFilled (PrimRect - no AA fringe) on snapped coordinates; only the
+// corner quadrants go through the AA arc stroker.
+void DrawHardRingBand(ImDrawList* dl, ImVec2 p_min, ImVec2 p_max, float e0, float e1,
+                      float corner_r, ImU32 col) {
+  const float x0 = Snap(p_min.x), y0 = Snap(p_min.y);
+  const float x1 = Snap(p_max.x), y1 = Snap(p_max.y);
+  const float rr = Snap(corner_r);
+  const float o0 = Snap(e0), o1 = Snap(e1);
+  const float a0 = x0 + rr, a1 = x1 - rr;  // straight-run x span
+  const float b0 = y0 + rr, b1 = y1 - rr;  // straight-run y span
+  dl->AddRectFilled(ImVec2(a0, y0 - o1), ImVec2(a1, y0 - o0), col);  // top
+  dl->AddRectFilled(ImVec2(a0, y1 + o0), ImVec2(a1, y1 + o1), col);  // bottom
+  dl->AddRectFilled(ImVec2(x0 - o1, b0), ImVec2(x0 - o0, b1), col);  // left
+  dl->AddRectFilled(ImVec2(x1 + o0, b0), ImVec2(x1 + o1, b1), col);  // right
+  // Corner quadrants: annulus arcs, stroke centered mid-band.
+  const float rm = rr + (o0 + o1) * 0.5f;
+  const float t = o1 - o0;
+  const struct {
+    ImVec2 c;
+    float ang0;
+  } corners[4] = {
+      {ImVec2(a0, b0), kPi},
+      {ImVec2(a1, b0), kPi * 1.5f},
+      {ImVec2(a1, b1), 0.0f},
+      {ImVec2(a0, b1), kPi * 0.5f},
+  };
+  for (const auto& c : corners) {
+    dl->PathArcTo(c.c, rm, c.ang0, c.ang0 + kPi * 0.5f);
+    dl->PathStroke(col, 0, t);
+  }
+}
+
+// Rounded fill with pixel-hard straight edges (browser border-radius
+// behavior: only the corner arcs antialias). PathFillConvex would feather
+// every edge 1px, leaving a soft seam where the fill meets the lime band.
+void DrawHardRoundedFill(ImDrawList* dl, ImVec2 p_min, ImVec2 p_max, float corner_r, ImU32 col) {
+  const float x0 = Snap(p_min.x), y0 = Snap(p_min.y);
+  const float x1 = Snap(p_max.x), y1 = Snap(p_max.y);
+  const float rr = Snap(corner_r);
+  const float a0 = x0 + rr, a1 = x1 - rr;
+  const float b0 = y0 + rr, b1 = y1 - rr;
+  dl->AddRectFilled(ImVec2(x0, b0), ImVec2(x1, b1), col);  // full-width middle
+  dl->AddRectFilled(ImVec2(a0, y0), ImVec2(a1, b0), col);  // top strip
+  dl->AddRectFilled(ImVec2(a0, b1), ImVec2(a1, y1), col);  // bottom strip
+  const struct {
+    ImVec2 c;
+    float ang0;
+  } corners[4] = {
+      {ImVec2(a0, b0), kPi},
+      {ImVec2(a1, b0), kPi * 1.5f},
+      {ImVec2(a1, b1), 0.0f},
+      {ImVec2(a0, b1), kPi * 0.5f},
+  };
+  for (const auto& c : corners) {
+    dl->PathLineTo(c.c);
+    dl->PathArcTo(c.c, rr, c.ang0, c.ang0 + kPi * 0.5f);
+    dl->PathFillConvex(col);
+  }
+}
+
 // Focused-item highlight: rounded black fill with a lime ring and a thicker
 // black outer edge, both drawn OUTSIDE the box (stacked
 // box-shadows). Total ring = 6*s beyond the rect on every side; callers keep
 // a matching margin in their clip rects.
 void DrawFocusHighlight(ImDrawList* dl, ImVec2 p_min, ImVec2 p_max, float s) {
   const float radius = 6.0f * s;
-  dl->AddRectFilled(p_min, p_max, kColSelFill, radius);
-  // Lime band: box edge -> +2*s (stroke centered at +1*s).
-  dl->AddRect(ImVec2(p_min.x - 1.0f * s, p_min.y - 1.0f * s),
-              ImVec2(p_max.x + 1.0f * s, p_max.y + 1.0f * s), kColAccent, radius + 1.0f * s, 0,
-              2.0f * s);
-  // Black outer edge: +2*s -> +6*s (stroke centered at +4*s).
-  dl->AddRect(ImVec2(p_min.x - 4.0f * s, p_min.y - 4.0f * s),
-              ImVec2(p_max.x + 4.0f * s, p_max.y + 4.0f * s), kColSelFill, radius + 4.0f * s, 0,
-              4.0f * s);
+  DrawHardRoundedFill(dl, p_min, p_max, radius, kColSelFill);
+  // Lime band: box edge -> +2*s (its corner arc rides at radius + 1*s).
+  DrawHardRingBand(dl, p_min, p_max, 0.0f, 2.0f * s, radius, kColAccent);
+  // Black outer edge: +2*s -> +6*s (corner arc at radius + 4*s).
+  DrawHardRingBand(dl, p_min, p_max, 2.0f * s, 6.0f * s, radius, kColSelFill);
 }
 
 // Stepper chevron: a triangle in a circle.
@@ -1625,7 +1693,15 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // 365px on "Vertical Synchronisation").
   constexpr float kEmPerSize = 2048.0f / 2478.0f;  // Inter upm / (asc - desc)
   auto font_px = [](float size) {
-    return std::round(size * kEmPerSize) / kEmPerSize;
+    const float em_quantized = std::round(size * kEmPerSize) / kEmPerSize;
+    // Snap to the 1/64px grid GetFontBaked quantizes to (rexglue imgui
+    // patch), so the baked size equals the drawn size EXACTLY and RenderText
+    // never rescales glyph quads. Stock imgui rounded bakes to whole pixels:
+    // the em-quantized 37.51 request baked at 38 and every glyph was
+    // GPU-bilinear-minified by 0.987 - the measured ~0.4px vertical smear
+    // that kept the menu slightly softer than intended. The 1/64
+    // snap moves the em by <0.02% - spacing shift is sub-0.1px per run.
+    return std::round(em_quantized * 64.0f) / 64.0f;
   };
 
   if (just_shown_) {
@@ -1848,9 +1924,9 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // overlaps neighbours - it draws above them.
   const float row_gap = Snap(5.0f * s);
   const float rail_item_h = Snap(52.0f * s);
-  const float label_size = font_px(19.0f * s);
-  const float value_size = font_px(19.0f * s);
-  const float desc_size = font_px(18.0f * s);
+  const float label_size = font_px(22.0f * s);
+  const float value_size = font_px(22.0f * s);
+  const float desc_size = font_px(20.0f * s);
   // Description panel height - also anchors Close Game's bottom edge.
   const float desc_panel_h =
       Snap(std::min(content_bottom - columns_y, 320.0f * s));
@@ -2070,7 +2146,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     highlight_anim_y_ = -1.0f;
   }
 
-  const float value_w = std::min(330.0f * s, content_w * 0.46f);
+  const float value_w = std::min(390.0f * s, content_w * 0.5f);
   const float chevron_r = 13.0f * s;
 
   // Rows draw whenever they touch the view: at rest the pitch-locked scroll
@@ -2172,9 +2248,20 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         if (count > 0) {
           float text_max_w = (right_center.x - chevron_r) - (left_center.x + chevron_r) -
                              16.0f * s;
+          // Free-form values (GPU adapter names) can outgrow the slot: step
+          // the value text down toward 18 design px first (each candidate
+          // em-quantized like every other size), only then ellipsize.
+          float fit_size = value_size;
+          for (float design = 21.0f;
+               design >= 18.0f &&
+               row_bold->CalcTextSizeA(fit_size, FLT_MAX, 0.0f, row.options[value].c_str()).x >
+                   text_max_w;
+               design -= 1.0f) {
+            fit_size = font_px(design * s);
+          }
           std::string text =
-              TruncateToWidth(row_bold, value_size, text_max_w, row.options[value]);
-          AddTextCentered(dl, row_bold, value_size,
+              TruncateToWidth(row_bold, fit_size, text_max_w, row.options[value]);
+          AddTextCentered(dl, row_bold, fit_size,
                           ImVec2((left_center.x + right_center.x) * 0.5f, cy), value_col,
                           text.c_str());
         }
@@ -2407,8 +2494,10 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         x += 2.0f * r + 8.0f * s;
       } else {
         float chip_w = Snap(glyph_extent.x + 18.0f * s);
-        dl->AddRectFilled(ImVec2(x, legend_y), ImVec2(x + chip_w, legend_y + chip_h),
-                          kColLegendChip, 4.0f * s);
+        // Hard straight edges + AA corners, like the browser's border-radius
+        // (rounded AddRectFilled feathers every edge 1px).
+        DrawHardRoundedFill(dl, ImVec2(x, legend_y), ImVec2(x + chip_w, legend_y + chip_h),
+                            4.0f * s, kColLegendChip);
         AddTextCenteredCap(dl, bold_ol, glyph_size, ImVec2(x + chip_w * 0.5f, cy),
                            kColLegendText, glyph.glyph, /*ink_x=*/false);
         x += chip_w + 8.0f * s;
