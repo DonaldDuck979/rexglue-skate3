@@ -1397,6 +1397,16 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
   }
 
+  // Cache the final letterboxed rectangle for UI-thread consumers
+  // (GetLastGuestOutputPaintRect). Values fit 16 bits comfortably (8K wide is
+  // 7680); reached only on the successful path, so degenerate flows keep the
+  // previous rectangle.
+  last_guest_output_paint_rect_.store(
+      uint64_t(uint16_t(int16_t(flow.output_x))) |
+          (uint64_t(uint16_t(int16_t(flow.output_y))) << 16) |
+          (uint64_t(uint16_t(output_width)) << 32) | (uint64_t(uint16_t(output_height)) << 48),
+      std::memory_order_relaxed);
+
   return flow;
 }
 

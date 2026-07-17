@@ -729,6 +729,27 @@ class Presenter {
     return width_out && height_out;
   }
 
+  // Final letterboxed rectangle (render-target pixels) the guest output was
+  // last painted into, cached by GetGuestOutputPaintFlow. width/height are 0
+  // until the first guest output paint. For UI-thread consumers that want to
+  // frame themselves to the game image rather than the whole window (e.g. the
+  // settings overlay on non-16:9 displays).
+  struct GuestOutputPaintRect {
+    int32_t x = 0;
+    int32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  GuestOutputPaintRect GetLastGuestOutputPaintRect() const {
+    const uint64_t packed = last_guest_output_paint_rect_.load(std::memory_order_relaxed);
+    GuestOutputPaintRect rect;
+    rect.x = int32_t(int16_t(packed & 0xFFFF));
+    rect.y = int32_t(int16_t((packed >> 16) & 0xFFFF));
+    rect.width = uint32_t(uint16_t((packed >> 32) & 0xFFFF));
+    rect.height = uint32_t(uint16_t((packed >> 48) & 0xFFFF));
+    return rect;
+  }
+
  protected:
   // is_8bpc_out_ref is where to write whether the source actually has no more
   // than 8 bits of precision per channel (though the image provided by the
@@ -1035,6 +1056,10 @@ class Presenter {
   // high frame rates.
   static constexpr size_t kGuestFrameTimestampCount = 512;
   std::atomic<bool> guest_frame_stats_enabled_{false};
+  // Packed x/y/width/height as 4x16-bit, written by GetGuestOutputPaintFlow
+  // (paint thread, const method - hence mutable), read from the UI thread via
+  // GetLastGuestOutputPaintRect.
+  mutable std::atomic<uint64_t> last_guest_output_paint_rect_{0};
   mutable std::mutex guest_frame_stats_mutex_;
   std::array<std::chrono::steady_clock::time_point, kGuestFrameTimestampCount>
       guest_frame_timestamps_{};

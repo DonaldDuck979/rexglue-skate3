@@ -26,6 +26,7 @@
 #include <imgui.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/ui/presenter.h>
 #include <toml++/toml.hpp>
 
 namespace rex::ui {
@@ -1683,8 +1684,26 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
                         ? imgui_drawer()->ui_font_semibold_on_light()
                         : bold;
 
+  // Layout frame: the letterboxed game image when the presenter reports one,
+  // the full window otherwise (boot, no guest output yet). On non-16:9
+  // displays the game letterboxes to 16:9 while the window is taller/wider -
+  // scaling and anchoring the menu to the window made it read visibly larger
+  // than on a 16:9 screen (user report, 16:10 Mac). On 16:9 displays the
+  // rectangle equals the window and nothing changes. The blur/backdrop wash
+  // still covers the whole window.
+  ImVec2 frame_pos(0.0f, 0.0f);
+  ImVec2 frame_size = io.DisplaySize;
+  if (Presenter* presenter = imgui_drawer()->presenter()) {
+    const Presenter::GuestOutputPaintRect rect = presenter->GetLastGuestOutputPaintRect();
+    if (rect.width > 0 && rect.height > 0) {
+      frame_pos = ImVec2(float(rect.x), float(rect.y));
+      frame_size = ImVec2(float(rect.width), float(rect.height));
+    }
+  }
+  const float frame_bottom = frame_pos.y + frame_size.y;
+
   // Uniform scale: design metrics are authored for 1080p.
-  const float s = std::clamp(io.DisplaySize.y / 1080.0f, 0.6f, 3.0f);
+  const float s = std::clamp(frame_size.y / 1080.0f, 0.6f, 3.0f);
 
   // Quantize font sizes so the EM (size * upm / (hhea ascent - descent) -
   // the browser's font-size) lands on whole pixels. A fractional em renders
@@ -1898,8 +1917,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   // ---- Layout ----
   // Positional metrics are snapped to whole pixels (see Snap).
-  const float margin_x = Snap(std::max(56.0f * s, io.DisplaySize.x * 0.05f));
-  const float title_y = Snap(io.DisplaySize.y * 0.13f);
+  const float margin_x = Snap(std::max(56.0f * s, frame_size.x * 0.05f));
+  const float title_y = Snap(frame_pos.y + frame_size.y * 0.13f);
   const float title_size = font_px(42.0f * s);
   const float columns_y = Snap(title_y + 74.0f * s);
   // Rail and description columns are equal-width.
@@ -1907,13 +1926,14 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   const float desc_w = Snap(300.0f * s);
   const float col_gap = Snap(14.0f * s);
   const float footer_h = Snap(96.0f * s);
-  const float content_bottom = Snap(io.DisplaySize.y - footer_h - 18.0f * s);
-  float content_w = io.DisplaySize.x - 2.0f * margin_x - rail_w - desc_w - 2.0f * col_gap;
+  const float content_bottom = Snap(frame_bottom - footer_h - 18.0f * s);
+  float content_w = frame_size.x - 2.0f * margin_x - rail_w - desc_w - 2.0f * col_gap;
   content_w = Snap(std::clamp(content_w, 300.0f * s, 800.0f * s));
   // The column widths are capped, so on wide displays the block would hug the
   // left margin - center the whole menu instead.
   const float menu_total_w = rail_w + content_w + desc_w + 2.0f * col_gap;
-  const float rail_x = Snap(std::max(margin_x, (io.DisplaySize.x - menu_total_w) * 0.5f));
+  const float rail_x =
+      Snap(frame_pos.x + std::max(margin_x, (frame_size.x - menu_total_w) * 0.5f));
   const float content_x = rail_x + rail_w + col_gap;
   const float desc_x = content_x + content_w + col_gap;
   const float menu_right = desc_x + desc_w;
@@ -2483,7 +2503,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   // ---- Footer button legend ----
   {
-    float legend_y = Snap(io.DisplaySize.y - footer_h + 14.0f * s);
+    float legend_y = Snap(frame_bottom - footer_h + 14.0f * s);
     std::vector<LegendGlyph> glyphs;
     if (pad_active_) {
       glyphs.push_back({"A", "Select", true});
