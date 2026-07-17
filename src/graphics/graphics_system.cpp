@@ -24,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/nvidia_app_profile.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -148,6 +149,10 @@ X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) 
   }
 
   if (!provider_) {
+    // Before the driver loads: make sure our NVIDIA application profile
+    // requests maximum performance so load-screen lulls cannot park the GPU
+    // in a low P-state for the rest of the session.
+    ApplyNvidiaMaxPerformanceProfile();
     CreateProvider(true);
     if (!provider_) {
       REXGPU_ERROR("Unable to create graphics provider");

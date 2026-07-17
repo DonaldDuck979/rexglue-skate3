@@ -17,6 +17,8 @@ set(REXGRAPHICS_CORE_SOURCES
 # GPU system files - full backend
 set(REXGRAPHICS_SYSTEM_SOURCES
     graphics_system.cpp
+    gpu_clock_telemetry.cpp
+    nvidia_app_profile.cpp
     command_processor.cpp
     trace_writer.cpp
     pipeline/texture/extent.cpp
