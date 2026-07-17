@@ -345,6 +345,28 @@ bool D3D12Provider::Initialize() {
     dxgi_factory->Release();
     return false;
   }
+  // Publish which cvar-order index the selection landed on (the automatic
+  // path walks a preference-ordered enumeration, so its index does not match
+  // the published list) so the settings device picker can show the adapter
+  // automatic selection resolved to. Matched by LUID against the plain
+  // enumeration the list was built from.
+  {
+    GraphicsDeviceList device_list = GetGraphicsDeviceList();
+    IDXGIAdapter1* match_adapter;
+    for (uint32_t i = 0; dxgi_factory->EnumAdapters1(i, &match_adapter) == S_OK; ++i) {
+      DXGI_ADAPTER_DESC1 match_desc;
+      const bool matched =
+          SUCCEEDED(match_adapter->GetDesc1(&match_desc)) &&
+          match_desc.AdapterLuid.LowPart == adapter_desc.AdapterLuid.LowPart &&
+          match_desc.AdapterLuid.HighPart == adapter_desc.AdapterLuid.HighPart;
+      match_adapter->Release();
+      if (matched) {
+        device_list.active_index = int32_t(i);
+        break;
+      }
+    }
+    SetGraphicsDeviceList(std::move(device_list));
+  }
   adapter_vendor_id_ = GpuVendorID(adapter_desc.VendorId);
   int adapter_name_mb_size =
       WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, nullptr, 0, nullptr, nullptr);

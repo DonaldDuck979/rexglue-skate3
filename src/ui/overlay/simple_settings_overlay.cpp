@@ -220,16 +220,19 @@ std::vector<std::string_view> GetSimpleSettingsCvars() {
   return cvars;
 }
 
-// 0 = automatic selection (cvar -1); i+1 = the list's device i.
+// The picker lists devices directly (no separate automatic entry):
+// automatic selection (cvar -1) reads as the device the backend reported
+// actually picking.
 int DeviceIndexFromCvar(const GraphicsDeviceList& device_list) {
   if (device_list.device_names.empty() || !HasCvar(device_list.cvar_name)) {
     return 0;
   }
   int32_t current = rex::cvar::Query<int32_t>(device_list.cvar_name);
   if (current >= 0 && current < static_cast<int32_t>(device_list.device_names.size())) {
-    return current + 1;
+    return current;
   }
-  return 0;
+  return std::clamp(device_list.active_index, 0,
+                    static_cast<int32_t>(device_list.device_names.size()) - 1);
 }
 
 int ResolutionIndexFromScale(int32_t scale) {
@@ -952,10 +955,14 @@ void SimpleSettingsDialog::SaveVideo() {
       std::clamp(aspect_ratio_index_, 0, static_cast<int>(kAspectRatioLabels.size()) - 1);
   field_of_view_ = std::clamp(field_of_view_, 40.0f, 120.0f);
   if (!device_list_.device_names.empty() && HasCvar(device_list_.cvar_name)) {
-    device_index_ =
-        std::clamp(device_index_, 0, static_cast<int>(device_list_.device_names.size()));
+    device_index_ = std::clamp(device_index_, 0,
+                               static_cast<int>(device_list_.device_names.size()) - 1);
+    // Selecting the device automatic selection already picked keeps the cvar
+    // automatic, so new hardware still re-picks the best adapter.
     rex::cvar::SetFlagByName(device_list_.cvar_name,
-                             device_index_ == 0 ? "-1" : std::to_string(device_index_ - 1));
+                             device_index_ == device_list_.active_index
+                                 ? "-1"
+                                 : std::to_string(device_index_));
   }
   const auto scale = std::to_string(kResolutionScales[resolution_scale_index_]);
   rex::cvar::SetFlagByName("resolution_scale", scale);
@@ -1058,19 +1065,20 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.kind = RowSpec::kEnum;
         row.label = "Graphics Device";
         row.desc =
-            "Select which GPU renders the game. Auto picks the highest-performance adapter.";
+            "Select which GPU renders the game. The highest-performance "
+            "adapter is selected automatically.";
         // Index-prefixed labels: virtual display drivers (Parsec etc.) make
         // the same physical GPU enumerate several times, and the index is
-        // what the device cvar and the startup log speak in.
-        row.options.push_back("Auto (recommended)");
+        // what the device cvar and the startup log speak in. No separate
+        // automatic entry; the row shows the adapter automatic selection
+        // resolved to, and re-selecting it keeps the choice automatic.
         for (size_t i = 0; i < device_list_.device_names.size(); ++i) {
           row.options.push_back(std::to_string(i) + ": " + device_list_.device_names[i]);
         }
         row.index = &device_index_;
-        if (device_index_ > 0 && device_index_ <= int(device_list_.device_names.size())) {
-          row.desc_extra = "Current: " + row.options[device_index_];
-        }
-        row.reset = [this] { device_index_ = 0; };
+        row.reset = [this] {
+          device_index_ = std::max(device_list_.active_index, 0);
+        };
         rows.push_back(std::move(row));
       }
       {
@@ -2333,12 +2341,17 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         // a circle greys out (and stops responding) at its end of the range.
         const bool can_left = row.enabled && value > 0;
         const bool can_right = row.enabled && value < count - 1;
-        bool left_hover = can_left &&
-                          mouse_in(left_center.x - chevron_r - 4.0f, cy - chevron_r - 4.0f,
-                                   left_center.x + chevron_r + 4.0f, cy + chevron_r + 4.0f);
-        bool right_hover = can_right &&
-                           mouse_in(right_center.x - chevron_r - 4.0f, cy - chevron_r - 4.0f,
-                                    right_center.x + chevron_r + 4.0f, cy + chevron_r + 4.0f);
+        // Hit areas are tracked separately from enablement: a click on a
+        // greyed-out stepper must be swallowed, not fall through to the
+        // row-body wrap-around cycle below.
+        const bool left_hit =
+            mouse_in(left_center.x - chevron_r - 4.0f, cy - chevron_r - 4.0f,
+                     left_center.x + chevron_r + 4.0f, cy + chevron_r + 4.0f);
+        const bool right_hit =
+            mouse_in(right_center.x - chevron_r - 4.0f, cy - chevron_r - 4.0f,
+                     right_center.x + chevron_r + 4.0f, cy + chevron_r + 4.0f);
+        bool left_hover = can_left && left_hit;
+        bool right_hover = can_right && right_hit;
         const ImU32 chev_disabled = focused ? kColChevDisabledOnDark : kColChevDisabled;
         DrawChevron(dl, left_center, chevron_r, true,
                     can_left ? (left_hover ? kColInteractHover : kColInteract)
@@ -2369,10 +2382,14 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
                           text.c_str());
         }
         if (clicked && row.enabled) {
-          if (left_hover) {
-            step_row(row, -1);
-          } else if (right_hover) {
-            step_row(row, 1);
+          if (left_hit) {
+            if (can_left) {
+              step_row(row, -1);
+            }
+          } else if (right_hit) {
+            if (can_right) {
+              step_row(row, 1);
+            }
           } else if (hovered) {
             activate_row(row);  // row-body click cycles with wrap-around
           }

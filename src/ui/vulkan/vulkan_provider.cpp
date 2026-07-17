@@ -165,6 +165,22 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     }
   }
 
+  // Publish which enumeration index the selection landed on (the automatic
+  // path walks a preference-ordered copy of the list) so the settings device
+  // picker can show the device automatic selection resolved to.
+  {
+    const VkPhysicalDevice active_physical_device =
+        provider->vulkan_device_->physical_device();
+    for (size_t i = 0; i < physical_devices.size(); ++i) {
+      if (physical_devices[i] == active_physical_device) {
+        GraphicsDeviceList device_list = GetGraphicsDeviceList();
+        device_list.active_index = int32_t(i);
+        SetGraphicsDeviceList(std::move(device_list));
+        break;
+      }
+    }
+  }
+
   if (with_presentation) {
     provider->ui_samplers_ = UISamplers::Create(provider->vulkan_device_.get());
     if (!provider->ui_samplers_) {
