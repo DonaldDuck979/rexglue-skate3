@@ -13,5 +13,6 @@ namespace rex::ui {
 
 const char* GetInterRegularCompressedBase85();
 const char* GetInterSemiBoldCompressedBase85();
+const char* GetInterBoldCompressedBase85();
 
 }  // namespace rex::ui

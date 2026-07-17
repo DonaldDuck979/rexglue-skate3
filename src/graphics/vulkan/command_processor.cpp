@@ -37,6 +37,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/graphics/gpu_clock_telemetry.h>
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
@@ -163,6 +164,12 @@ REXCVAR_DEFINE_BOOL(vulkan_gpu_timestamp_buckets, false, "GPU/Vulkan",
                     "with timestamp queries and report them in the FPS overlay")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(vulkan_gpu_clock_log_interval_frames, 120, "GPU/Vulkan",
+                     "How often (in guest frames) to log the GPU clock/P-state telemetry line; "
+                     "P-state changes and large clock swings log immediately; 0 disables")
+    .range(0, 36000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // Skate 3 ultrawide cvars. These mirror the Direct3D 12 backend's definitions
 // so the Hor+ classifier behaves identically on Vulkan; the D3D12 translation
 // unit is not compiled on this platform, so without these the queries below
@@ -200,6 +207,51 @@ const char* ReadbackResolveModeName(ReadbackResolveMode mode) {
       return "auto";
   }
   return "unknown";
+}
+
+// Periodic GPU clock/P-state telemetry. All timestamp buckets inflating
+// together with unchanged interval counts means the same workload is
+// executing slower - this line attributes that to core/memory clocks the
+// driver kept parked (the sticky post-map-change slow state and the slow
+// first seconds of gameplay). Logs on P-state changes and large SM clock
+// swings immediately, and unconditionally every interval as a heartbeat.
+void LogGpuClockTelemetry() {
+  const int32_t interval = REXCVAR_GET(vulkan_gpu_clock_log_interval_frames);
+  if (interval <= 0) {
+    return;
+  }
+  constexpr uint32_t kSampleEveryFrames = 15;
+  static uint32_t frames_until_sample = 0;
+  static uint32_t frames_since_log = 0;
+  static uint32_t last_logged_pstate = UINT32_MAX;
+  static uint32_t last_logged_sm_mhz = 0;
+  ++frames_since_log;
+  if (frames_until_sample > 1) {
+    --frames_until_sample;
+    return;
+  }
+  frames_until_sample = kSampleEveryFrames;
+  const GpuClockSample sample = SampleGpuClocks();
+  if (!sample.valid) {
+    // Never loaded or failed - stop paying for the attempt.
+    REXCVAR_SET(vulkan_gpu_clock_log_interval_frames, 0);
+    return;
+  }
+  const uint32_t sm_delta =
+      sample.sm_mhz > last_logged_sm_mhz ? sample.sm_mhz - last_logged_sm_mhz
+                                         : last_logged_sm_mhz - sample.sm_mhz;
+  const bool state_changed = sample.performance_state != last_logged_pstate ||
+                             sm_delta * 5 > last_logged_sm_mhz;  // >20% swing.
+  if (!state_changed && frames_since_log < uint32_t(interval)) {
+    return;
+  }
+  REXGPU_INFO("Vulkan GPU clocks: sm={}MHz mem={}MHz pstate=P{} util={}% memutil={}% "
+              "throttle={:#x}",
+              sample.sm_mhz, sample.mem_mhz, sample.performance_state, sample.gpu_util_percent,
+              sample.mem_util_percent, sample.throttle_reasons);
+  frames_since_log = 0;
+  last_logged_pstate = sample.performance_state;
+  last_logged_sm_mhz = sample.sm_mhz;
 }
 
 bool IsGameplayStateActive(const system::KernelState* kernel_state) {
@@ -2736,6 +2788,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  LogGpuClockTelemetry();
+
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
@@ -3471,6 +3525,31 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+        }
+
+        // Host post-processor over the emulated output (settings-menu
+        // backdrop blur): runs after the gamma/FXAA pass has fully written
+        // the image (the pending release barrier above is flushed by the
+        // RHI frame begin). Frames the native renderer handled returned
+        // above; it applies its own effects inline.
+        if (IsNativeGuestOutputPostProcessRequested() && HasNativeGuestOutputPostProcessor()) {
+          NativeGuestOutputRenderContext native_context;
+          native_context.backend = NativeGuestOutputBackend::kVulkan;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          if (native_rhi_device_ == nullptr) {
+            native_rhi_device_ = CreateNativeRhiDevice(this);
+          }
+          native_context.device = native_rhi_device_;
+          // ever_written = true: the pass above just wrote the image, so it
+          // is in the presenter's internal layout once barriers flush.
+          native_context.cmd = NativeRhiBeginFrame(
+              native_rhi_device_, vulkan_context.image(), vulkan_context.image_view(), true,
+              guest_output_width, guest_output_height, &native_context.guest_output);
+          InvokeNativeGuestOutputPostProcessor(native_context);
+          NativeRhiEndFrame(native_rhi_device_);
         }
 
         // Need to submit all the commands before giving the image back to the

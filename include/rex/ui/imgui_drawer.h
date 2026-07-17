@@ -52,6 +52,11 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // default font (PushFont(nullptr, size)).
   ImFont* ui_font() const { return ui_font_; }
   ImFont* ui_font_semibold() const { return ui_font_semibold_; }
+  ImFont* ui_font_bold() const { return ui_font_bold_; }
+  // Coverage-thinned variants for DARK text on LIGHT backgrounds (see
+  // SetupFonts); same metrics as the plain fonts.
+  ImFont* ui_font_on_light() const { return ui_font_on_light_; }
+  ImFont* ui_font_semibold_on_light() const { return ui_font_semibold_on_light_; }
 
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
@@ -114,6 +119,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // System UI fonts (see ui_font()). Owned by the ImGui font atlas.
   ImFont* ui_font_ = nullptr;
   ImFont* ui_font_semibold_ = nullptr;
+  ImFont* ui_font_bold_ = nullptr;
+  ImFont* ui_font_on_light_ = nullptr;
+  ImFont* ui_font_semibold_on_light_ = nullptr;
 
   // All currently-attached dialogs that get drawn.
   std::vector<ImGuiDialog*> dialogs_;

@@ -20,6 +20,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <imgui.h>
@@ -78,21 +79,41 @@ constexpr float kRepeatDelay = 0.42f;
 constexpr float kRepeatRate = 0.11f;
 
 // ---- Palette -------------------------------------------------------------
+// Frosted-panel color scheme (iterated against
+// real gameplay captures): teal frosted side panels with white text over the
+// blurred scene, WHITE setting rows with near-black text, black focused row
+// with a lime ring, lime section/description bars, magenta steppers/slider.
 
-constexpr ImU32 kColSelFill = IM_COL32(243, 246, 247, 255);
-constexpr ImU32 kColSelText = IM_COL32(13, 16, 18, 255);
-constexpr ImU32 kColPanel = IM_COL32(15, 19, 22, 216);
-constexpr ImU32 kColPanelHover = IM_COL32(30, 37, 41, 230);
-constexpr ImU32 kColPanelBorder = IM_COL32(255, 255, 255, 14);
-constexpr ImU32 kColText = IM_COL32(228, 233, 235, 255);
-constexpr ImU32 kColTextDim = IM_COL32(148, 157, 161, 255);
-constexpr ImU32 kColTextFaint = IM_COL32(105, 114, 118, 255);
-constexpr ImU32 kColAccent = IM_COL32(62, 219, 190, 255);
-constexpr ImU32 kColAccentDark = IM_COL32(9, 24, 21, 255);
+constexpr ImU32 kColSelFill = IM_COL32(10, 12, 12, 255);
+constexpr ImU32 kColSelText = IM_COL32(250, 252, 252, 255);
+// Rows are OPAQUE (no scene bleed-through) but tuned to the tone the
+// raw white would render (~235 vs 252) so they don't read as
+// too bright or too contrasty.
+constexpr ImU32 kColPanel = IM_COL32(235, 236, 236, 255);
+constexpr ImU32 kColPanelHover = IM_COL32(248, 250, 250, 255);
+constexpr ImU32 kColPanelBorder = IM_COL32(0, 0, 0, 26);
+constexpr ImU32 kColRowText = IM_COL32(15, 17, 18, 255);
+constexpr ImU32 kColRailPanel = IM_COL32(14, 56, 53, 140);
+constexpr ImU32 kColRailPanelHover = IM_COL32(24, 90, 86, 166);
+constexpr ImU32 kColRailBorder = IM_COL32(255, 255, 255, 26);
+constexpr ImU32 kColText = IM_COL32(235, 242, 241, 255);
+constexpr ImU32 kColTextDim = IM_COL32(224, 235, 234, 191);
+constexpr ImU32 kColTextFaint = IM_COL32(150, 158, 158, 255);
+constexpr ImU32 kColAccent = IM_COL32(213, 235, 10, 255);
+constexpr ImU32 kColAccentDark = IM_COL32(13, 15, 5, 255);
+constexpr ImU32 kColInteract = IM_COL32(230, 0, 120, 255);
+constexpr ImU32 kColInteractHover = IM_COL32(255, 25, 145, 255);
 constexpr ImU32 kColDanger = IM_COL32(233, 88, 76, 255);
 constexpr ImU32 kColWarn = IM_COL32(245, 197, 87, 255);
-constexpr ImU32 kColDescPanel = IM_COL32(11, 15, 17, 220);
-constexpr ImU32 kColRule = IM_COL32(255, 255, 255, 26);
+constexpr ImU32 kColDescPanel = IM_COL32(11, 46, 43, 140);
+constexpr ImU32 kColChevDisabled = IM_COL32(0, 0, 0, 56);
+// The disabled chevron on the FOCUSED (black) row needs a light variant -
+// black-alpha disappears there.
+constexpr ImU32 kColChevDisabledOnDark = IM_COL32(255, 255, 255, 64);
+constexpr ImU32 kColLegendChip = IM_COL32(238, 240, 240, 255);
+constexpr ImU32 kColLegendText = IM_COL32(15, 18, 20, 255);
+constexpr ImU32 kColLegendLabel = IM_COL32(228, 236, 235, 255);
+constexpr ImU32 kColWhite = IM_COL32(255, 255, 255, 255);
 
 bool HasCvar(std::string_view name) {
   return rex::cvar::GetFlagInfo(name) != nullptr;
@@ -296,6 +317,13 @@ void SetTearingCvars(bool value) {
 
 // ---- Small draw helpers ----------------------------------------------------
 
+// Snap to whole pixels. Fractional origins under bilinear filtering smear
+// glyph edges and turn 1px rules into soft 2px lines - browsers pixel-snap
+// text and borders, so snapping to whole pixels keeps them crisp.
+float Snap(float value) {
+  return std::floor(value + 0.5f);
+}
+
 std::string TruncateToWidth(ImFont* font, float size, float max_width, std::string text) {
   if (font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str()).x <= max_width) {
     return text;
@@ -310,24 +338,157 @@ std::string TruncateToWidth(ImFont* font, float size, float max_width, std::stri
 void AddTextCentered(ImDrawList* dl, ImFont* font, float size, ImVec2 center, ImU32 col,
                      const char* text) {
   ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
-  dl->AddText(font, size, ImVec2(center.x - extent.x * 0.5f, center.y - extent.y * 0.5f), col,
+  dl->AddText(font, size,
+              ImVec2(Snap(center.x - extent.x * 0.5f), Snap(center.y - extent.y * 0.5f)), col,
               text);
+}
+
+// Optical centering for short glyph labels (pad button circles, key chips):
+// AddTextCentered centers the line box, but a capital's visual ink sits
+// asymmetrically inside it (descender slack below, bearings on the sides), so
+// the letter lands ~1px down-right of a small circle's center. Vertical
+// centers the CAP-HEIGHT BAND taken from 'H'
+// rather than each glyph's own ink: per-glyph raster boxes round
+// independently (A has a pointed-apex overshoot, Y doesn't), which lands
+// adjacent buttons on different subpixel rows - the eye catches that
+// inconsistency more than any absolute offset. One shared band = identical
+// placement for every label, overshoots hanging evenly, which is also what
+// the browser's hinted rasterizer converges to. Horizontal centers the ink
+// for single glyphs (circles) or the advance box when ink_x is false -
+// multi-glyph chip labels match the browser's text-box centering that way.
+// ASCII labels only.
+void AddTextCenteredCap(ImDrawList* dl, ImFont* font, float size, ImVec2 center, ImU32 col,
+                        const char* text, bool ink_x) {
+  ImFontBaked* baked = font->GetFontBaked(size);
+  float pen = 0.0f;
+  float min_x = FLT_MAX, max_x = -FLT_MAX;
+  for (const char* p = text; *p; ++p) {
+    const ImFontGlyph* glyph = baked->FindGlyph(ImWchar(uint8_t(*p)));
+    if (!glyph) {
+      continue;
+    }
+    if (glyph->Visible) {
+      min_x = std::min(min_x, pen + glyph->X0);
+      max_x = std::max(max_x, pen + glyph->X1);
+    }
+    pen += glyph->AdvanceX;
+  }
+  if (min_x > max_x) {
+    return;  // no visible ink
+  }
+  float band_top = 0.0f;
+  float band_bottom = size;
+  if (const ImFontGlyph* cap = baked->FindGlyphNoFallback(ImWchar('H'))) {
+    band_top = cap->Y0;
+    band_bottom = cap->Y1;
+  }
+  const float x = ink_x ? center.x - (min_x + max_x) * 0.5f : center.x - pen * 0.5f;
+  // Round-half-DOWN for the vertical position: the cap band regularly has a
+  // half-integer center (e.g. 18px band in a 52px circle), and Snap's
+  // round-half-up resolved every tie downward - measured exactly 1px low
+  // versus the browser, which resolves the same tie upward (the typographic
+  // convention: when a glyph can't center exactly, err high).
+  const float y = center.y - (band_top + band_bottom) * 0.5f;
+  dl->AddText(font, size, ImVec2(Snap(x), std::ceil(y - 0.5f)), col, text);
 }
 
 void AddTextVCentered(ImDrawList* dl, ImFont* font, float size, float x, float center_y,
                       ImU32 col, const char* text) {
   ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
-  dl->AddText(font, size, ImVec2(x, center_y - extent.y * 0.5f), col, text);
+  dl->AddText(font, size, ImVec2(Snap(x), Snap(center_y - extent.y * 0.5f)), col, text);
+}
+
+// Justified paragraph (browser text-align: justify): wraps words to wrap_w
+// and stretches the word gaps of every full line so both edges align; the
+// last line of the paragraph stays ragged-left. Returns the height consumed.
+float AddTextJustified(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, float wrap_w,
+                       ImU32 col, const char* text) {
+  std::vector<std::string_view> words;
+  for (const char* p = text; *p;) {
+    while (*p == ' ') {
+      ++p;
+    }
+    const char* start = p;
+    while (*p && *p != ' ') {
+      ++p;
+    }
+    if (p > start) {
+      words.emplace_back(start, size_t(p - start));
+    }
+  }
+  if (words.empty()) {
+    return 0.0f;
+  }
+  const float space_w = font->CalcTextSizeA(size, FLT_MAX, 0.0f, " ").x;
+  auto word_w = [&](std::string_view w) {
+    return font->CalcTextSizeA(size, FLT_MAX, 0.0f, w.data(), w.data() + w.size()).x;
+  };
+  float y = pos.y;
+  size_t i = 0;
+  while (i < words.size()) {
+    float line_w = word_w(words[i]);
+    size_t j = i + 1;
+    while (j < words.size()) {
+      const float w = word_w(words[j]);
+      if (line_w + space_w + w > wrap_w) {
+        break;
+      }
+      line_w += space_w + w;
+      ++j;
+    }
+    const bool last_line = j == words.size();
+    float gap = space_w;
+    if (!last_line && j - i > 1) {
+      const float words_only = line_w - space_w * float(j - i - 1);
+      const float stretched = (wrap_w - words_only) / float(j - i - 1);
+      // Conditional justify: only stretch when the gaps stay modest -
+      // beyond ~1.6x a normal space the stretched line reads worse than a
+      // ragged one (the "big spaces" objection to naive justification).
+      if (stretched <= space_w * 1.6f) {
+        gap = stretched;
+      }
+    }
+    float x = pos.x;
+    for (size_t k = i; k < j; ++k) {
+      dl->AddText(font, size, ImVec2(Snap(x), Snap(y)), col, words[k].data(),
+                  words[k].data() + words[k].size());
+      x += word_w(words[k]) + gap;
+    }
+    y += size;
+    i = j;
+  }
+  return y - pos.y;
+}
+
+// Focused-item highlight: rounded black fill with a lime ring and a thicker
+// black outer edge, both drawn OUTSIDE the box (stacked
+// box-shadows). Total ring = 6*s beyond the rect on every side; callers keep
+// a matching margin in their clip rects.
+void DrawFocusHighlight(ImDrawList* dl, ImVec2 p_min, ImVec2 p_max, float s) {
+  const float radius = 6.0f * s;
+  dl->AddRectFilled(p_min, p_max, kColSelFill, radius);
+  // Lime band: box edge -> +2*s (stroke centered at +1*s).
+  dl->AddRect(ImVec2(p_min.x - 1.0f * s, p_min.y - 1.0f * s),
+              ImVec2(p_max.x + 1.0f * s, p_max.y + 1.0f * s), kColAccent, radius + 1.0f * s, 0,
+              2.0f * s);
+  // Black outer edge: +2*s -> +6*s (stroke centered at +4*s).
+  dl->AddRect(ImVec2(p_min.x - 4.0f * s, p_min.y - 4.0f * s),
+              ImVec2(p_max.x + 4.0f * s, p_max.y + 4.0f * s), kColSelFill, radius + 4.0f * s, 0,
+              4.0f * s);
 }
 
 // Stepper chevron: a triangle in a circle.
 void DrawChevron(ImDrawList* dl, ImVec2 center, float radius, bool points_left, ImU32 circle_col,
                  ImU32 tri_col, bool filled) {
+  center = ImVec2(Snap(center.x), Snap(center.y));
   if (filled) {
     dl->AddCircleFilled(center, radius, circle_col, 24);
   } else {
     dl->AddCircle(center, radius, circle_col, 24, 1.5f);
   }
+  // Tip-anchored triangle (tip reaches further from center than the back
+  // edge). A bbox-centered variant was tried and looked worse in playtest -
+  // keep this geometry.
   float t = radius * 0.42f;
   float dir = points_left ? -1.0f : 1.0f;
   ImVec2 tip(center.x + dir * t, center.y);
@@ -447,6 +608,7 @@ void SimpleSettingsDialog::Show() {
   highlight_anim_y_ = -1.0f;
   rail_anim_y_ = -1.0f;
   prev_pad_buttons_ = 0xFFFF;  // swallow buttons already held at open
+  just_shown_ = true;          // swallow the stale cursor delta too
 }
 
 void SimpleSettingsDialog::LoadSettingsFromCvars() {
@@ -591,7 +753,12 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
   rows.clear();
   const bool pending = HasSettingsChanges();
 
+  // Section bars only SEPARATE groups - a category's first group
+  // starts directly with its rows, so a leading header is dropped.
   auto header = [&rows](const char* label) {
+    if (rows.empty()) {
+      return;
+    }
     RowSpec row;
     row.kind = RowSpec::kHeader;
     row.label = label;
@@ -600,7 +767,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
 
   switch (category) {
     case 0: {  // Video
-      header("DISPLAY");
+      header("Display");
       if (!device_list_.device_names.empty() && HasCvar(device_list_.cvar_name)) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -711,7 +878,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         rows.push_back(std::move(row));
       }
       if (HasFieldOfViewCvar()) {
-        header("GAMEPLAY");
+        header("Gameplay");
         RowSpec row;
         row.kind = RowSpec::kSlider;
         row.label = "Field of View";
@@ -735,7 +902,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       break;
     }
     case 1: {  // Controls
-      header("MOUSE & KEYBOARD");
+      header("Mouse & Keyboard");
       {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -763,7 +930,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       break;
     }
     case 2: {  // Profile
-      header("LOCAL PROFILE");
+      header("Local Profile");
       {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -810,7 +977,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       break;
     }
     case 3: {  // System
-      header("SESSION");
+      header("Session");
       {
         RowSpec row;
         row.kind = RowSpec::kAction;
@@ -990,9 +1157,33 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   ImFont* font = imgui_drawer()->ui_font() ? imgui_drawer()->ui_font() : ImGui::GetFont();
   ImFont* bold = imgui_drawer()->ui_font_semibold() ? imgui_drawer()->ui_font_semibold() : font;
+  // Coverage-thinned variants for dark text on light panels (rows, section
+  // bars, legend chips) - matches the browser's per-polarity text gamma.
+  ImFont* bold_ol = imgui_drawer()->ui_font_semibold_on_light()
+                        ? imgui_drawer()->ui_font_semibold_on_light()
+                        : bold;
 
   // Uniform scale: design metrics are authored for 1080p.
   const float s = std::clamp(io.DisplaySize.y / 1080.0f, 0.6f, 3.0f);
+
+  // Quantize font sizes so the EM (size * upm / (hhea ascent - descent) -
+  // the browser's font-size) lands on whole pixels. A fractional em renders
+  // measurably wider letter spacing than the browser reference, which snaps
+  // css font sizes to the device grid (+1.3% run width at 4K, 370px vs
+  // 365px on "Vertical Synchronisation").
+  constexpr float kEmPerSize = 2048.0f / 2478.0f;  // Inter upm / (asc - desc)
+  auto font_px = [](float size) {
+    return std::round(size * kEmPerSize) / kEmPerSize;
+  };
+
+  if (just_shown_) {
+    // Ignore the pre-open cursor position delta (opening warps/reveals the
+    // cursor): it otherwise reads as motion and steals focus from the rail
+    // to whatever row happens to sit under the cursor.
+    mouse_x_ = io.MousePos.x;
+    mouse_y_ = io.MousePos.y;
+    just_shown_ = false;
+  }
 
   // ---- Input ----
   NavIntents in = GatherInput(io);
@@ -1067,15 +1258,17 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       row.on_enum_change(value);
     }
   };
+  // Range semantics: directional stepping (dpad/arrows/chevrons)
+  // CLAMPS at the ends - the matching chevron greys out there - while
+  // activation (A/Enter/row click) cycles with wrap-around.
   auto step_row = [&](RowSpec& row, int dir) {
     if (row.kind == RowSpec::kEnum) {
       int count = static_cast<int>(row.options.size());
       if (count <= 0) {
         return;
       }
-      int value = ((enum_value(row) % count) + count) % count;
-      value = ((value + dir) % count + count) % count;
-      set_enum_value(row, value);
+      int value = std::clamp(enum_value(row), 0, count - 1);
+      set_enum_value(row, std::clamp(value + dir, 0, count - 1));
     } else if (row.kind == RowSpec::kSlider && row.value) {
       *row.value = std::clamp(*row.value + dir * row.step, row.min, row.max);
       if (row.on_value_change) {
@@ -1089,9 +1282,14 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       return;
     }
     switch (row.kind) {
-      case RowSpec::kEnum:
-        step_row(row, 1);
+      case RowSpec::kEnum: {
+        int count = static_cast<int>(row.options.size());
+        if (count > 0) {
+          int value = std::clamp(enum_value(row), 0, count - 1);
+          set_enum_value(row, (value + 1) % count);
+        }
         break;
+      }
       case RowSpec::kAction:
         if (row.action) {
           row.action();
@@ -1169,33 +1367,39 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   const bool pending = HasSettingsChanges();
 
   // ---- Layout ----
-  const float margin_x = std::max(56.0f * s, io.DisplaySize.x * 0.05f);
-  const float title_y = io.DisplaySize.y * 0.085f;
-  const float title_size = 42.0f * s;
-  const float columns_y = title_y + 74.0f * s;
-  const float rail_w = 250.0f * s;
-  const float desc_w = 330.0f * s;
-  const float col_gap = 14.0f * s;
-  const float footer_h = 96.0f * s;
-  const float content_bottom = io.DisplaySize.y - footer_h - 18.0f * s;
+  // Positional metrics are snapped to whole pixels (see Snap).
+  const float margin_x = Snap(std::max(56.0f * s, io.DisplaySize.x * 0.05f));
+  const float title_y = Snap(io.DisplaySize.y * 0.13f);
+  const float title_size = font_px(42.0f * s);
+  const float columns_y = Snap(title_y + 74.0f * s);
+  // Rail and description columns are equal-width.
+  const float rail_w = Snap(300.0f * s);
+  const float desc_w = Snap(300.0f * s);
+  const float col_gap = Snap(14.0f * s);
+  const float footer_h = Snap(96.0f * s);
+  const float content_bottom = Snap(io.DisplaySize.y - footer_h - 18.0f * s);
   float content_w = io.DisplaySize.x - 2.0f * margin_x - rail_w - desc_w - 2.0f * col_gap;
-  content_w = std::clamp(content_w, 300.0f * s, 800.0f * s);
+  content_w = Snap(std::clamp(content_w, 300.0f * s, 800.0f * s));
   // The column widths are capped, so on wide displays the block would hug the
   // left margin - center the whole menu instead.
   const float menu_total_w = rail_w + content_w + desc_w + 2.0f * col_gap;
-  const float rail_x = std::max(margin_x, (io.DisplaySize.x - menu_total_w) * 0.5f);
+  const float rail_x = Snap(std::max(margin_x, (io.DisplaySize.x - menu_total_w) * 0.5f));
   const float content_x = rail_x + rail_w + col_gap;
   const float desc_x = content_x + content_w + col_gap;
   const float menu_right = desc_x + desc_w;
 
-  const float row_h = 52.0f * s;
-  const float header_h = 36.0f * s;
-  const float row_gap = 6.0f * s;
-  const float rail_item_h = 52.0f * s;
-  const float label_size = 19.0f * s;
-  const float value_size = 19.0f * s;
-  const float header_size = 14.5f * s;
-  const float desc_size = 16.5f * s;
+  const float row_h = Snap(52.0f * s);
+  const float header_h = row_h;  // section bars match setting rows
+  // Gap is 1 design px tighter than the 6*s focus ring, so the ring slightly
+  // overlaps neighbours - it draws above them.
+  const float row_gap = Snap(5.0f * s);
+  const float rail_item_h = Snap(52.0f * s);
+  const float label_size = font_px(19.0f * s);
+  const float value_size = font_px(19.0f * s);
+  const float desc_size = font_px(18.0f * s);
+  // Description panel height - also anchors Close Game's bottom edge.
+  const float desc_panel_h =
+      Snap(std::min(content_bottom - columns_y, 320.0f * s));
 
   const ImVec2 mouse = io.MousePos;
   const bool mouse_moved =
@@ -1224,56 +1428,27 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   }
   ImDrawList* dl = ImGui::GetWindowDrawList();
 
-  // ---- Backdrop scrim: even dim plus a stronger wash behind the columns ----
-  dl->AddRectFilledMultiColor(ImVec2(0.0f, 0.0f), io.DisplaySize, IM_COL32(6, 9, 11, 150),
-                              IM_COL32(6, 9, 11, 150), IM_COL32(3, 5, 7, 215),
-                              IM_COL32(3, 5, 7, 215));
-  {
-    // Extra wash behind the menu block, fading out symmetrically at both
-    // sides so the (centered) block reads against busy game scenes.
-    const float wash_pad = 110.0f * s;
-    const ImU32 wash = IM_COL32(4, 6, 8, 140);
-    const ImU32 wash_clear = IM_COL32(4, 6, 8, 0);
-    dl->AddRectFilledMultiColor(ImVec2(rail_x - wash_pad, 0.0f),
-                                ImVec2(rail_x, io.DisplaySize.y), wash_clear, wash, wash,
-                                wash_clear);
-    dl->AddRectFilled(ImVec2(rail_x, 0.0f), ImVec2(menu_right, io.DisplaySize.y), wash);
-    dl->AddRectFilledMultiColor(ImVec2(menu_right, 0.0f),
-                                ImVec2(menu_right + wash_pad, io.DisplaySize.y), wash,
-                                wash_clear, wash_clear, wash);
-  }
+  // ---- Backdrop: uniform slightly-dark tint over the whole screen. The
+  // native renderer blurs the finished frame while the menu is open
+  // (SetSettingsMenuBlur), so the tint lands on a frosted scene.
+  dl->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize, IM_COL32(6, 9, 11, 133));
 
   // ---- Title ----
-  dl->AddRectFilled(ImVec2(rail_x, title_y + 3.0f * s),
-                    ImVec2(rail_x + 6.0f * s, title_y + title_size - 3.0f * s), kColAccent);
-  dl->AddText(bold, title_size, ImVec2(rail_x + 18.0f * s, title_y), kColText, "Settings");
-  {
-    const char* cat_name = kCategories[category_].name;
-    char crumb[64];
-    std::snprintf(crumb, sizeof(crumb), "/  %s", cat_name);
-    ImVec2 title_extent = bold->CalcTextSizeA(title_size, FLT_MAX, 0.0f, "Settings");
-    dl->AddText(font, 20.0f * s,
-                ImVec2(rail_x + 18.0f * s + title_extent.x + 16.0f * s,
-                       title_y + title_size - 26.0f * s),
-                kColTextDim, crumb);
-  }
+  dl->AddText(bold, title_size, ImVec2(Snap(rail_x), title_y), kColText, "Settings");
   if (pending) {
     const char* chip_text = "RESTART REQUIRED TO APPLY";
-    float chip_size = 14.0f * s;
+    float chip_size = font_px(14.0f * s);
     ImVec2 extent = bold->CalcTextSizeA(chip_size, FLT_MAX, 0.0f, chip_text);
     float chip_pad = 10.0f * s;
     float chip_x1 = menu_right;
-    float chip_x0 = chip_x1 - extent.x - 2.0f * chip_pad;
-    float chip_y0 = title_y + title_size * 0.5f - extent.y * 0.5f - 6.0f * s;
-    float chip_y1 = chip_y0 + extent.y + 12.0f * s;
+    float chip_x0 = Snap(chip_x1 - extent.x - 2.0f * chip_pad);
+    float chip_y0 = Snap(title_y + title_size * 0.5f - extent.y * 0.5f - 6.0f * s);
+    float chip_y1 = Snap(chip_y0 + extent.y + 12.0f * s);
     dl->AddRect(ImVec2(chip_x0, chip_y0), ImVec2(chip_x1, chip_y1), kColWarn, 0.0f, 0,
                 1.5f);
-    dl->AddText(bold, chip_size, ImVec2(chip_x0 + chip_pad, chip_y0 + 6.0f * s), kColWarn,
-                chip_text);
+    dl->AddText(bold, chip_size, ImVec2(Snap(chip_x0 + chip_pad), Snap(chip_y0 + 6.0f * s)),
+                kColWarn, chip_text);
   }
-  dl->AddRectFilled(ImVec2(rail_x, columns_y - 12.0f * s),
-                    ImVec2(menu_right, columns_y - 12.0f * s + 1.0f), kColRule);
-
   // ---- Left rail ----
   float rail_focus_target = -1.0f;
   for (int i = 0; i < category_count; ++i) {
@@ -1292,30 +1467,25 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     if (is_current && zone_ == FocusZone::kRail && rail_sel_ == i) {
       rail_focus_target = y0;
     }
-    ImU32 bg = is_current ? kColPanelHover : (hovered ? kColPanelHover : kColPanel);
-    dl->AddRectFilled(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), bg, 0.0f);
-    dl->AddRect(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), kColPanelBorder, 0.0f);
-    // Static accent bar only while focus lives in the content column; while
-    // navigating the rail the bar rides the sliding highlight below so both
-    // move at the same rate.
-    if (is_current && zone_ == FocusZone::kContent) {
-      dl->AddRectFilled(ImVec2(rail_x, y0), ImVec2(rail_x + 4.0f * s, y1), kColAccent,
-                        0.0f, ImDrawFlags_RoundCornersLeft);
+    // The rounded focus fill covers this item while rail-focused; skip the
+    // square panel underneath so its corners don't poke past the radius.
+    bool rail_focused = zone_ == FocusZone::kRail && rail_sel_ == i;
+    if (!rail_focused) {
+      ImU32 bg = is_current ? kColSelFill : (hovered ? kColRailPanelHover : kColRailPanel);
+      dl->AddRectFilled(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), bg, 0.0f);
+      dl->AddRect(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), kColRailBorder, 0.0f);
     }
   }
-  // Focused rail item: sliding white fill (with the accent bar attached to
-  // its left edge) drawn over the panels, then labels.
+  // Focused rail item: sliding black fill with the lime focus ring, drawn
+  // over the panels, then labels.
   if (rail_focus_target >= 0.0f) {
     if (rail_anim_y_ < 0.0f || std::abs(rail_anim_y_ - rail_focus_target) > 160.0f * s) {
       rail_anim_y_ = rail_focus_target;
     }
     rail_anim_y_ += (rail_focus_target - rail_anim_y_) * std::min(1.0f, io.DeltaTime * 22.0f);
-    dl->AddRectFilled(ImVec2(rail_x, rail_anim_y_),
-                      ImVec2(rail_x + rail_w, rail_anim_y_ + rail_item_h), kColSelFill,
-                      0.0f);
-    dl->AddRectFilled(ImVec2(rail_x, rail_anim_y_),
-                      ImVec2(rail_x + 4.0f * s, rail_anim_y_ + rail_item_h), kColAccent,
-                      0.0f, ImDrawFlags_RoundCornersLeft);
+    const float fill_y = Snap(rail_anim_y_);
+    DrawFocusHighlight(dl, ImVec2(rail_x, fill_y),
+                       ImVec2(rail_x + rail_w, fill_y + rail_item_h), s);
   } else {
     rail_anim_y_ = -1.0f;
   }
@@ -1324,7 +1494,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     bool is_current = category_ == i;
     bool focused = is_current && zone_ == FocusZone::kRail && rail_sel_ == i;
     ImU32 text_col = focused ? kColSelText : (is_current ? kColText : kColTextDim);
-    AddTextVCentered(dl, focused || is_current ? bold : font, label_size, rail_x + 20.0f * s,
+    AddTextVCentered(dl, bold, label_size, rail_x + 20.0f * s,
                      y0 + rail_item_h * 0.5f, text_col, kCategories[i].name);
     if (is_current && zone_ == FocusZone::kContent) {
       // Arrow hinting that focus lives in the content column.
@@ -1337,7 +1507,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   // Close Game entry: below the categories, set apart by an extra gap.
   {
-    float y0 = columns_y + category_count * (rail_item_h + row_gap) + 26.0f * s;
+    // Bottom edge aligned with the description panel's bottom.
+    float y0 = Snap(columns_y + desc_panel_h - rail_item_h);
     float y1 = y0 + rail_item_h;
     bool focused = zone_ == FocusZone::kRail && rail_sel_ == quit_rail_index;
     bool hovered = mouse_in(rail_x, y0, rail_x + rail_w, y1);
@@ -1345,14 +1516,10 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       Hide();
       close_game_();
     }
-    ImU32 bg = focused ? kColDanger : (hovered ? kColPanelHover : kColPanel);
+    ImU32 bg = focused ? kColDanger : (hovered ? kColRailPanelHover : kColRailPanel);
     dl->AddRectFilled(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), bg, 0.0f);
     dl->AddRect(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1),
-                focused ? kColDanger : kColPanelBorder, 0.0f);
-    if (!focused) {
-      dl->AddRectFilled(ImVec2(rail_x, y0), ImVec2(rail_x + 4.0f * s, y1), kColDanger,
-                        0.0f, ImDrawFlags_RoundCornersLeft);
-    }
+                focused ? kColDanger : kColRailBorder, 0.0f);
     AddTextVCentered(dl, bold, label_size, rail_x + 20.0f * s, (y0 + y1) * 0.5f,
                      focused ? IM_COL32(255, 250, 249, 255) : kColDanger, "Close Game");
   }
@@ -1389,9 +1556,13 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     }
   }
   content_scroll_ = std::clamp(content_scroll_, 0.0f, max_scroll);
+  const float scroll = Snap(content_scroll_);
 
-  dl->PushClipRect(ImVec2(content_x, columns_y - 2.0f), ImVec2(content_x + content_w + 1.0f,
-                                                               content_bottom),
+  // Clip window padded by the focus-ring extent (6*s) so the ring can sit
+  // fully OUTSIDE the focused row without being cut off at the edges.
+  const float ring_pad = 6.0f * s;
+  dl->PushClipRect(ImVec2(content_x - ring_pad, columns_y - ring_pad),
+                   ImVec2(content_x + content_w + ring_pad + 1.0f, content_bottom + ring_pad),
                    true);
 
   // Sliding selection highlight (white fill under the focused row).
@@ -1409,14 +1580,16 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   const float value_w = std::min(330.0f * s, content_w * 0.46f);
   const float chevron_r = 13.0f * s;
 
-  // Backgrounds first (so the sliding highlight can sit above them), then
-  // per-row content.
+  // Backgrounds first, then per-row content in TWO phases around the sliding
+  // highlight: non-focused content below it, the focused row's content above
+  // it - the ring overlaps neighbours (gap is 1 design px tighter than the
+  // ring) and must read as the forefront element.
   for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
     const RowSpec& row = rows[i];
     if (row.kind == RowSpec::kHeader) {
       continue;
     }
-    float y0 = columns_y + row_y[i] - content_scroll_;
+    float y0 = columns_y + Snap(row_y[i]) - scroll;
     float y1 = y0 + row_hgt[i];
     if (y1 < columns_y || y0 > content_bottom) {
       continue;
@@ -1426,49 +1599,46 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       zone_ = FocusZone::kContent;
       row_index_ = i;
     }
+    // The rounded highlight covers the focused row's panel entirely; skip it
+    // so its square corners don't poke past the radius.
+    if (content_focus && row_index_ == i) {
+      continue;
+    }
     ImU32 bg = hovered && row.enabled ? kColPanelHover : kColPanel;
     dl->AddRectFilled(ImVec2(content_x, y0), ImVec2(content_x + content_w, y1), bg, 0.0f);
     dl->AddRect(ImVec2(content_x, y0), ImVec2(content_x + content_w, y1), kColPanelBorder,
                 0.0f);
   }
-  if (content_focus && highlight_anim_y_ >= 0.0f) {
-    float y0 = columns_y + highlight_anim_y_ - content_scroll_;
-    dl->AddRectFilled(ImVec2(content_x, y0), ImVec2(content_x + content_w, y0 + row_h),
-                      kColSelFill, 0.0f);
-    dl->AddRect(ImVec2(content_x - 1.0f, y0 - 1.0f),
-                ImVec2(content_x + content_w + 1.0f, y0 + row_h + 1.0f), kColAccent, 0.0f,
-                0, 2.0f * s);
-  }
 
-  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+  auto draw_row_content = [&](int i) {
     RowSpec& row = rows[i];
-    float y0 = columns_y + row_y[i] - content_scroll_;
+    float y0 = columns_y + Snap(row_y[i]) - scroll;
     float y1 = y0 + row_hgt[i];
     if (y1 < columns_y || y0 > content_bottom) {
-      continue;
+      return;
     }
     float cy = (y0 + y1) * 0.5f;
 
     if (row.kind == RowSpec::kHeader) {
-      dl->AddText(bold, header_size, ImVec2(content_x + 2.0f * s, y0 + 8.0f * s), kColAccent,
-                  row.label);
-      ImVec2 extent = bold->CalcTextSizeA(header_size, FLT_MAX, 0.0f, row.label);
-      dl->AddRectFilled(ImVec2(content_x + extent.x + 14.0f * s, y0 + 8.0f * s + extent.y * 0.5f),
-                        ImVec2(content_x + content_w, y0 + 8.0f * s + extent.y * 0.5f + 1.0f),
-                        kColRule);
-      continue;
+      // Section header: solid accent bar spanning the content
+      // column, dark bold text, label column-aligned with the row labels.
+      dl->AddRectFilled(ImVec2(content_x, y0), ImVec2(content_x + content_w, y1), kColAccent,
+                        0.0f);
+      AddTextVCentered(dl, bold_ol, label_size, content_x + 18.0f * s, cy, kColAccentDark,
+                       row.label);
+      return;
     }
 
     const bool focused = content_focus && row_index_ == i;
     const bool hovered = mouse_in(content_x, y0, content_x + content_w, y1);
+    ImFont* row_bold = focused ? bold : bold_ol;  // polarity-matched weight
     ImU32 label_col = focused ? kColSelText
                               : (!row.enabled ? kColTextFaint
-                                              : (row.danger ? kColDanger : kColText));
-    ImU32 value_col = focused ? kColSelText : (row.enabled ? kColText : kColTextFaint);
-    ImU32 dim_col = focused ? IM_COL32(60, 70, 74, 255) : kColTextDim;
+                                              : (row.danger ? kColDanger : kColRowText));
+    ImU32 value_col = focused ? kColSelText : (row.enabled ? kColRowText : kColTextFaint);
 
     // Label.
-    AddTextVCentered(dl, font, label_size, content_x + 18.0f * s, cy, label_col, row.label);
+    AddTextVCentered(dl, row_bold, label_size, content_x + 18.0f * s, cy, label_col, row.label);
 
     // Value area on the right side of the row.
     float vx1 = content_x + content_w - 12.0f * s;
@@ -1480,26 +1650,31 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         int value = count > 0 ? std::clamp(enum_value(row), 0, count - 1) : 0;
         ImVec2 left_center(vx0 + chevron_r, cy);
         ImVec2 right_center(vx1 - chevron_r, cy);
-        bool left_hover = row.enabled &&
+        // Magenta filled stepper circles with white triangles;
+        // a circle greys out (and stops responding) at its end of the range.
+        const bool can_left = row.enabled && value > 0;
+        const bool can_right = row.enabled && value < count - 1;
+        bool left_hover = can_left &&
                           mouse_in(left_center.x - chevron_r - 4.0f, cy - chevron_r - 4.0f,
                                    left_center.x + chevron_r + 4.0f, cy + chevron_r + 4.0f);
-        bool right_hover = row.enabled &&
+        bool right_hover = can_right &&
                            mouse_in(right_center.x - chevron_r - 4.0f, cy - chevron_r - 4.0f,
                                     right_center.x + chevron_r + 4.0f, cy + chevron_r + 4.0f);
-        ImU32 chev_circle = focused ? kColAccent : IM_COL32(255, 255, 255, 36);
-        ImU32 chev_tri = focused ? kColAccentDark : kColTextDim;
+        const ImU32 chev_disabled = focused ? kColChevDisabledOnDark : kColChevDisabled;
         DrawChevron(dl, left_center, chevron_r, true,
-                    left_hover ? kColAccent : chev_circle,
-                    left_hover ? kColAccentDark : chev_tri, focused || left_hover);
+                    can_left ? (left_hover ? kColInteractHover : kColInteract)
+                             : chev_disabled,
+                    kColWhite, true);
         DrawChevron(dl, right_center, chevron_r, false,
-                    right_hover ? kColAccent : chev_circle,
-                    right_hover ? kColAccentDark : chev_tri, focused || right_hover);
+                    can_right ? (right_hover ? kColInteractHover : kColInteract)
+                              : chev_disabled,
+                    kColWhite, true);
         if (count > 0) {
           float text_max_w = (right_center.x - chevron_r) - (left_center.x + chevron_r) -
                              16.0f * s;
           std::string text =
-              TruncateToWidth(bold, value_size, text_max_w, row.options[value]);
-          AddTextCentered(dl, bold, value_size,
+              TruncateToWidth(row_bold, value_size, text_max_w, row.options[value]);
+          AddTextCentered(dl, row_bold, value_size,
                           ImVec2((left_center.x + right_center.x) * 0.5f, cy), value_col,
                           text.c_str());
         }
@@ -1509,7 +1684,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
           } else if (right_hover) {
             step_row(row, 1);
           } else if (hovered) {
-            step_row(row, 1);
+            activate_row(row);  // row-body click cycles with wrap-around
           }
         }
         break;
@@ -1520,18 +1695,17 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         float track_x1 = vx1 - number_w;
         float t = row.max > row.min ? (*row.value - row.min) / (row.max - row.min) : 0.0f;
         float knob_x = track_x0 + t * (track_x1 - track_x0);
-        ImU32 track_col = focused ? IM_COL32(0, 0, 0, 56) : IM_COL32(255, 255, 255, 40);
+        ImU32 track_col = focused ? IM_COL32(255, 255, 255, 77) : IM_COL32(0, 0, 0, 56);
         dl->AddRectFilled(ImVec2(track_x0, cy - 2.0f * s), ImVec2(track_x1, cy + 2.0f * s),
                           track_col, 0.0f);
         dl->AddRectFilled(ImVec2(track_x0, cy - 2.0f * s), ImVec2(knob_x, cy + 2.0f * s),
-                          kColAccent, 0.0f);
-        dl->AddCircleFilled(ImVec2(knob_x, cy), 8.0f * s,
-                            focused ? kColSelText : IM_COL32(240, 244, 245, 255), 24);
+                          kColInteract, 0.0f);
+        dl->AddCircleFilled(ImVec2(Snap(knob_x), Snap(cy)), 8.0f * s, kColInteract, 24);
         char value_text[32];
         std::snprintf(value_text, sizeof(value_text), row.fmt, double(*row.value));
-        ImVec2 extent = bold->CalcTextSizeA(value_size, FLT_MAX, 0.0f, value_text);
-        dl->AddText(bold, value_size, ImVec2(vx1 - extent.x, cy - extent.y * 0.5f), value_col,
-                    value_text);
+        ImVec2 extent = row_bold->CalcTextSizeA(value_size, FLT_MAX, 0.0f, value_text);
+        dl->AddText(row_bold, value_size, ImVec2(Snap(vx1 - extent.x), Snap(cy - extent.y * 0.5f)),
+                    value_col, value_text);
         // Mouse drag on the track.
         ImGui::SetCursorScreenPos(ImVec2(track_x0 - 10.0f * s, cy - 14.0f * s));
         char slider_id[48];
@@ -1560,10 +1734,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         break;
       }
       case RowSpec::kAction: {
-        const char* hint = row.enabled ? "Select" : "-";
-        ImVec2 extent = font->CalcTextSizeA(15.0f * s, FLT_MAX, 0.0f, hint);
-        dl->AddText(font, 15.0f * s, ImVec2(vx1 - extent.x, cy - extent.y * 0.5f), dim_col,
-                    hint);
+        // No right-side 'Select' / '-' hint: the footer legend covers
+        // activation, and disabled rows read from their dim label alone.
         if (clicked && hovered && row.enabled && !row_activated_this_frame) {
           activate_row(row);
           row_activated_this_frame = true;
@@ -1575,10 +1747,13 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         if (editing_this) {
           ImGui::SetCursorScreenPos(ImVec2(vx0 + 6.0f * s, cy - 14.0f * s));
           ImGui::SetNextItemWidth(vx1 - vx0 - 12.0f * s);
-          ImGui::PushFont(font, value_size);
-          ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0.12f));
+          // value_size is already physical; divide out the global widget-font
+          // DPI scale (it exists for logical-unit dialogs, see ImGuiDrawer).
+          ImGui::PushFont(font, value_size / std::max(0.01f, ImGui::GetStyle().FontScaleDpi));
+          // Edit field sits on the BLACK focused row: light text, light frame.
+          ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1, 1, 1, 0.15f));
           ImGui::PushStyleColor(ImGuiCol_Text,
-                                ImVec4(0.05f, 0.06f, 0.07f, 1.0f));
+                                ImVec4(0.98f, 0.99f, 0.99f, 1.0f));
           if (text_edit_focus_pending_) {
             ImGui::SetKeyboardFocusHere();
             text_edit_focus_pending_ = false;
@@ -1594,8 +1769,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
           ImGui::PopFont();
         } else {
           const char* text = row.text_buf && row.text_buf[0] ? row.text_buf : "-";
-          ImVec2 extent = bold->CalcTextSizeA(value_size, FLT_MAX, 0.0f, text);
-          dl->AddText(bold, value_size, ImVec2(vx1 - extent.x, cy - extent.y * 0.5f),
+          ImVec2 extent = row_bold->CalcTextSizeA(value_size, FLT_MAX, 0.0f, text);
+          dl->AddText(row_bold, value_size, ImVec2(Snap(vx1 - extent.x), Snap(cy - extent.y * 0.5f)),
                       value_col, text);
           if (clicked && hovered && row.enabled) {
             zone_ = FocusZone::kContent;
@@ -1609,6 +1784,22 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       default:
         break;
     }
+  };
+  // Phase 1: everything except the focused row.
+  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    if (!(content_focus && row_index_ == i)) {
+      draw_row_content(i);
+    }
+  }
+  // Phase 2: the sliding highlight above neighbours...
+  if (content_focus && highlight_anim_y_ >= 0.0f) {
+    float y0 = columns_y + Snap(highlight_anim_y_) - scroll;
+    DrawFocusHighlight(dl, ImVec2(content_x, y0), ImVec2(content_x + content_w, y0 + row_h),
+                       s);
+  }
+  // ...phase 3: the focused row's own content above the highlight.
+  if (content_focus && row_index_ >= 0 && row_index_ < static_cast<int>(rows.size())) {
+    draw_row_content(row_index_);
   }
   dl->PopClipRect();
 
@@ -1626,17 +1817,16 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   // ---- Description panel ----
   {
-    float panel_h = std::min(content_view_h, 320.0f * s);
-    float header_bar_h = 38.0f * s;
+    const float panel_h = desc_panel_h;
+    const float header_bar_h = row_h;  // header bar matches a settings row
     dl->AddRectFilled(ImVec2(desc_x, columns_y), ImVec2(desc_x + desc_w, columns_y + header_bar_h),
-                      kColAccent, 0.0f, ImDrawFlags_RoundCornersTop);
-    AddTextVCentered(dl, bold, 16.0f * s, desc_x + 14.0f * s, columns_y + header_bar_h * 0.5f,
+                      kColAccent, 0.0f);
+    AddTextVCentered(dl, bold_ol, label_size, desc_x + 18.0f * s, columns_y + header_bar_h * 0.5f,
                      kColAccentDark, "Description");
     dl->AddRectFilled(ImVec2(desc_x, columns_y + header_bar_h),
-                      ImVec2(desc_x + desc_w, columns_y + panel_h), kColDescPanel, 0.0f,
-                      ImDrawFlags_RoundCornersBottom);
+                      ImVec2(desc_x + desc_w, columns_y + panel_h), kColDescPanel, 0.0f);
     dl->AddRect(ImVec2(desc_x, columns_y), ImVec2(desc_x + desc_w, columns_y + panel_h),
-                kColPanelBorder, 0.0f);
+                kColRailBorder, 0.0f);
 
     const char* desc_text = kCategories[category_].desc;
     if (zone_ == FocusZone::kRail && rail_sel_ == quit_rail_index) {
@@ -1655,37 +1845,34 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         extra_text = &row.desc_extra;
       }
     }
-    float text_x = desc_x + 14.0f * s;
-    float text_y = columns_y + header_bar_h + 14.0f * s;
+    float text_x = Snap(desc_x + 14.0f * s);
+    float text_y = Snap(columns_y + header_bar_h + 14.0f * s);
     float wrap_w = desc_w - 28.0f * s;
-    dl->AddText(font, desc_size, ImVec2(text_x, text_y), kColText, desc_text, nullptr, wrap_w);
-    ImVec2 used = font->CalcTextSizeA(desc_size, FLT_MAX, wrap_w, desc_text);
-    text_y += used.y + 10.0f * s;
+    text_y = Snap(text_y +
+                  AddTextJustified(dl, font, desc_size, ImVec2(text_x, text_y), wrap_w,
+                                   kColText, desc_text) +
+                  10.0f * s);
     if (extra_text) {
-      dl->AddText(font, desc_size, ImVec2(text_x, text_y), kColTextDim, extra_text->c_str(),
-                  nullptr, wrap_w);
-      ImVec2 extra_used =
-          font->CalcTextSizeA(desc_size, FLT_MAX, wrap_w, extra_text->c_str());
-      text_y += extra_used.y + 10.0f * s;
+      text_y = Snap(text_y +
+                    AddTextJustified(dl, font, desc_size, ImVec2(text_x, text_y), wrap_w,
+                                     kColTextDim, extra_text->c_str()) +
+                    10.0f * s);
     }
     if (note_text) {
-      dl->AddText(bold, desc_size, ImVec2(text_x, text_y), kColWarn, note_text, nullptr,
-                  wrap_w);
-      ImVec2 note_used = font->CalcTextSizeA(desc_size, FLT_MAX, wrap_w, note_text);
-      text_y += note_used.y + 10.0f * s;
+      text_y = Snap(text_y +
+                    AddTextJustified(dl, bold, desc_size, ImVec2(text_x, text_y), wrap_w,
+                                     kColWarn, note_text) +
+                    10.0f * s);
     }
     if (pending) {
-      dl->AddText(font, desc_size, ImVec2(text_x, text_y), kColWarn,
-                  "Changes are applied after a restart. Use Apply & Restart when ready.",
-                  nullptr, wrap_w);
+      AddTextJustified(dl, font, desc_size, ImVec2(text_x, text_y), wrap_w, kColWarn,
+                       "Changes are applied after a restart. Use Apply & Restart when ready.");
     }
   }
 
   // ---- Footer button legend ----
   {
-    float legend_y = io.DisplaySize.y - footer_h + 14.0f * s;
-    dl->AddRectFilled(ImVec2(rail_x, legend_y - 12.0f * s),
-                      ImVec2(menu_right, legend_y - 12.0f * s + 1.0f), kColRule);
+    float legend_y = Snap(io.DisplaySize.y - footer_h + 14.0f * s);
     std::vector<LegendGlyph> glyphs;
     if (pad_active_) {
       glyphs.push_back({"A", "Select", true});
@@ -1705,29 +1892,30 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       }
     }
     float x = rail_x;
-    float glyph_size = 15.0f * s;
-    float label_text_size = 16.0f * s;
-    float chip_h = 26.0f * s;
+    float glyph_size = font_px(15.0f * s);
+    float label_text_size = font_px(16.0f * s);
+    float chip_h = Snap(26.0f * s);
     for (const LegendGlyph& glyph : glyphs) {
       ImVec2 glyph_extent = bold->CalcTextSizeA(glyph_size, FLT_MAX, 0.0f, glyph.glyph);
       float cy = legend_y + chip_h * 0.5f;
+      x = Snap(x);
       if (glyph.circle) {
         float r = chip_h * 0.5f;
-        dl->AddCircleFilled(ImVec2(x + r, cy), r, IM_COL32(232, 236, 237, 235), 28);
-        AddTextCentered(dl, bold, glyph_size, ImVec2(x + r, cy), IM_COL32(15, 18, 20, 255),
-                        glyph.glyph);
+        dl->AddCircleFilled(ImVec2(x + r, cy), r, kColLegendChip, 28);
+        AddTextCenteredCap(dl, bold_ol, glyph_size, ImVec2(x + r, cy), kColLegendText,
+                           glyph.glyph, /*ink_x=*/true);
         x += 2.0f * r + 8.0f * s;
       } else {
-        float chip_w = glyph_extent.x + 18.0f * s;
+        float chip_w = Snap(glyph_extent.x + 18.0f * s);
         dl->AddRectFilled(ImVec2(x, legend_y), ImVec2(x + chip_w, legend_y + chip_h),
-                          IM_COL32(232, 236, 237, 235), 4.0f * s);
-        AddTextCentered(dl, bold, glyph_size, ImVec2(x + chip_w * 0.5f, cy),
-                        IM_COL32(15, 18, 20, 255), glyph.glyph);
+                          kColLegendChip, 4.0f * s);
+        AddTextCenteredCap(dl, bold_ol, glyph_size, ImVec2(x + chip_w * 0.5f, cy),
+                           kColLegendText, glyph.glyph, /*ink_x=*/false);
         x += chip_w + 8.0f * s;
       }
-      ImVec2 label_extent = font->CalcTextSizeA(label_text_size, FLT_MAX, 0.0f, glyph.label);
-      dl->AddText(font, label_text_size, ImVec2(x, cy - label_extent.y * 0.5f), kColTextDim,
-                  glyph.label);
+      ImVec2 label_extent = bold->CalcTextSizeA(label_text_size, FLT_MAX, 0.0f, glyph.label);
+      dl->AddText(bold, label_text_size, ImVec2(Snap(x), Snap(cy - label_extent.y * 0.5f)),
+                  kColLegendLabel, glyph.label);
       x += label_extent.x + 26.0f * s;
     }
   }

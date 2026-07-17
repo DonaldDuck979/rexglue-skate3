@@ -125,6 +125,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   float highlight_anim_y_ = -1.0f;  // smoothed selection highlight position
   float rail_anim_y_ = -1.0f;
   float content_scroll_ = 0.0f;
+  // Swallow the first frame's cursor delta after Show: the pre-open cursor
+  // position (or a cursor-mode warp) otherwise reads as mouse motion and
+  // steals focus from the rail to whatever row it lands on.
+  bool just_shown_ = false;
   float mouse_x_ = -1.0f;        // last mouse position, to detect real motion
   float mouse_y_ = -1.0f;
 };

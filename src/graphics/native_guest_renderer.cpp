@@ -55,6 +55,9 @@ std::atomic<void*> g_renderer_user_data{nullptr};
 // True while the registered renderer actually replaced the last presented
 // frame (false when it yields: menus, early-outs, no renderer).
 std::atomic<bool> g_native_output_active{false};
+std::atomic<NativeGuestOutputPostProcessor> g_post_processor{nullptr};
+std::atomic<void*> g_post_processor_user_data{nullptr};
+std::atomic<bool> g_post_process_requested{false};
 
 }  // namespace
 
@@ -77,6 +80,33 @@ bool TryRenderNativeGuestOutput(const NativeGuestOutputRenderContext& context) {
 
 bool HasNativeGuestOutputRenderer() {
   return g_renderer.load(std::memory_order_acquire) != nullptr;
+}
+
+void SetNativeGuestOutputPostProcessor(NativeGuestOutputPostProcessor post_processor,
+                                       void* user_data) {
+  g_post_processor_user_data.store(user_data, std::memory_order_release);
+  g_post_processor.store(post_processor, std::memory_order_release);
+}
+
+bool HasNativeGuestOutputPostProcessor() {
+  return g_post_processor.load(std::memory_order_acquire) != nullptr;
+}
+
+void InvokeNativeGuestOutputPostProcessor(const NativeGuestOutputRenderContext& context) {
+  NativeGuestOutputPostProcessor post_processor =
+      g_post_processor.load(std::memory_order_acquire);
+  if (post_processor == nullptr) {
+    return;
+  }
+  post_processor(context, g_post_processor_user_data.load(std::memory_order_acquire));
+}
+
+void RequestNativeGuestOutputPostProcess(bool requested) {
+  g_post_process_requested.store(requested, std::memory_order_release);
+}
+
+bool IsNativeGuestOutputPostProcessRequested() {
+  return g_post_process_requested.load(std::memory_order_acquire);
 }
 
 bool IsNativeGuestOutputActive() {

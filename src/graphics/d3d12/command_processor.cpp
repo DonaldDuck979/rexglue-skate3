@@ -2631,6 +2631,31 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // presenter so it can submit its own commands for displaying it to the
         // queue.
         SubmitBarriers();
+
+        // Host post-processor over the emulated output (settings-menu
+        // backdrop blur): runs after the gamma/FXAA pass has fully written
+        // the image (barriers above put it in the presenter's internal
+        // state). Frames the native renderer handled returned above; it
+        // applies its own effects inline.
+        if (IsNativeGuestOutputPostProcessRequested() && HasNativeGuestOutputPostProcessor()) {
+          NativeGuestOutputRenderContext native_context;
+          native_context.backend = NativeGuestOutputBackend::kD3D12;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          if (native_rhi_device_ == nullptr) {
+            native_rhi_device_ = CreateNativeRhiDevice(this);
+          }
+          native_context.device = native_rhi_device_;
+          native_context.cmd = NativeRhiBeginFrame(
+              native_rhi_device_, guest_output_resource,
+              ui::d3d12::D3D12Presenter::kGuestOutputFormat,
+              ui::d3d12::D3D12Presenter::kGuestOutputInternalState, guest_output_width,
+              guest_output_height, &native_context.guest_output);
+          InvokeNativeGuestOutputPostProcessor(native_context);
+        }
+
         EndSubmission(true);
         return true;
       });

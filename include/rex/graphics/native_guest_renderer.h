@@ -68,4 +68,24 @@ bool ShouldSuppressPassAtPitch(uint32_t surface_pitch);
 // only suppressed scene passes (the native renderer shadows itself).
 bool ShouldSuppressExemptDepthOnlyDraws();
 
+// ---- Guest-output post-processor ------------------------------------------
+// Host effect over the EMULATED guest-output path (e.g. the settings-menu
+// backdrop blur): invoked by the command processors at the very end of the
+// emulated gamma/FXAA refresh, after the guest output image has been fully
+// written, with the same context contract as the renderer callback (the
+// image arrives in kGuestOutput state and must be returned to it). When the
+// native renderer handled the frame this is NOT invoked; the renderer
+// applies its own effects inline. Only invoked while the request flag is set
+// (a cheap gate so the common no-effect frame skips the RHI frame setup);
+// the post-processor clears the flag itself once its effect has fully
+// decayed.
+using NativeGuestOutputPostProcessor = void (*)(const NativeGuestOutputRenderContext& context,
+                                                void* user_data);
+void SetNativeGuestOutputPostProcessor(NativeGuestOutputPostProcessor post_processor,
+                                       void* user_data);
+bool HasNativeGuestOutputPostProcessor();
+void InvokeNativeGuestOutputPostProcessor(const NativeGuestOutputRenderContext& context);
+void RequestNativeGuestOutputPostProcess(bool requested);
+bool IsNativeGuestOutputPostProcessRequested();
+
 }  // namespace rex::graphics

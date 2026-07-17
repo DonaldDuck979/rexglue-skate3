@@ -29,6 +29,7 @@
 #include <rex/ui/windowed_app_context.h>
 
 #include <imgui.h>
+#include <misc/freetype/imgui_freetype.h>
 
 namespace rex {
 namespace ui {
@@ -370,10 +371,38 @@ void ImGuiDrawer::SetupFonts() {
   // loaded before them - fonts cached here would dangle.
   {
     ImFontConfig config;
+    // FreeType rasterization WITHOUT hinting: light hinting's blue-zone
+    // snapping rounded the x-height down at the menu sizes and read as
+    // vertically squished (playtest). Unhinted FreeType keeps the design
+    // proportions exactly while still rasterizing curves cleaner than stb.
+    // Advances stay fractional (browser letter spacing); the Oversample
+    // fields are ignored by the FreeType loader.
+    config.OversampleH = 1;
+    config.OversampleV = 1;
+    config.PixelSnapH = false;
+    config.RasterizerMultiply = 1.0f;
+    config.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
     ui_font_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
         GetInterRegularCompressedBase85(), 18.0f, &config);
     ui_font_semibold_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
         GetInterSemiBoldCompressedBase85(), 18.0f, &config);
+    ui_font_bold_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterBoldCompressedBase85(), 18.0f, &config);
+    // DARK-ON-LIGHT variants: naive sRGB alpha blending renders dark text on
+    // light panels measurably fatter and softer than the browser (stems 4.94
+    // vs 4.70 px, vertical edge gradient 73 vs 92) - the
+    // browser's text engine gamma-adjusts coverage per polarity. A coverage
+    // multiply < 1 approximates that for dark-on-light; light-on-dark keeps
+    // the plain 1.0 fonts above. Metrics are identical across variants.
+    ImFontConfig config_on_light = config;
+    // 1.0 = currently identical to the plain fonts: the 0.8 coverage-thinning
+    // experiment read as "lighter, not sharper" in playtest. Kept as the
+    // per-polarity tuning knob.
+    config_on_light.RasterizerMultiply = 1.0f;
+    ui_font_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterRegularCompressedBase85(), 18.0f, &config_on_light);
+    ui_font_semibold_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        GetInterSemiBoldCompressedBase85(), 18.0f, &config_on_light);
   }
   auto add_first_available = [&io](const std::vector<std::string>& paths) -> ImFont* {
     for (const std::string& path : paths) {
@@ -449,6 +478,15 @@ void ImGuiDrawer::SetupFonts() {
   }
   if (!ui_font_semibold_) {
     ui_font_semibold_ = ui_font_;
+  }
+  if (!ui_font_bold_) {
+    ui_font_bold_ = ui_font_semibold_;
+  }
+  if (!ui_font_on_light_) {
+    ui_font_on_light_ = ui_font_;
+  }
+  if (!ui_font_semibold_on_light_) {
+    ui_font_semibold_on_light_ = ui_font_semibold_;
   }
   REXLOG_INFO("imgui fonts: drawer={} atlas={} count={} ui={} uisb={}", (void*)this,
               (void*)io.Fonts, io.Fonts->Fonts.Size, (void*)ui_font_, (void*)ui_font_semibold_);
@@ -533,13 +571,21 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
 
   ImGuiIO& io = ImGui::GetIO();
 
-#if defined(__APPLE__)
-  // Retina: glyphs must rasterize at display pixel density to survive the
-  // logical->physical magnification in RenderDrawLists. Per-frame because the
-  // window can move between displays with different densities.
-  float fb_scale = float(window_->GetDpi()) / float(window_->GetMediumDpi());
-  io.DisplayFramebufferScale = ImVec2(fb_scale, fb_scale);
-#endif
+  // The UI coordinate space is PHYSICAL pixels, 1:1 with the render target -
+  // no logical->physical magnification anywhere in the UI path. Under a
+  // fractional OS scale (e.g. Windows 150%) a logical coordinate space cannot
+  // be blur-free: the GPU stretch lands half the pixel-snapped positions
+  // between physical pixels, and glyph texels can never all align. Glyphs now
+  // rasterize at their physical size directly, so density compensation
+  // (DisplayFramebufferScale, the old Retina fix) must stay 1.
+  io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+  // Widget-based dialogs (message boxes, wizards, fps overlay) author their
+  // font sizes in logical units - FontScaleDpi keeps their on-screen size
+  // across DPI scales while text rasterizes at physical resolution. Explicit
+  // ImDrawList::AddText sizes (the settings overlay) are unaffected by it.
+  // Per-frame because the window can move between monitors with different
+  // scales.
+  ImGui::GetStyle().FontScaleDpi = float(window_->GetDpi()) / float(window_->GetMediumDpi());
 
   uint64_t current_frame_time_ticks = rex::chrono::Clock::QueryHostTickCount();
   io.DeltaTime =
@@ -551,9 +597,8 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   }
   last_frame_time_ticks_ = current_frame_time_ticks;
 
-  float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
-  io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
-  io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
+  io.DisplaySize.x = float(window_->GetActualPhysicalWidth());
+  io.DisplaySize.y = float(window_->GetActualPhysicalHeight());
 
   ImGui::NewFrame();
 
@@ -859,8 +904,9 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
 
 void ImGuiDrawer::UpdateMousePosition(float x, float y) {
   auto& io = GetIO();
-  float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
-  io.AddMousePosEvent(x * physical_to_logical, y * physical_to_logical);
+  // MouseEvents already carry physical pixels (WindowPointToPhysical) - the
+  // UI coordinate space is physical too, no conversion.
+  io.AddMousePosEvent(x, y);
 }
 
 void ImGuiDrawer::SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e) {

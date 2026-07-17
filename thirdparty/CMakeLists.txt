@@ -226,6 +226,29 @@ endif()
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
 
 #=============================================================================
+# FreeType - font rasterizer for imgui (fetched on demand, all optional deps
+# disabled: pure static rasterizer). Enables hinted glyph rendering - the
+# stb_truetype loader cannot grid-fit horizontal strokes, which measurably
+# softens UI text versus browser rendering.
+#=============================================================================
+include(FetchContent)
+set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+FetchContent_Declare(freetype
+    GIT_REPOSITORY https://github.com/freetype/freetype.git
+    GIT_TAG VER-2-13-3
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(freetype)
+# Drop the version .rc: it's DLL metadata only, and rc.exe has no include
+# paths under the clang/ninja toolchain (fatal RC1015 on windows.h).
+get_target_property(_ft_sources freetype SOURCES)
+list(FILTER _ft_sources EXCLUDE REGEX "\\.rc$")
+set_property(TARGET freetype PROPERTY SOURCES ${_ft_sources})
+
+#=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)
 #=============================================================================
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")
@@ -235,11 +258,16 @@ add_library(imgui OBJECT
     ${IMGUI_DIR}/imgui_draw.cpp
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/misc/freetype/imgui_freetype.cpp
 )
 add_library(imgui::imgui ALIAS imgui)
 target_include_directories(imgui PUBLIC
     $<BUILD_INTERFACE:${IMGUI_DIR}>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+# PUBLIC: the define selects the default font loader in imgui.h-level state;
+# every TU including imgui.h must agree.
+target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_FREETYPE)
+target_link_libraries(imgui PUBLIC freetype)
 target_compile_options(imgui PRIVATE -w)
 
 #=============================================================================
