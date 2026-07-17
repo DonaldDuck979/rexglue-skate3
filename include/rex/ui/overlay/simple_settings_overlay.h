@@ -115,6 +115,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   char gamertag_buf_[32] = {};
   // Live setting values (hot cvars, applied and saved on change).
   bool renderer_native_ = true;
+  bool ssao_ = true;
   bool mode_indicator_ = true;
   bool fps_counter_ = false;
   bool audio_mute_ = false;

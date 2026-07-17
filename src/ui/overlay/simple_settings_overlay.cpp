@@ -53,11 +53,12 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 13> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 14> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
     "skate3_native_render_scene_shadow_tile",
+    "skate3_native_render_scene_ssao",
     "skate3_native_render_mode_indicator",
     "show_fps_counter",
     "monitor",
@@ -867,6 +868,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   mnk_capture_mouse_ = rex::cvar::Query<bool>("mnk_capture_mouse");
   renderer_native_ =
       HasCvar("skate3_native_render_scene") && rex::cvar::Query<bool>("skate3_native_render_scene");
+  ssao_ = HasCvar("skate3_native_render_scene_ssao") &&
+          rex::cvar::Query<bool>("skate3_native_render_scene_ssao");
   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
@@ -1203,7 +1206,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] { tearing_ = TearingDefault(); };
         rows.push_back(std::move(row));
       }
-      if (HasRendererChoice() || HasMsaaCvar() || HasShadowQualityCvars()) {
+      if (HasRendererChoice() || HasMsaaCvar() || HasShadowQualityCvars() ||
+          HasCvar("skate3_native_render_scene_ssao")) {
         header("Quality");
       }
       if (HasRendererChoice()) {
@@ -1273,6 +1277,27 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           shadow_quality_index_ = ShadowQualityIndexFrom(
               CvarDefaultBool("skate3_native_render_scene_shadows", true),
               int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 0.0)));
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_native_render_scene_ssao")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Ambient Occlusion";
+        row.desc =
+            "Soft contact shading where surfaces meet (under ledges, rails, "
+            "vehicles, the skater). Native renderer only; applies "
+            "immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &ssao_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("skate3_native_render_scene_ssao", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          ssao_ = CvarDefaultBool("skate3_native_render_scene_ssao", true);
+          SetBoolCvar("skate3_native_render_scene_ssao", ssao_);
+          SaveSimpleSettingsConfig(config_path_);
         };
         rows.push_back(std::move(row));
       }
