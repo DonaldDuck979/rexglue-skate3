@@ -156,13 +156,35 @@ bool WriteConfigFile(const std::filesystem::path& config_path, const toml::table
     }
   }
 
-  std::ofstream file(config_path);
-  if (!file) {
-    REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
+  // Write to a temporary sibling and rename it over the target so an
+  // interrupted write (crash, power loss, full disk) cannot leave a truncated
+  // config file behind.
+  std::filesystem::path temp_path = config_path;
+  temp_path += ".tmp";
+  {
+    std::ofstream file(temp_path, std::ios::trunc);
+    if (!file) {
+      REXLOG_ERROR("SaveConfig: failed to open {}", temp_path.string());
+      return false;
+    }
+    file << "# Auto-generated cvar configuration\n";
+    file << config;
+    file.flush();
+    if (!file) {
+      REXLOG_ERROR("SaveConfig: failed to write {}", temp_path.string());
+      std::error_code ec;
+      std::filesystem::remove(temp_path, ec);
+      return false;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp_path, config_path, ec);
+  if (ec) {
+    REXLOG_ERROR("SaveConfig: failed to replace {}: {}", config_path.string(), ec.message());
+    std::error_code remove_ec;
+    std::filesystem::remove(temp_path, remove_ec);
     return false;
   }
-  file << "# Auto-generated cvar configuration\n";
-  file << config;
   return true;
 }
 
@@ -656,9 +678,18 @@ void SaveConfigValues(const std::filesystem::path& config_path,
 void SaveConfigValues(const std::filesystem::path& config_path,
                       const std::vector<std::string_view>& names) {
   try {
+    // Merge into the existing file so keys saved by other callers survive. A
+    // malformed existing file must not abort the save: it would never load
+    // anyway, and rewriting it from the current cvar values is the only way
+    // persistence can recover.
     toml::table config;
     if (std::filesystem::exists(config_path)) {
-      config = toml::parse_file(config_path.string());
+      try {
+        config = toml::parse_file(config_path.string());
+      } catch (const toml::parse_error& err) {
+        REXLOG_WARN("SaveConfigValues: existing config {} is malformed ({}), rewriting it",
+                    config_path.string(), err.description());
+      }
     }
 
     {
