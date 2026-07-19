@@ -101,6 +101,19 @@ REXCVAR_DEFINE_INT32(native_render_force_resolve_readback_max_length, 0, "GPU",
     .range(0, 16 * 1024 * 1024)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(native_render_targeted_readback_min_interval_ms, 33, "GPU",
+                     "Minimum interval between the targeted always-on resolve readbacks "
+                     "(the non-gameplay Import-Skater/preview target) in milliseconds. "
+                     "Each readback is a synchronous GPU drain plus a multi-megabyte CPU "
+                     "copy; menu flows that re-resolve the preview target every frame "
+                     "(trick guide demo pages) otherwise saturate the command processor "
+                     "with hundreds of drains per second. Skipped copies leave the "
+                     "previous CPU-visible contents in place (the consumer is a preview "
+                     "image). 0 disables the throttle. Does not affect the app-armed "
+                     "photo-grab window.")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(native_render_force_resolve_readback_min_length, 0, "GPU",
                      "Lower bound companion to "
                      "native_render_force_resolve_readback_max_length: when > 0, resolves "

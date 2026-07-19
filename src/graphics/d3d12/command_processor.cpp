@@ -3616,10 +3616,30 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     constexpr uint32_t kImportSkaterPreviewResolveAddress = UINT32_C(0x04911000);
     constexpr uint32_t kImportSkaterPreviewResolveLength = UINT32_C(0x2D0000);
-    const bool force_scaled_resolve_cpu_copy =
+    bool force_scaled_resolve_cpu_copy =
         !IsGameplayStateActive(kernel_state_) && is_scaled &&
         written_address == kImportSkaterPreviewResolveAddress &&
         written_length == kImportSkaterPreviewResolveLength;
+    // Rate-limit the targeted copies: each one is a synchronous GPU drain
+    // plus a multi-megabyte CPU copy, and menu flows that re-resolve the
+    // preview target every frame (trick guide demo pages) issue hundreds
+    // per second. A skipped copy leaves the previous CPU-visible contents
+    // in place, which a preview consumer tolerates. The app-armed
+    // photo-grab window below is deliberately NOT throttled (the display
+    // card composes from exact frames). Mirrors the Vulkan gate.
+    if (force_scaled_resolve_cpu_copy) {
+      const int32_t min_interval_ms =
+          REXCVAR_GET(native_render_targeted_readback_min_interval_ms);
+      if (min_interval_ms > 0) {
+        static uint64_t s_last_targeted_copy_ms = 0;
+        const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+        if (now_ms - s_last_targeted_copy_ms < uint64_t(min_interval_ms)) {
+          force_scaled_resolve_cpu_copy = false;
+        } else {
+          s_last_targeted_copy_ms = now_ms;
+        }
+      }
+    }
     // App-armed readback window (Skate 3 photo grab): the game CPU-reads the
     // resolved 1152x640 PostFX screenshot target (also 0x04911000) while the
     // gameplay presence context is still 1 (photo missions), so the targeted
