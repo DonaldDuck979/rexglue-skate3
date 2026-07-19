@@ -85,12 +85,23 @@ ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem:
 
 ContentManager::~ContentManager() = default;
 
+void ContentManager::SetContentTypeRoot(XContentType content_type, std::filesystem::path root) {
+  content_type_roots_[uint32_t(content_type)] = std::move(root);
+}
+
 std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                                          uint32_t title_id) {
   if (title_id == kCurrentlyRunningTitleId) {
     title_id = kernel_state_->title_id();
   }
   auto xuid_str = fmt::format("{:016X}", xuid);
+
+  // Overridden types use a flattened single-title layout: root/xuid/
+  auto override_it = content_type_roots_.find(uint32_t(content_type));
+  if (override_it != content_type_roots_.end()) {
+    return override_it->second / xuid_str;
+  }
+
   auto title_id_str = fmt::format("{:08X}", title_id);
   auto content_type_str = fmt::format("{:08X}", uint32_t(content_type));
 
@@ -126,9 +137,16 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
   }
 
   auto xuid_str = fmt::format("{:016X}", xuid);
+  std::string final_name = std::string(file_name) + ".header";
+
+  // Overridden types keep headers beside their data: root/xuid/Headers/
+  auto override_it = content_type_roots_.find(uint32_t(content_type));
+  if (override_it != content_type_roots_.end()) {
+    return override_it->second / xuid_str / kGameContentHeaderDirName / final_name;
+  }
+
   auto title_id_str = fmt::format("{:08X}", title_id);
   auto content_type_str = fmt::format("{:08X}", uint32_t(content_type));
-  std::string final_name = std::string(file_name) + ".header";
 
   // Header root path:
   // content_root/xuid/title_id/Headers/content_type/filename.header

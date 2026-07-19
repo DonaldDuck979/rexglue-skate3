@@ -183,6 +183,14 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
+  // Redirects all content of `content_type` to `root` with a flattened
+  // single-title layout instead of the shared content tree:
+  //   root/{xuid}/{package}/                data
+  //   root/{xuid}/Headers/{package}.header  enumeration header
+  // The xuid level is kept so per-profile content stays isolated. Set before
+  // the title enumerates or opens content of this type; no data is migrated.
+  void SetContentTypeRoot(XContentType content_type, std::filesystem::path root);
+
  private:
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
@@ -199,6 +207,9 @@ class ContentManager {
 
   KernelState* kernel_state_;
   std::filesystem::path root_path_;
+  // Per-content-type root overrides (SetContentTypeRoot), keyed by the raw
+  // XContentType value.
+  std::unordered_map<uint32_t, std::filesystem::path> content_type_roots_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;
