@@ -85,7 +85,7 @@ endif()
 
 # Enforce x64 architecture
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "ReXGlue only supports 64‑bit architectures (x86_64 or ARM64)")
+    message(FATAL_ERROR "ReXGlue only supports 64-bit architectures (x86_64 or ARM64)")
 endif()
 
 # Set C++23 standard
