@@ -197,7 +197,12 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   const std::string search(search_buf_);
   const bool searching = !search.empty();
 
-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
+  // The dialog's fixed metrics were authored against ImGui's 13 px default
+  // font; the drawer bakes fonts at the display scale, so every metric
+  // (default window size, panel widths, widget widths) follows the live
+  // font size or the dialog opens tiny on scaled displays.
+  const float ui_s = ImGui::GetFontSize() / 13.0f;
+  ImGui::SetNextWindowSize(ImVec2(620.0f * ui_s, 480.0f * ui_s), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.85f);
   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
     ImGui::End();
@@ -212,8 +217,8 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   ImGui::Separator();
 
-  const float panel_width = 160.0f;
-  ImGui::BeginChild("##cats", ImVec2(panel_width, -30.0f), true);
+  const float panel_width = 160.0f * ui_s;
+  ImGui::BeginChild("##cats", ImVec2(panel_width, -30.0f * ui_s), true);
 
   // Recursive lambda to draw the category tree.
   std::function<void(const std::map<std::string, CatNode>&, int)> draw_tree;
@@ -287,7 +292,12 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
            (cat.size() > 15 && cat.compare(0, 15, "Input/Keybinds/") == 0);
   };
 
-  ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
+  ImGui::BeginChild("##cvars", ImVec2(0, -30.0f * ui_s), false);
+  // Value column anchor: a fixed offset both sat under long cvar names and
+  // stayed put when the window was resized. Anchor at 55% of the list width
+  // (never under the 260 design px the short labels need) so widening the
+  // window moves the widgets and grows the label space with it.
+  const float value_col = std::max(260.0f * ui_s, ImGui::GetWindowWidth() * 0.55f);
   for (auto& entry : registry) {
     // Filter by category (unless searching).
     if (!searching) {
@@ -332,12 +342,12 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
       // Show description as label (e.g. "A button"), not the raw CVAR name
       ImGui::Text("%-20s", entry.description.c_str());
-      ImGui::SameLine(240.0f);
+      ImGui::SameLine(value_col);
 
       bool is_capturing = (capturing_bind_name_ == entry.name);
 
       if (is_capturing) {
-        ImGui::Button("Press any key...##v", ImVec2(140.0f, 0));
+        ImGui::Button("Press any key...##v", ImVec2(140.0f * ui_s, 0));
 
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
           capturing_bind_name_.clear();
@@ -426,9 +436,10 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           ImGui::SetTooltip("[%s]", lifecycle_label);
         }
       }
-      ImGui::SameLine(240.0f);
+      ImGui::SameLine(value_col);
 
-      ImGui::SetNextItemWidth(160.0f);
+      // Fill the remaining row width (checkboxes keep their natural size).
+      ImGui::SetNextItemWidth(-12.0f * ui_s);
       if (entry.type == rex::cvar::FlagType::Boolean) {
         bool v = (current_val == "true");
         if (ImGui::Checkbox("##v", &v)) {
