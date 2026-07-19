@@ -119,8 +119,9 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool renderer_native_ = true;
   bool ssao_ = true;
   bool static_shadows_ = true;
-  float static_shadow_strength_ = 1.0f;
   bool shadow_pcss_ = true;
+  bool bloom_ = true;
+  bool volumetrics_ = true;
   int draw_distance_index_ = 1;
   int stream_probe_index_ = 0;
   bool mode_indicator_ = true;

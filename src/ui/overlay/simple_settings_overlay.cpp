@@ -53,16 +53,18 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 18> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 20> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
     "skate3_native_render_scene_shadow_tile",
     "skate3_native_render_scene_shadow_static_casters",
-    "skate3_native_render_scene_shadow_static_strength",
     "skate3_native_render_scene_shadow_static_size",
     "skate3_native_render_scene_shadow_pcss",
     "skate3_native_render_scene_ssao",
+    "skate3_native_render_scene_bloom",
+    "skate3_native_render_scene_shafts",
+    "skate3_native_render_scene_haze",
     "skate3_native_render_mode_indicator",
     "show_fps_counter",
     "monitor",
@@ -1013,14 +1015,16 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   static_shadows_ =
       HasCvar("skate3_native_render_scene_shadow_static_casters") &&
       rex::cvar::Query<bool>("skate3_native_render_scene_shadow_static_casters");
-  static_shadow_strength_ =
-      HasCvar("skate3_native_render_scene_shadow_static_strength")
-          ? float(std::clamp(rex::cvar::Query<double>(
-                                 "skate3_native_render_scene_shadow_static_strength"),
-                             0.0, 1.0))
-          : 1.0f;
   shadow_pcss_ = HasCvar("skate3_native_render_scene_shadow_pcss") &&
                  rex::cvar::Query<bool>("skate3_native_render_scene_shadow_pcss");
+  bloom_ = HasCvar("skate3_native_render_scene_bloom") &&
+           rex::cvar::Query<bool>("skate3_native_render_scene_bloom");
+  // The volumetric row drives the shafts + haze pair; either one on shows
+  // as On so toggling Off always disables both.
+  volumetrics_ = (HasCvar("skate3_native_render_scene_shafts") &&
+                  rex::cvar::Query<bool>("skate3_native_render_scene_shafts")) ||
+                 (HasCvar("skate3_native_render_scene_haze") &&
+                  rex::cvar::Query<bool>("skate3_native_render_scene_haze"));
   draw_distance_index_ = DrawDistanceIndexFromCvar();
   stream_probe_index_ = StreamProbeIndexFromCvar();
   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
@@ -1419,7 +1423,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       if (HasRendererChoice() || HasMsaaCvar() || HasShadowQualityCvars() ||
           HasCvar("skate3_native_render_scene_ssao") || HasDrawDistanceCvars()) {
-        header("Quality");
+        header("Graphics");
       }
       if (HasRendererChoice()) {
         RowSpec row;
@@ -1535,36 +1539,6 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasCvar("skate3_native_render_scene_shadow_static_strength")) {
-        RowSpec row;
-        row.kind = RowSpec::kSlider;
-        row.label = "Enhanced Shadow Strength";
-        row.desc =
-            "How dark the enhanced shadows get (1 matches the game's dynamic "
-            "shadows). Lower values blend them with the baked lighting where "
-            "the two disagree. Applies immediately.";
-        row.value = &static_shadow_strength_;
-        row.min = 0.0f;
-        row.max = 1.0f;
-        row.step = 0.05f;
-        row.fmt = "%.2f";
-        row.on_value_change = [this] {
-          static_shadow_strength_ =
-              std::clamp(static_shadow_strength_, 0.0f, 1.0f);
-          rex::cvar::SetFlagByName(
-              "skate3_native_render_scene_shadow_static_strength",
-              std::to_string(static_shadow_strength_));
-        };
-        row.reset = [this] {
-          static_shadow_strength_ = float(CvarDefaultDouble(
-              "skate3_native_render_scene_shadow_static_strength", 1.0));
-          rex::cvar::SetFlagByName(
-              "skate3_native_render_scene_shadow_static_strength",
-              std::to_string(static_shadow_strength_));
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        rows.push_back(std::move(row));
-      }
       if (HasCvar("skate3_native_render_scene_shadow_pcss")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -1605,6 +1579,61 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] {
           ssao_ = CvarDefaultBool("skate3_native_render_scene_ssao", true);
           SetBoolCvar("skate3_native_render_scene_ssao", ssao_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_native_render_scene_bloom")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Bloom";
+        row.desc =
+            "Glow around bright light sources (lamps, neon, the sun and "
+            "sky glare), driven by real scene brightness. Most visible at "
+            "night. Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &bloom_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("skate3_native_render_scene_bloom", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          bloom_ = CvarDefaultBool("skate3_native_render_scene_bloom", true);
+          SetBoolCvar("skate3_native_render_scene_bloom", bloom_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_native_render_scene_shafts") ||
+          HasCvar("skate3_native_render_scene_haze")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Volumetric Lighting";
+        row.desc =
+            "Sun shafts through buildings and trees plus directional "
+            "atmospheric haze, both following the time of day. Costs a "
+            "little performance. Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &volumetrics_;
+        row.on_enum_change = [this](int value) {
+          if (HasCvar("skate3_native_render_scene_shafts")) {
+            SetBoolCvar("skate3_native_render_scene_shafts", value != 0);
+          }
+          if (HasCvar("skate3_native_render_scene_haze")) {
+            SetBoolCvar("skate3_native_render_scene_haze", value != 0);
+          }
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          volumetrics_ =
+              CvarDefaultBool("skate3_native_render_scene_shafts", true) ||
+              CvarDefaultBool("skate3_native_render_scene_haze", true);
+          if (HasCvar("skate3_native_render_scene_shafts")) {
+            SetBoolCvar("skate3_native_render_scene_shafts", volumetrics_);
+          }
+          if (HasCvar("skate3_native_render_scene_haze")) {
+            SetBoolCvar("skate3_native_render_scene_haze", volumetrics_);
+          }
           SaveSimpleSettingsConfig(config_path_);
         };
         rows.push_back(std::move(row));
