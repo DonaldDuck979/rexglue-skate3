@@ -131,6 +131,15 @@ constexpr std::array<CategoryInfo, 5> kCategories = {{
 constexpr float kRepeatDelay = 0.42f;
 constexpr float kRepeatRate = 0.11f;
 
+// Menu-only scale on top of the viewport scale: the rail/content/description
+// columns and title shrink together while the footer legend stays at the
+// base size.
+constexpr float kMenuScale = 0.92f;
+
+// The content view never grows past the classic 12 row slots, so the smaller
+// menu buys breathing room rather than extra rows.
+constexpr int kMaxViewRows = 12;
+
 // ---- Palette -------------------------------------------------------------
 // Frosted-panel color scheme (iterated against
 // real gameplay captures): teal frosted side panels with white text over the
@@ -1786,8 +1795,11 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   }
   const float frame_bottom = frame_pos.y + frame_size.y;
 
-  // Uniform scale: design metrics are authored for 1080p.
-  const float s = std::clamp(frame_size.y / 1080.0f, 0.6f, 3.0f);
+  // Uniform scale: design metrics are authored for 1080p. The menu proper
+  // renders at a slightly reduced scale; the footer legend
+  // keeps the base viewport scale.
+  const float base_s = std::clamp(frame_size.y / 1080.0f, 0.6f, 3.0f);
+  const float s = base_s * kMenuScale;
 
   // Quantize font sizes so the EM (size * upm / (hhea ascent - descent) -
   // the browser's font-size) lands on whole pixels. A fractional em renders
@@ -2007,7 +2019,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   const float rail_w = Snap(300.0f * s);
   const float desc_w = Snap(300.0f * s);
   const float col_gap = Snap(14.0f * s);
-  const float footer_h = Snap(96.0f * s);
+  const float footer_h = Snap(96.0f * base_s);
   const float content_bottom = Snap(frame_bottom - footer_h - 18.0f * s);
   float content_w = frame_size.x - 2.0f * margin_x - rail_w - desc_w - 2.0f * col_gap;
   content_w = Snap(std::clamp(content_w, 300.0f * s, 800.0f * s));
@@ -2037,8 +2049,9 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // (title at 13% of the frame) so the slot count keeps its tuned value...
   const float row_pitch = row_h + row_gap;
   const float columns_y_flow = Snap(Snap(frame_pos.y + frame_size.y * 0.13f) + 74.0f * s);
-  const int view_rows = std::max(
-      1, static_cast<int>((content_bottom - columns_y_flow + row_gap) / row_pitch) - 1);
+  const int view_rows = std::clamp(
+      static_cast<int>((content_bottom - columns_y_flow + row_gap) / row_pitch) - 1, 1,
+      kMaxViewRows);
   const float content_view_h = view_rows * row_pitch - row_gap;
   // ...but the block itself is re-anchored so those slots sit vertically
   // CENTERED in the frame (the flow layout read visibly low). The title rides
@@ -2602,9 +2615,10 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     }
   }
 
-  // ---- Footer button legend ----
+  // ---- Footer button legend (base viewport scale, not the menu scale) ----
   {
-    float legend_y = Snap(frame_bottom - footer_h + 14.0f * s);
+    const float fs = base_s;
+    float legend_y = Snap(frame_bottom - footer_h + 14.0f * fs);
     std::vector<LegendGlyph> glyphs;
     if (pad_active_) {
       glyphs.push_back({"A", "Select", true});
@@ -2624,9 +2638,9 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       }
     }
     float x = rail_x;
-    float glyph_size = font_px(15.0f * s);
-    float label_text_size = font_px(16.0f * s);
-    float chip_h = Snap(26.0f * s);
+    float glyph_size = font_px(15.0f * fs);
+    float label_text_size = font_px(16.0f * fs);
+    float chip_h = Snap(26.0f * fs);
     for (const LegendGlyph& glyph : glyphs) {
       ImVec2 glyph_extent = bold->CalcTextSizeA(glyph_size, FLT_MAX, 0.0f, glyph.glyph);
       float cy = legend_y + chip_h * 0.5f;
@@ -2636,21 +2650,21 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         dl->AddCircleFilled(ImVec2(x + r, cy), r, kColLegendChip, 28);
         AddTextCenteredCap(dl, bold_ol, glyph_size, ImVec2(x + r, cy), kColLegendText,
                            glyph.glyph, /*ink_x=*/true);
-        x += 2.0f * r + 8.0f * s;
+        x += 2.0f * r + 8.0f * fs;
       } else {
-        float chip_w = Snap(glyph_extent.x + 18.0f * s);
+        float chip_w = Snap(glyph_extent.x + 18.0f * fs);
         // Hard straight edges + AA corners, like the browser's border-radius
         // (rounded AddRectFilled feathers every edge 1px).
         DrawHardRoundedFill(dl, ImVec2(x, legend_y), ImVec2(x + chip_w, legend_y + chip_h),
-                            4.0f * s, kColLegendChip);
+                            4.0f * fs, kColLegendChip);
         AddTextCenteredCap(dl, bold_ol, glyph_size, ImVec2(x + chip_w * 0.5f, cy),
                            kColLegendText, glyph.glyph, /*ink_x=*/false);
-        x += chip_w + 8.0f * s;
+        x += chip_w + 8.0f * fs;
       }
       ImVec2 label_extent = bold->CalcTextSizeA(label_text_size, FLT_MAX, 0.0f, glyph.label);
       dl->AddText(bold, label_text_size, ImVec2(Snap(x), Snap(cy - label_extent.y * 0.5f)),
                   kColLegendLabel, glyph.label);
-      x += label_extent.x + 26.0f * s;
+      x += label_extent.x + 26.0f * fs;
     }
   }
 
