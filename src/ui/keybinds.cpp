@@ -163,6 +163,49 @@ std::string VirtualKeyToString(VirtualKey vk) {
   return {};
 }
 
+/* ---- Chord parsing ---- */
+
+/* A key spec is either a single key name ("Home", "F3") or a chord of
+   modifier names joined to a final key with '+' ("Ctrl+Shift+B",
+   "Alt+NumpadPlus"). The last token is always the main key; every earlier
+   token must be a modifier name (Ctrl/Control, Shift, Alt, Super/Win). */
+struct KeyChord {
+  VirtualKey key = VirtualKey::kNone;
+  bool shift = false;
+  bool ctrl = false;
+  bool alt = false;
+  bool super_key = false;
+  bool has_modifiers() const { return shift || ctrl || alt || super_key; }
+};
+
+static KeyChord ParseKeyChord(std::string_view spec) {
+  KeyChord chord;
+  size_t pos = 0;
+  while (true) {
+    const size_t plus = spec.find('+', pos);
+    if (plus == std::string_view::npos) {
+      chord.key = ParseVirtualKey(spec.substr(pos));
+      return chord;
+    }
+    const std::string_view token = spec.substr(pos, plus - pos);
+    if (token == "Ctrl" || token == "Control") {
+      chord.ctrl = true;
+    } else if (token == "Shift") {
+      chord.shift = true;
+    } else if (token == "Alt") {
+      chord.alt = true;
+    } else if (token == "Super" || token == "Win") {
+      chord.super_key = true;
+    } else {
+      /* Unknown modifier name: treat the whole spec as invalid rather than
+         silently binding the trailing key. */
+      chord.key = VirtualKey::kNone;
+      return chord;
+    }
+    pos = plus + 1;
+  }
+}
+
 /* ---- Bind registry ---- */
 
 struct BindEntry {
@@ -219,12 +262,22 @@ bool ProcessKeyEvent(KeyEvent& e) {
   for (auto& entry : g_binds) {
     if (!entry.callback)
       continue;
-    VirtualKey vk = ParseVirtualKey(entry.current_key);
-    if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
-      entry.callback();
-      e.set_handled(true);
-      return true;
+    const KeyChord chord = ParseKeyChord(entry.current_key);
+    if (chord.key == VirtualKey::kNone || e.virtual_key() != chord.key)
+      continue;
+    /* Chord binds require the exact modifier set. Plain binds keep firing
+       regardless of held modifiers, so a bind like "End" still works while
+       Shift/Ctrl are held for another purpose. */
+    if (chord.has_modifiers() &&
+        (e.is_shift_pressed() != chord.shift ||
+         e.is_ctrl_pressed() != chord.ctrl ||
+         e.is_alt_pressed() != chord.alt ||
+         e.is_super_pressed() != chord.super_key)) {
+      continue;
     }
+    entry.callback();
+    e.set_handled(true);
+    return true;
   }
   return false;
 }

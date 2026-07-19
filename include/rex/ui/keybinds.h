@@ -57,7 +57,9 @@ std::string VirtualKeyToString(VirtualKey vk);
  * binding is visible in the settings overlay and persisted to config.
  *
  * @param name         CVAR name for this bind (e.g. "bind_console").
- * @param default_key  Default key name (e.g. "Backtick", "F3").
+ * @param default_key  Default key spec: a key name (e.g. "Backtick", "F3")
+ *                     or a modifier chord "Mod+...+Key" (e.g. "Ctrl+Shift+B";
+ *                     modifiers are Ctrl/Control, Shift, Alt, Super/Win).
  * @param description  Human-readable description for the settings UI.
  * @param callback     Function to invoke when the bound key is pressed.
  */
@@ -73,9 +75,11 @@ void UnregisterBind(std::string_view name);
 /**
  * Process a key-down event against all registered binds.
  *
- * Looks up each bind's current key from its CVAR, parses it, and compares
- * against the event's virtual key. If a match is found, the bind's callback
- * is invoked and the event is marked as handled.
+ * Looks up each bind's current key spec from its CVAR, parses it, and
+ * compares against the event's virtual key. Chord specs ("Ctrl+Shift+B")
+ * additionally require the event's modifier state to match exactly; plain
+ * single-key specs fire regardless of held modifiers. If a match is found,
+ * the bind's callback is invoked and the event is marked as handled.
  *
  * @param e  The key event to process.
  * @return   True if a bind matched and the event was consumed.
