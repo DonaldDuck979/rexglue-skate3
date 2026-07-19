@@ -28,6 +28,7 @@
 #include <rex/logging.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/ui/presenter.h>
+#include <rex/ui/window.h>
 #include <toml++/toml.hpp>
 
 namespace rex::ui {
@@ -37,11 +38,10 @@ constexpr std::array<int32_t, 3> kResolutionScales = {1, 2, 3};
 constexpr std::array<const char*, 3> kResolutionLabels = {"720p (1x)", "1440p (2x)",
                                                           "2160p (3x)"};
 constexpr std::array<const char*, 2> kAspectRatioLabels = {"16:9", "21:9 (Experimental)"};
-constexpr std::array<double, 7> kFrameCapRates = {60.0,  90.0,  120.0, 140.0,
-                                                  144.0, 165.0, 240.0};
-constexpr std::array<const char*, 8> kFrameCapLabels = {"Unlimited", "60 FPS",  "90 FPS",
-                                                        "120 FPS",   "140 FPS", "144 FPS",
-                                                        "165 FPS",   "240 FPS"};
+constexpr std::array<double, 6> kFrameCapRates = {60.0, 90.0, 120.0, 144.0, 165.0, 240.0};
+constexpr std::array<const char*, 7> kFrameCapLabels = {"Unlimited", "60 FPS",  "90 FPS",
+                                                        "120 FPS",   "144 FPS", "165 FPS",
+                                                        "240 FPS"};
 constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
     "resolution_scale",
     "draw_resolution_scale_x",
@@ -209,6 +209,9 @@ std::vector<std::string_view> GetSimpleSettingsCvars() {
   if (HasCvar("skate3_guest_fps_cap")) {
     cvars.push_back("skate3_guest_fps_cap");
   }
+  if (HasCvar("skate3_guest_fps_cap_auto")) {
+    cvars.push_back("skate3_guest_fps_cap_auto");
+  }
   if (HasCvar("d3d12_present_frame_limiter")) {
     cvars.push_back("d3d12_present_frame_limiter");
   }
@@ -282,16 +285,30 @@ bool HasFrameCapControl() {
   return UseGuestFrameCap() || HasHostFrameCapCvars();
 }
 
+// The refresh-derived automatic cap rides the guest pacer only (the host
+// present limiter has no auto mode). Option-list order: [Auto,] <rates...>,
+// Unlimited.
+bool FrameCapHasAuto() {
+  return UseGuestFrameCap() && HasCvar("skate3_guest_fps_cap_auto");
+}
+
+int FrameCapRateBaseIndex() { return FrameCapHasAuto() ? 1 : 0; }
+
+int FrameCapUnlimitedIndex() {
+  return FrameCapRateBaseIndex() + static_cast<int>(kFrameCapRates.size());
+}
+
 int FrameCapIndexFromRate(double rate) {
   if (rate < 1.0) {
-    return 0;
+    return FrameCapUnlimitedIndex();
   }
-  int best = 1;
+  const int base = FrameCapRateBaseIndex();
+  int best = base;
   double best_delta = 1000.0;
   for (int i = 0; i < static_cast<int>(kFrameCapRates.size()); ++i) {
     double delta = std::abs(kFrameCapRates[i] - rate);
     if (delta < best_delta) {
-      best = i + 1;
+      best = base + i;
       best_delta = delta;
     }
   }
@@ -299,6 +316,9 @@ int FrameCapIndexFromRate(double rate) {
 }
 
 int FrameCapIndexFromCvar() {
+  if (FrameCapHasAuto() && rex::cvar::Query<bool>("skate3_guest_fps_cap_auto")) {
+    return 0;
+  }
   double current = 0.0;
   if (UseGuestFrameCap()) {
     current = rex::cvar::Query<double>("skate3_guest_fps_cap");
@@ -961,8 +981,7 @@ void SimpleSettingsDialog::ReloadProfiles() {
 void SimpleSettingsDialog::SaveVideo() {
   resolution_scale_index_ =
       std::clamp(resolution_scale_index_, 0, static_cast<int>(kResolutionScales.size()) - 1);
-  frame_cap_index_ =
-      std::clamp(frame_cap_index_, 0, static_cast<int>(kFrameCapLabels.size()) - 1);
+  frame_cap_index_ = std::clamp(frame_cap_index_, 0, FrameCapUnlimitedIndex());
   aspect_ratio_index_ =
       std::clamp(aspect_ratio_index_, 0, static_cast<int>(kAspectRatioLabels.size()) - 1);
   field_of_view_ = std::clamp(field_of_view_, 40.0f, 120.0f);
@@ -981,7 +1000,16 @@ void SimpleSettingsDialog::SaveVideo() {
   rex::cvar::SetFlagByName("draw_resolution_scale_x", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_y", scale);
   if (UseGuestFrameCap()) {
-    const double cap_fps = frame_cap_index_ != 0 ? kFrameCapRates[frame_cap_index_ - 1] : 0.0;
+    const int rate_base = FrameCapRateBaseIndex();
+    if (FrameCapHasAuto()) {
+      // Auto rides its own flag; the pacer derives the rate from the display
+      // refresh live (window moves between monitors keep working).
+      SetBoolCvar("skate3_guest_fps_cap_auto", frame_cap_index_ == 0);
+    }
+    const double cap_fps =
+        frame_cap_index_ >= rate_base && frame_cap_index_ < FrameCapUnlimitedIndex()
+            ? kFrameCapRates[frame_cap_index_ - rate_base]
+            : 0.0;
     rex::cvar::SetFlagByName("skate3_guest_fps_cap", std::to_string(cap_fps));
     // Never run both pacers: the host limiter waits on the paint thread
     // without backpressuring the guest, so presents drop frames on an
@@ -990,10 +1018,12 @@ void SimpleSettingsDialog::SaveVideo() {
       SetBoolCvar("d3d12_present_frame_limiter", false);
     }
   } else if (HasHostFrameCapCvars()) {
-    SetBoolCvar("d3d12_present_frame_limiter", frame_cap_index_ != 0);
-    if (frame_cap_index_ != 0) {
-      rex::cvar::SetFlagByName("d3d12_present_frame_limiter_fps",
-                               std::to_string(kFrameCapRates[frame_cap_index_ - 1]));
+    const bool capped = frame_cap_index_ < FrameCapUnlimitedIndex();
+    SetBoolCvar("d3d12_present_frame_limiter", capped);
+    if (capped) {
+      rex::cvar::SetFlagByName(
+          "d3d12_present_frame_limiter_fps",
+          std::to_string(kFrameCapRates[frame_cap_index_ - FrameCapRateBaseIndex()]));
     }
   }
   SetBoolCvar("fullscreen", fullscreen_);
@@ -1135,12 +1165,27 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.label = "Framerate Cap";
         row.desc =
             "Limit how fast the game runs. A steady cap slightly below your display's "
-            "refresh rate gives the smoothest pacing on variable-refresh displays.";
-        for (const char* label : kFrameCapLabels) {
-          row.options.push_back(label);
+            "refresh rate gives the smoothest pacing on variable-refresh displays; "
+            "Auto tracks the current display and does exactly that. Frames above the "
+            "refresh rate cannot be shown and only make steady motion judder.";
+        if (FrameCapHasAuto()) {
+          const float hz = rex::ui::Window::CachedDisplayRefreshHz();
+          row.options.push_back(
+              hz >= 30.0f
+                  ? "Auto (" + std::to_string(int(hz) - 4) + " FPS)"
+                  : std::string("Auto"));
         }
+        for (size_t i = 1; i < kFrameCapLabels.size(); ++i) {
+          row.options.push_back(kFrameCapLabels[i]);
+        }
+        row.options.push_back(kFrameCapLabels[0]);
         row.index = &frame_cap_index_;
         row.reset = [this] {
+          if (FrameCapHasAuto() &&
+              CvarDefaultBool("skate3_guest_fps_cap_auto", false)) {
+            frame_cap_index_ = 0;
+            return;
+          }
           double rate = 0.0;
           if (UseGuestFrameCap()) {
             rate = CvarDefaultDouble("skate3_guest_fps_cap", 0.0);
@@ -2062,9 +2107,17 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       std::min(frame_pos.y + 98.0f * s, columns_y_flow), content_bottom - content_view_h));
   const float title_y = Snap(columns_y - 74.0f * s);
   const float content_view_bottom = columns_y + content_view_h;
-  // Description panel height - also anchors Close Game's bottom edge.
-  const float desc_panel_h =
-      Snap(std::min(content_bottom - columns_y, 320.0f * s));
+  // Description panel height - also anchors Close Game's bottom edge. When
+  // the category rail is long enough to push Close Game below the panel's
+  // tuned 320*s height, the panel stretches so its bottom stays level with
+  // the button's (the two columns read as one aligned baseline).
+  const float rail_close_bottom =
+      Snap(columns_y + category_count * (rail_item_h + row_gap) - row_gap +
+           45.0f * s) +
+      rail_item_h;
+  const float desc_panel_h = Snap(std::min(
+      content_bottom - columns_y,
+      std::max(320.0f * s, rail_close_bottom - columns_y)));
 
   const ImVec2 mouse = io.MousePos;
   const bool mouse_moved =
