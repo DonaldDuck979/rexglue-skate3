@@ -1,6 +1,7 @@
 #include <rex/graphics/native_guest_renderer.h>
 
 #include <atomic>
+#include <string>
 
 #include <rex/cvar.h>
 
@@ -146,3 +147,22 @@ bool ShouldSuppressPassAtPitch(uint32_t surface_pitch) {
 }
 
 }  // namespace rex::graphics
+
+namespace rex::graphics::nrhi {
+namespace {
+
+// Set once during app startup before any CreateShader (see native_rhi.h);
+// lives in this shared TU so every backend reads the same value.
+std::string g_shader_bytecode_cache_dir;
+
+}  // namespace
+
+void SetShaderBytecodeCacheDirectory(const char* path) {
+  g_shader_bytecode_cache_dir = path != nullptr ? path : "";
+}
+
+const char* GetShaderBytecodeCacheDirectory() {
+  return g_shader_bytecode_cache_dir.c_str();
+}
+
+}  // namespace rex::graphics::nrhi

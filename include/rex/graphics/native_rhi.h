@@ -513,4 +513,15 @@ class Device {
   virtual ~Device() = default;
 };
 
+// Optional on-disk cache directory for runtime-compiled shader bytecode
+// (the D3D12 backend's D3DCompile output; backends consuming prebuilt
+// shaders ignore it). Entries are keyed by a content hash of the stage,
+// entry point, macros and full source text, so source edits miss naturally
+// and stale bytecode is never served. Set once during app startup, before
+// the first CreateShader; empty (the default) disables caching. A missing
+// or unwritable directory only costs compile time, never correctness.
+void SetShaderBytecodeCacheDirectory(const char* path);
+// The configured directory, or an empty string when caching is disabled.
+const char* GetShaderBytecodeCacheDirectory();
+
 }  // namespace rex::graphics::nrhi

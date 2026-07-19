@@ -24,6 +24,7 @@
 #include <rex/ui/overlay/fps_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/native_rhi.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
@@ -356,6 +357,16 @@ bool ReXApp::SetupEnvironment() {
   cache_root_ = path_config.cache_root;
   config_path_ = path_config.config_path;
   resolved_defaults_ = std::move(path_config);
+
+  // Native-render RHI shader bytecode cache: the D3D12 backend runtime-
+  // compiles its HLSL, and the largest scene shader costs seconds on the
+  // render thread at first-frame pipeline creation; cached bytecode turns
+  // every launch after the first into a file read. Must be set before the
+  // graphics system creates its first shader.
+  if (!cache_root_.empty()) {
+    graphics::nrhi::SetShaderBytecodeCacheDirectory(
+        (cache_root_ / "nrhi_shaders").string().c_str());
+  }
 
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);

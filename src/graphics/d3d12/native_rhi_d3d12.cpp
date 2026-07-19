@@ -7,9 +7,14 @@
 #include <rex/graphics/d3d12/native_rhi_d3d12.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +33,107 @@ using nrhi::Format;
 using nrhi::HeapKind;
 using nrhi::ResourceState;
 using nrhi::TextureKind;
+
+// ---- Shader bytecode cache ------------------------------------------------
+// D3DCompile of the scene uber shader costs whole seconds and runs on the
+// render thread during pipeline creation, which holds the first presented
+// frame (a launch black screen). Compiled DXBC is content-addressed on disk
+// (see nrhi::SetShaderBytecodeCacheDirectory): the key hashes everything
+// that affects codegen, so source edits miss naturally and entries never go
+// stale. Every failure path falls back to compiling.
+
+uint64_t Fnv1a64(const void* data, size_t size, uint64_t hash) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= p[i];
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+std::filesystem::path ShaderCachePath(const nrhi::ShaderDesc& desc,
+                                      const char* target) {
+  const char* dir = nrhi::GetShaderBytecodeCacheDirectory();
+  if (dir == nullptr || dir[0] == '\0') {
+    return {};
+  }
+  // Two independent FNV-1a streams form a 128-bit key; the terminating NUL
+  // fed with each field keeps concatenations unambiguous.
+  uint64_t h1 = 14695981039346656037ull;
+  uint64_t h2 = 0x84222325CBF29CE4ull;
+  const auto feed_str = [&](const char* s) {
+    const size_t n = std::strlen(s) + 1;
+    h1 = Fnv1a64(s, n, h1);
+    h2 = Fnv1a64(s, n, h2);
+  };
+  feed_str("nrhi-dxbc-1");  // cache format tag
+  feed_str(target);
+  feed_str(desc.entry_point != nullptr ? desc.entry_point : "");
+  if (desc.macros != nullptr) {
+    for (uint32_t i = 0; desc.macros[i].name != nullptr; ++i) {
+      feed_str(desc.macros[i].name);
+      feed_str(desc.macros[i].value != nullptr ? desc.macros[i].value : "");
+    }
+  }
+  feed_str(desc.hlsl_source != nullptr ? desc.hlsl_source : "");
+  char name[48];
+  std::snprintf(name, sizeof(name), "%016llx%016llx.dxbc",
+                static_cast<unsigned long long>(h1),
+                static_cast<unsigned long long>(h2));
+  return std::filesystem::path(dir) / name;
+}
+
+ID3DBlob* TryLoadCachedBlob(const std::filesystem::path& path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f.is_open()) {
+    return nullptr;
+  }
+  const std::streamoff size = f.tellg();
+  if (size < 8) {
+    return nullptr;
+  }
+  ID3DBlob* blob = nullptr;
+  if (FAILED(D3DCreateBlob(static_cast<SIZE_T>(size), &blob))) {
+    return nullptr;
+  }
+  f.seekg(0);
+  f.read(static_cast<char*>(blob->GetBufferPointer()),
+         static_cast<std::streamsize>(size));
+  // The DXBC container magic rejects truncated or foreign files.
+  if (!f.good() || std::memcmp(blob->GetBufferPointer(), "DXBC", 4) != 0) {
+    blob->Release();
+    return nullptr;
+  }
+  return blob;
+}
+
+void StoreCachedBlob(const std::filesystem::path& path, ID3DBlob* blob) {
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  // Write-then-rename so a crash mid-write never leaves a truncated blob
+  // under the final name (the loader's DXBC magic check is the second line
+  // of defense). The per-process temp name keeps two instances compiling
+  // the same shader from interleaving writes.
+  std::filesystem::path tmp = path;
+  tmp += ".tmp" + std::to_string(GetCurrentProcessId());
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f.is_open()) {
+      return;
+    }
+    f.write(static_cast<const char*>(blob->GetBufferPointer()),
+            static_cast<std::streamsize>(blob->GetBufferSize()));
+    if (!f.good()) {
+      f.close();
+      std::filesystem::remove(tmp, ec);
+      return;
+    }
+  }
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    std::filesystem::remove(tmp, ec);
+  }
+}
 
 DXGI_FORMAT ToDxgi(Format format) {
   switch (format) {
@@ -640,22 +746,35 @@ class NrDeviceD3D12 : public nrhi::Device {
         ++macro_count;
       }
     }
-    ID3DBlob* blob = nullptr;
-    ID3DBlob* errors = nullptr;
     const char* target = desc.stage == nrhi::ShaderStage::kVertex ? "vs_5_0" : "ps_5_0";
-    HRESULT hr = D3DCompile(desc.hlsl_source, std::strlen(desc.hlsl_source),
-                            desc.name != nullptr ? desc.name : "nrhi_shader",
-                            macro_count != 0 ? macros : nullptr, nullptr, desc.entry_point,
-                            target, 0, 0, &blob, &errors);
-    if (FAILED(hr)) {
-      REXLOG_ERROR("nrhi-d3d12: shader compile failed ({} {}): {}",
-                   desc.name != nullptr ? desc.name : "?", desc.entry_point,
-                   errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer())
-                                     : "no error blob");
+    const std::filesystem::path cache_path = ShaderCachePath(desc, target);
+    ID3DBlob* blob = cache_path.empty() ? nullptr : TryLoadCachedBlob(cache_path);
+    if (blob == nullptr) {
+      ID3DBlob* errors = nullptr;
+      const auto compile_start = std::chrono::steady_clock::now();
+      HRESULT hr = D3DCompile(desc.hlsl_source, std::strlen(desc.hlsl_source),
+                              desc.name != nullptr ? desc.name : "nrhi_shader",
+                              macro_count != 0 ? macros : nullptr, nullptr, desc.entry_point,
+                              target, 0, 0, &blob, &errors);
+      if (FAILED(hr)) {
+        REXLOG_ERROR("nrhi-d3d12: shader compile failed ({} {}): {}",
+                     desc.name != nullptr ? desc.name : "?", desc.entry_point,
+                     errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer())
+                                       : "no error blob");
+        if (errors) errors->Release();
+        return nullptr;
+      }
       if (errors) errors->Release();
-      return nullptr;
+      const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - compile_start)
+                                  .count();
+      if (!cache_path.empty()) {
+        StoreCachedBlob(cache_path, blob);
+      }
+      REXLOG_INFO("nrhi-d3d12: compiled {} {} in {} ms{}",
+                  desc.name != nullptr ? desc.name : "?", desc.entry_point, compile_ms,
+                  cache_path.empty() ? "" : " (cached to disk)");
     }
-    if (errors) errors->Release();
     auto* shader = new NrShaderD3D12();
     shader->blob = blob;
     return shader;
