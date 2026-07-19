@@ -612,10 +612,6 @@ class TextureCache {
   static bool DebugIsTeamProfileBackgroundCandidateKey(const TextureKey& key);
   void DebugLogTeamProfileBackgroundTextureCandidate(const char* action, uint32_t fetch_index,
                                                      const Texture& texture);
-  bool DebugConsumeSkate3UltrawideTextureTraceLog();
-  void DebugLogSkate3UltrawideTextureTrace(const char* action, uint32_t fetch_index,
-                                           const TextureKey& key,
-                                           const Texture* texture = nullptr);
 
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 

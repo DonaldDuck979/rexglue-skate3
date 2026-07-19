@@ -49,6 +49,25 @@ bool HasNativeGuestOutputRenderer();
 // True while the registered renderer actually replaced the last presented
 // frame (false when it yields to the emulated output).
 bool IsNativeGuestOutputActive();
+
+// ---- Wide guest output ----------------------------------------------------
+// Display aspect the native renderer wants to draw at when it is wider than
+// the guest frontbuffer's own aspect (ultrawide). 0 = disabled. Set once at
+// app startup; consumed by the command processors when sizing the guest
+// output for a swap.
+void SetNativeGuestOutputWideAspect(double aspect);
+double GetNativeGuestOutputWideAspect();
+// Applies the wide aspect to this swap's guest output and display
+// dimensions: widens guest_output_width to guest_output_height * aspect and
+// makes the display aspect match. Only widens while a renderer is registered
+// AND it served the last presented frame, so emulated fallback frames size
+// back to the frontbuffer aspect and present pillarboxed by the presenter's
+// letterbox path. Returns whether the output was widened; when it was and
+// the renderer then yields the frame, the refresh callback must return false
+// (keeping the previously presented image) instead of running the emulated
+// blit, which writes frontbuffer-aspect content.
+bool ApplyNativeGuestOutputWideAspect(uint32_t& guest_output_width, uint32_t guest_output_height,
+                                      uint32_t& display_width, uint32_t& display_height);
 // native_render_suppress_emulated_draws && IsNativeGuestOutputActive():
 // command processors skip emulated draw/resolve execution (memexport draws,
 // fences, queries and PM4 parsing still run).

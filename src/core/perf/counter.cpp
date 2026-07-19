@@ -688,16 +688,8 @@ bool ShouldCollectDrawDiagnostics() {
   return REXCVAR_GET(perf_diagnostics) || IsCaptureRecording();
 }
 
-// skate3_ultrawide_trace_draws lives in another DLL, so it is reachable only
-// through the by-name registry query (mutex + map lookup), far too expensive
-// for the per-draw call sites of ShouldCollectDrawFingerprints(). Cache the
-// value and refresh it once per frame from ResetFrameCounters().
-static std::atomic<bool> g_trace_draws_cvar_cache{false};
-
 bool ShouldCollectDrawFingerprints() {
-  return REXCVAR_GET(perf_draw_fingerprints) ||
-         g_trace_draws_cvar_cache.load(std::memory_order_relaxed) ||
-         ShouldCollectDrawDiagnostics();
+  return REXCVAR_GET(perf_draw_fingerprints) || ShouldCollectDrawDiagnostics();
 }
 
 int64_t GetCounter(CounterId id) {
@@ -705,9 +697,6 @@ int64_t GetCounter(CounterId id) {
 }
 
 void ResetFrameCounters() {
-  g_trace_draws_cvar_cache.store(
-      rex::cvar::Query<bool>("skate3_ultrawide_trace_draws"),
-      std::memory_order_relaxed);
   for (size_t i = 0; i < kNumCounters; ++i) {
     if (kIsGauge[i]) {
       // Gauges: snapshot the current value, don't zero

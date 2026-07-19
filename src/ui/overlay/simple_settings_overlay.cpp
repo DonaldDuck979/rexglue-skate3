@@ -1364,7 +1364,9 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Aspect Ratio";
-        row.desc = "21:9 widens the world rendering for ultrawide displays.";
+        row.desc =
+            "21:9 widens the world rendering for ultrawide displays. Requires "
+            "the native renderer; the emulated renderer presents 16:9.";
         row.value_note = "21:9 is experimental";
         for (const char* label : kAspectRatioLabels) {
           row.options.push_back(label);

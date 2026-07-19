@@ -24,7 +24,6 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
-#include <rex/graphics/ultrawide_debug.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -107,25 +106,6 @@ REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_bindings_remaining
     .range(0, 10000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
-
-REXCVAR_DEFINE_INT32(skate3_ultrawide_texture_trace_remaining, 0, "Skate 3/Ultrawide",
-                     "Log this many Skate 3 texture lifecycle events for ultrawide pop-in tracing")
-    .range(0, 1000000)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_BOOL(skate3_ultrawide_texture_trace_bind_keys, false, "Skate 3/Ultrawide",
-                    "Include high-frequency texture bind-key churn in ultrawide texture tracing")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_BOOL(skate3_ultrawide_texture_trace_scaled_resolve, false, "Skate 3/Ultrawide",
-                    "Include scaled render-to-texture resolve targets in ultrawide texture tracing")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_BOOL(skate3_ultrawide_ignore_streamer_texture_invalidations, false,
-                    "Skate 3/Ultrawide",
-                    "Diagnostic: keep host textures resident when guest streamer writes from "
-                    "82CD4300 invalidate watched texture pages")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
@@ -344,9 +324,6 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
-      DebugLogSkate3UltrawideTextureTrace(limit_hard_exceeded ? "destroy-hard-limit"
-                                                              : "destroy-soft-limit",
-                                          UINT32_MAX, texture->key(), texture);
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
     }
@@ -517,11 +494,6 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
   texture.LogAction("Loaded");
-  DebugLogSkate3UltrawideTextureTrace(pending_load.load_base
-                                          ? (pending_load.load_mips ? "loaded-base-mips"
-                                                                    : "loaded-base")
-                                          : "loaded-mips",
-                                      UINT32_MAX, texture.key(), &texture);
   DebugLogTeamProfileBackgroundTextureCandidate("loaded", UINT32_MAX, texture);
 
   return true;
@@ -598,7 +570,6 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {
         bindings_changed |= index_bit;
-        DebugLogSkate3UltrawideTextureTrace("unbind-invalid-fetch", index, old_key);
       }
       binding.Reset();
       continue;
@@ -659,15 +630,6 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     if (load_signed_data) {
       queue_pending_texture_load(binding.texture_signed);
-    }
-    if (key_changed) {
-      DebugLogSkate3UltrawideTextureTrace("bind-key", index, binding.key,
-                                          binding.texture ? binding.texture
-                                                          : binding.texture_signed);
-    } else if (bindings_changed & index_bit) {
-      DebugLogSkate3UltrawideTextureTrace("bind-view", index, binding.key,
-                                          binding.texture ? binding.texture
-                                                          : binding.texture_signed);
     }
   }
 
@@ -899,90 +861,6 @@ bool TextureCache::DebugFindTeamProfileBackgroundBinding(uint32_t used_texture_m
     }
   }
   return false;
-}
-
-bool TextureCache::DebugConsumeSkate3UltrawideTextureTraceLog() {
-  int32_t remaining = REXCVAR_GET(skate3_ultrawide_texture_trace_remaining);
-  if (remaining <= 0) {
-    return false;
-  }
-  REXCVAR_SET(skate3_ultrawide_texture_trace_remaining, remaining - 1);
-  return true;
-}
-
-void TextureCache::DebugLogSkate3UltrawideTextureTrace(const char* action, uint32_t fetch_index,
-                                                       const TextureKey& key,
-                                                       const Texture* texture) {
-  const bool is_bind_action = std::string_view(action).starts_with("bind-");
-  if (is_bind_action && !REXCVAR_GET(skate3_ultrawide_texture_trace_bind_keys)) {
-    return;
-  }
-  if (key.is_valid && key.scaled_resolve &&
-      !REXCVAR_GET(skate3_ultrawide_texture_trace_scaled_resolve)) {
-    return;
-  }
-
-  if (!key.is_valid) {
-    if (!DebugConsumeSkate3UltrawideTextureTraceLog()) {
-      return;
-    }
-    REXGPU_WARN("Skate3 texture trace: action={}, submission={}, fetch={}, invalid-key", action,
-                current_submission_index_, fetch_index == UINT32_MAX ? -1 : int32_t(fetch_index));
-    return;
-  }
-
-  const FormatInfo* format_info = FormatInfo::Get(key.format);
-  const uint64_t key_hash = TextureKey::Hasher{}(key);
-  uint32_t guest_base_size = 0;
-  uint32_t guest_mips_size = 0;
-  if (texture) {
-    guest_base_size = texture->GetGuestBaseSize();
-    guest_mips_size = texture->GetGuestMipsSize();
-  } else {
-    const texture_util::TextureGuestLayout fallback_layout = key.GetGuestLayout();
-    guest_base_size = fallback_layout.base.level_data_extent_bytes;
-    guest_mips_size = fallback_layout.mips_total_extent_bytes;
-  }
-  const uint32_t host_width = key.GetWidth() * (key.scaled_resolve ? draw_resolution_scale_x_ : 1);
-  const uint32_t host_height =
-      key.GetHeight() * (key.scaled_resolve ? draw_resolution_scale_y_ : 1);
-
-  if (!DebugConsumeSkate3UltrawideTextureTraceLog()) {
-    return;
-  }
-
-  const auto& invalidation_diagnostics =
-      rex::memory::GetPhysicalMemoryInvalidationDiagnostics();
-  if (std::string_view(action).starts_with("invalidate-") && invalidation_diagnostics.valid) {
-    REXGPU_WARN(
-        "Skate3 texture trace: action={}, submission={}, fetch={}, key={:016X}, scaled={}, {} "
-        "{}x{}x{} host={}x{} {}, base={:08X}+{:X}, mips={:08X}+{:X}, mip_max={}, pitch={}, "
-        "outdated={:X}, host_mem_kb={}, write_va={:08X}, write_phys={:08X}+{:X}, "
-        "thread={:08X}, lr={:08X}, stack={:08X}, exact={}, unprotect={}",
-        action, current_submission_index_, fetch_index == UINT32_MAX ? -1 : int32_t(fetch_index),
-        key_hash, bool(key.scaled_resolve), key.tiled ? "tiled" : "linear", key.GetWidth(),
-        key.GetHeight(), key.GetDepthOrArraySize(), host_width, host_height,
-        format_info ? format_info->name : "unknown", key.base_page << 12, guest_base_size,
-        key.mip_page << 12, guest_mips_size, key.mip_max_level, key.pitch << 5,
-        texture ? texture->outdated_mask() : 0,
-        texture ? uint32_t((texture->GetHostMemoryUsage() + 1023) >> 10) : 0,
-        invalidation_diagnostics.virtual_address, invalidation_diagnostics.physical_address,
-        invalidation_diagnostics.length, invalidation_diagnostics.thread_id,
-        invalidation_diagnostics.lr, invalidation_diagnostics.stack,
-        invalidation_diagnostics.exact_range, invalidation_diagnostics.unprotect);
-    return;
-  }
-  REXGPU_WARN(
-      "Skate3 texture trace: action={}, submission={}, fetch={}, key={:016X}, scaled={}, {} "
-      "{}x{}x{} host={}x{} {}, base={:08X}+{:X}, mips={:08X}+{:X}, mip_max={}, pitch={}, "
-      "outdated={:X}, host_mem_kb={}",
-      action, current_submission_index_, fetch_index == UINT32_MAX ? -1 : int32_t(fetch_index),
-      key_hash, bool(key.scaled_resolve), key.tiled ? "tiled" : "linear", key.GetWidth(),
-      key.GetHeight(), key.GetDepthOrArraySize(), host_width, host_height,
-      format_info ? format_info->name : "unknown", key.base_page << 12, guest_base_size,
-      key.mip_page << 12, guest_mips_size, key.mip_max_level, key.pitch << 5,
-      texture ? texture->outdated_mask() : 0,
-      texture ? uint32_t((texture->GetHostMemoryUsage() + 1023) >> 10) : 0);
 }
 
 void TextureCache::DebugLogTeamProfileBackgroundTextureCandidate(const char* action,
@@ -1380,26 +1258,6 @@ void TextureCache::Texture::MarkAsUsed() {
 void TextureCache::Texture::WatchCallback(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
     bool invalidated_by_gpu) {
-  const auto& invalidation_diagnostics =
-      rex::memory::GetPhysicalMemoryInvalidationDiagnostics();
-  const bool ignore_skate3_streamer_invalidation =
-      !invalidated_by_gpu && REXCVAR_GET(skate3_ultrawide_ignore_streamer_texture_invalidations) &&
-      invalidation_diagnostics.valid && invalidation_diagnostics.lr == 0x82CD4300;
-  if (ignore_skate3_streamer_invalidation) {
-    texture_cache().DebugLogSkate3UltrawideTextureTrace(
-        is_mip ? "suppress-streamer-mips" : "suppress-streamer-base", UINT32_MAX, key(), this);
-    if (is_mip) {
-      mips_watch_handle_ = nullptr;
-    } else {
-      base_watch_handle_ = nullptr;
-    }
-    return;
-  }
-
-  texture_cache().DebugLogSkate3UltrawideTextureTrace(
-      invalidated_by_gpu ? (is_mip ? "invalidate-gpu-mips" : "invalidate-gpu-base")
-                         : (is_mip ? "invalidate-cpu-mips" : "invalidate-cpu-base"),
-      UINT32_MAX, key(), this);
   texture_cache().DebugLogTeamProfileBackgroundTextureCandidate(
       invalidated_by_gpu ? (is_mip ? "invalidate-gpu-mips" : "invalidate-gpu-base")
                          : (is_mip ? "invalidate-cpu-mips" : "invalidate-cpu-base"),
@@ -1427,11 +1285,6 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
-  if (!from_destructor) {
-    for (const auto& [key, texture] : textures_) {
-      DebugLogSkate3UltrawideTextureTrace("destroy-clear", UINT32_MAX, key, texture.get());
-    }
-  }
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -1554,7 +1407,6 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
-  DebugLogSkate3UltrawideTextureTrace("create", UINT32_MAX, texture->key(), texture);
   DebugLogTeamProfileBackgroundTextureCandidate("create", UINT32_MAX, *texture);
   return texture;
 }

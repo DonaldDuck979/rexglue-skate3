@@ -1,5 +1,6 @@
 #include <rex/graphics/native_guest_renderer.h>
 
+#include <algorithm>
 #include <atomic>
 #include <string>
 
@@ -112,6 +113,41 @@ bool IsNativeGuestOutputPostProcessRequested() {
 
 bool IsNativeGuestOutputActive() {
   return g_native_output_active.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::atomic<double> g_wide_aspect{0.0};
+}  // namespace
+
+void SetNativeGuestOutputWideAspect(double aspect) {
+  g_wide_aspect.store(aspect > 0.0 ? aspect : 0.0, std::memory_order_relaxed);
+}
+
+double GetNativeGuestOutputWideAspect() {
+  return g_wide_aspect.load(std::memory_order_relaxed);
+}
+
+bool ApplyNativeGuestOutputWideAspect(uint32_t& guest_output_width, uint32_t guest_output_height,
+                                      uint32_t& display_width, uint32_t& display_height) {
+  const double aspect = g_wide_aspect.load(std::memory_order_relaxed);
+  if (aspect <= 0.0 || !guest_output_width || !guest_output_height ||
+      !HasNativeGuestOutputRenderer() ||
+      !g_native_output_active.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  // Even width keeps every half-resolution derived target (bloom, SSAO,
+  // menu snapshots) an exact divide.
+  uint32_t wide_width =
+      uint32_t(std::clamp(aspect * double(guest_output_height) + 0.5, 1.0, 16384.0)) & ~1u;
+  if (wide_width <= guest_output_width) {
+    return false;
+  }
+  guest_output_width = wide_width;
+  // The display aspect is the actual pixel aspect: the presenter maps the
+  // wide image edge-to-edge on a matching window.
+  display_width = guest_output_width;
+  display_height = guest_output_height;
+  return true;
 }
 
 bool ShouldSuppressEmulatedDraws() {

@@ -14,8 +14,8 @@
 #include <atomic>
 
 #include <rex/cvar.h>
-#include <rex/graphics/ultrawide_debug.h>
 #include <rex/input/input.h>
+#include <rex/kernel/guest_presence.h>
 #include <rex/kernel/xam/input_injection.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -49,8 +49,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
       auto old_value = kernel_state_->GetUserContext(user_index, context_id);
       kernel_state_->SetUserContext(user_index, context_id, context_value);
-      rex::graphics::ultrawide_debug::NotifySkate3GameplayContext(user_index, context_id,
-                                                                  context_value);
+      rex::kernel::guest_presence::NotifyContext(user_index, context_id, context_value);
       if (rex::cvar::Query<bool>("skate3_demo_path") && user_index == 0 &&
           context_id == 0x8001) {
         // Boot automation is strictly ONE-SHOT: the dialog A auto-tap exists

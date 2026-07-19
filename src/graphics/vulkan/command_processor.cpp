@@ -45,7 +45,6 @@
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
-#include <rex/graphics/ultrawide_debug.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
@@ -161,15 +160,6 @@ REXCVAR_DEFINE_INT32(vulkan_gpu_clock_log_interval_frames, 0, "GPU/Vulkan",
     .debug_only()
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-// The shared Skate 3 Hor+ classifier cvars (skate3_ultrawide_skip_shadow_targets,
-// skate3_ultrawide_shadow_skip_mode) live in graphics/command_processor.cpp so
-// every backend sees one registration; the queries below resolve them by name.
-REXCVAR_DEFINE_BOOL(skate3_ultrawide_skip_screen_space_targets, false, "Skate 3",
-                    "Exclude screen-space/orthographic (pre-divided XY) passes from Skate 3 Hor+ "
-                    "NDC correction. Off by default so the Vulkan default classifier matches the "
-                    "Direct3D 12 build; enable if menu/HUD fragments appear in the side areas")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -241,160 +231,6 @@ bool IsGameplayStateActive(const system::KernelState* kernel_state) {
   }
   auto gameplay_context = kernel_state->GetUserContext(0, 0x8001);
   return gameplay_context && *gameplay_context == 1;
-}
-
-struct Skate3UltrawideDrawState {
-  bool correction_active = false;
-  bool skip_shadow_targets = false;
-  bool skip_screen_space_targets = false;
-  uint32_t shadow_skip_mode = 1;
-  float hor_plus_scale = 1.0f;
-};
-
-double GetSkate3UltrawideTargetAspect(const ui::Presenter* presenter = nullptr) {
-  if (!rex::cvar::Query<bool>("skate3_ultrawide") ||
-      !ultrawide_debug::IsSkate3GameplayUltrawideActive()) {
-    return 0.0;
-  }
-
-  constexpr double kBaseAspect = 16.0 / 9.0;
-  uint32_t surface_width = 0;
-  uint32_t surface_height = 0;
-  if (presenter && presenter->GetSurfacePaintConnectionSize(surface_width, surface_height) &&
-      surface_width && surface_height) {
-    const double surface_aspect = double(surface_width) / double(surface_height);
-    if (surface_aspect > kBaseAspect + 0.01) {
-      return std::clamp(surface_aspect, kBaseAspect, 8.0);
-    }
-  }
-
-  const double target_aspect = rex::cvar::Query<double>("skate3_ultrawide_target_aspect");
-  return target_aspect > kBaseAspect + 0.01 ? std::clamp(target_aspect, kBaseAspect, 8.0) : 0.0;
-}
-
-void ApplySkate3UltrawidePresenterAspect(const ui::Presenter* presenter, uint32_t& display_width,
-                                         uint32_t& display_height) {
-  const double target_aspect = GetSkate3UltrawideTargetAspect(presenter);
-  if (target_aspect <= 0.0) {
-    return;
-  }
-
-  rex::cvar::SetFlagByName("skate3_ultrawide_target_aspect", std::to_string(target_aspect));
-
-  display_height =
-      uint32_t(std::clamp(rex::cvar::Query<int32_t>("skate3_ultrawide_base_height"), 480, 2160));
-  display_width =
-      uint32_t(std::clamp(target_aspect * double(display_height) + 0.5, 1.0, 4095.0));
-}
-
-float ComputeSkate3UltrawideHorPlusScale() {
-  const double manual_scale = rex::cvar::Query<double>("skate3_ultrawide_hor_plus_scale");
-  if (manual_scale > 0.0) {
-    return float(std::clamp(manual_scale, 0.25, 4.0));
-  }
-
-  constexpr double kBaseAspect = 16.0 / 9.0;
-  double aspect = GetSkate3UltrawideTargetAspect();
-  if (aspect <= 0.0) {
-    const int32_t display_width = REXCVAR_GET(video_mode_width);
-    const int32_t display_height = REXCVAR_GET(video_mode_height);
-    if (display_width <= 0 || display_height <= 0) {
-      return 1.0f;
-    }
-    aspect = double(display_width) / double(display_height);
-  }
-
-  if (aspect <= kBaseAspect + 0.01f) {
-    return 1.0f;
-  }
-
-  return float(std::clamp(kBaseAspect / aspect, 0.25, 1.0));
-}
-
-Skate3UltrawideDrawState QuerySkate3UltrawideDrawState() {
-  Skate3UltrawideDrawState state;
-  state.correction_active = rex::cvar::Query<bool>("skate3_ultrawide") &&
-                            rex::cvar::Query<bool>("skate3_ultrawide_hor_plus") &&
-                            ultrawide_debug::IsSkate3GameplayUltrawideActive() &&
-                            !rex::cvar::Query<bool>("skate3_ultrawide_disable_ndc_correction");
-  if (!state.correction_active) {
-    return state;
-  }
-
-  state.hor_plus_scale = ComputeSkate3UltrawideHorPlusScale();
-  state.skip_shadow_targets = rex::cvar::Query<bool>("skate3_ultrawide_skip_shadow_targets");
-  state.skip_screen_space_targets =
-      rex::cvar::Query<bool>("skate3_ultrawide_skip_screen_space_targets");
-  state.shadow_skip_mode = uint32_t(std::clamp(
-      rex::cvar::Query<int32_t>("skate3_ultrawide_shadow_skip_mode"), 1, 3));
-  return state;
-}
-
-Skate3UltrawideDrawState SnapshotSkate3UltrawideDrawState(uint64_t frame) {
-  thread_local uint64_t cached_frame = 0;
-  thread_local Skate3UltrawideDrawState cached_state;
-  if (cached_frame != frame) {
-    cached_state = QuerySkate3UltrawideDrawState();
-    cached_frame = frame;
-  }
-  return cached_state;
-}
-
-// Frame-cached read of the cross-TU draw trace flag - the registry Query is a
-// mutex + string hash, too expensive to run for every draw.
-bool QuerySkate3UltrawideTraceDraws(uint64_t frame) {
-  thread_local uint64_t cached_frame = UINT64_MAX;
-  thread_local bool cached_value = false;
-  if (cached_frame != frame) {
-    cached_value = rex::cvar::Query<bool>("skate3_ultrawide_trace_draws");
-    cached_frame = frame;
-  }
-  return cached_value;
-}
-
-bool IsSkate3UltrawideDisplayViewport(const draw_util::ViewportInfo& viewport_info) {
-  const uint32_t width = viewport_info.xy_extent[0];
-  const uint32_t height = viewport_info.xy_extent[1];
-  if (!width || !height) {
-    return false;
-  }
-
-  const uint64_t scaled_width = uint64_t(width) * 9;
-  const uint64_t scaled_height = uint64_t(height) * 16;
-  const uint64_t difference =
-      scaled_width > scaled_height ? scaled_width - scaled_height : scaled_height - scaled_width;
-  return difference <= scaled_height / 20;
-}
-
-bool ShouldApplySkate3UltrawideHorPlus(
-    const ultrawide_debug::TargetKey& target_key, bool primitive_polygonal,
-    Shader::HostVertexShaderType host_vertex_shader_type, reg::PA_CL_VTE_CNTL pa_cl_vte_cntl,
-    const draw_util::ViewportInfo& viewport_info,
-    reg::RB_DEPTHCONTROL normalized_depth_control,
-    const Skate3UltrawideDrawState& ultrawide_state) {
-  if (!ultrawide_state.correction_active) {
-    return false;
-  }
-
-  // The base classifier matches the Direct3D 12 build exactly. Pre-divided XY
-  // (screen-space/orthographic passes), non-kVertex host shaders, and depth
-  // passes without a depth write can leak widening into the side areas as
-  // menu/HUD fragments; excluding them is gated behind
-  // skate3_ultrawide_skip_screen_space_targets (off by default) so the Vulkan
-  // default matches the D3D12-tuned target list unless opted in.
-  const bool screen_space_pass =
-      host_vertex_shader_type != Shader::HostVertexShaderType::kVertex ||
-      !normalized_depth_control.z_write_enable || pa_cl_vte_cntl.vtx_xy_fmt;
-  const bool default_enabled =
-      primitive_polygonal && normalized_depth_control.z_enable &&
-      IsSkate3UltrawideDisplayViewport(viewport_info) &&
-      !(ultrawide_state.skip_screen_space_targets && screen_space_pass);
-  const bool selected = ultrawide_debug::ShouldApplyAndRecord(target_key, default_enabled);
-  if (selected && ultrawide_state.skip_shadow_targets &&
-      ultrawide_debug::IsShadowMapCandidate(target_key, ultrawide_state.shadow_skip_mode)) {
-    return false;
-  }
-  return selected;
 }
 
 bool IsInGameContextActive(const system::KernelState* kernel_state) {
@@ -2954,13 +2790,17 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
-  ApplySkate3UltrawidePresenterAspect(presenter, display_width, display_height);
+  // Ultrawide: while the native renderer is serving frames, allocate the
+  // guest output at the wide display aspect; emulated frames keep the
+  // frontbuffer aspect and present pillarboxed.
+  const bool native_wide_output = ApplyNativeGuestOutputWideAspect(
+      guest_output_width, guest_output_height, display_width, display_height);
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
-       frontbuffer_format, swap_texture_view, swap_post_effect,
-       swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
+       native_wide_output](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -3028,6 +2868,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           // the gamma pass below records into the same deferred command
           // buffer.
           NativeRhiEndFrame(native_rhi_device_);
+          if (native_wide_output) {
+            // The output was sized wide for the native renderer; the
+            // emulated blit writes frontbuffer-aspect content, so keep the
+            // previously presented image and resize on the next refresh.
+            return false;
+          }
         }
 
         bool swap_source_requires_compute_rb_swap =
@@ -5085,69 +4931,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         break;
       }
     }
-  }
-  bool skate3_ultrawide_submit_draw = true;
-  // Frame-cached: the registry Query takes the registry mutex and hashes the
-  // name, far too expensive for a per-draw debug-flag check.
-  if (QuerySkate3UltrawideTraceDraws(frame_current_)) {
-    ultrawide_debug::DrawFingerprint fingerprint;
-    fingerprint.bucket =
-        memexport_writes_possible
-            ? ultrawide_debug::DrawBucket::kMemexport
-            : (edram_mode == xenos::EdramMode::kDepthOnly
-                   ? ultrawide_debug::DrawBucket::kDepthOnly
-                   : (pixel_shader == nullptr ? ultrawide_debug::DrawBucket::kNoPixelShader
-                                              : ultrawide_debug::DrawBucket::kMainColorDepth));
-    fingerprint.vertex_shader_hash = vertex_shader->ucode_data_hash();
-    fingerprint.pixel_shader_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
-    fingerprint.primitive_type = uint32_t(primitive_processing_result.host_primitive_type);
-    fingerprint.vertex_count = host_draw_vertex_count;
-    fingerprint.primitive_count = host_draw_primitive_count;
-    fingerprint.packet_ptr = current_packet_ptr_;
-    if (index_buffer_info) {
-      fingerprint.index_guest_base = index_buffer_info->guest_base;
-      fingerprint.index_length = uint32_t(index_buffer_info->length);
-    }
-    const Shader::ConstantRegisterMap& constant_map = vertex_shader->constant_register_map();
-    size_t fetch_count = 0;
-    for (uint32_t i = 0; i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
-      uint32_t fetch_bits = constant_map.vertex_fetch_bitmap[i];
-      uint32_t bit = 0;
-      while (fetch_count < ultrawide_debug::DrawFingerprint::kVertexFetchCount &&
-             rex::bit_scan_forward(fetch_bits, &bit)) {
-        fetch_bits &= ~(uint32_t(1) << bit);
-        xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(i * 32 + bit);
-        fingerprint.vertex_fetch_address[fetch_count] = fetch.address << 2;
-        fingerprint.vertex_fetch_size[fetch_count] = fetch.size << 2;
-        ++fetch_count;
-      }
-      if (fetch_count >= ultrawide_debug::DrawFingerprint::kVertexFetchCount) {
-        break;
-      }
-    }
-    size_t texture_count = 0;
-    uint32_t texture_bits = used_texture_mask;
-    uint32_t texture_index = 0;
-    while (texture_count < ultrawide_debug::DrawFingerprint::kTextureFetchCount &&
-           rex::bit_scan_forward(texture_bits, &texture_index)) {
-      texture_bits &= ~(UINT32_C(1) << texture_index);
-      TextureCache::DebugActiveTextureBinding binding;
-      if (!texture_cache_->DebugGetActiveTextureBinding(texture_index, binding)) {
-        continue;
-      }
-      fingerprint.texture_key_hash[texture_count] = binding.key_hash;
-      fingerprint.texture_fetch_index[texture_count] = binding.fetch_index;
-      fingerprint.texture_base_address[texture_count] = binding.base_address;
-      fingerprint.texture_base_length[texture_count] = binding.base_length;
-      fingerprint.texture_width[texture_count] = binding.width;
-      fingerprint.texture_height[texture_count] = binding.height;
-      fingerprint.texture_format[texture_count] = binding.format;
-      ++texture_count;
-    }
-    skate3_ultrawide_submit_draw = ultrawide_debug::RecordDrawFingerprint(fingerprint);
-  }
-  if (!skate3_ultrawide_submit_draw) {
-    return true;
   }
   pre_draw_stage_timer.Stop();
 
@@ -8238,39 +8021,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   system_constants_.tessellation_factor_range_max = tessellation_factor_max;
 
   // Conversion to host normalized device coordinates.
-  ultrawide_debug::TargetKey skate3_ultrawide_target_key;
-  for (uint32_t i = 0; i < 4; ++i) {
-    skate3_ultrawide_target_key.color_info[i] = color_infos[i].value;
-  }
-  skate3_ultrawide_target_key.depth_info = rb_depth_info.value;
-  skate3_ultrawide_target_key.surface_info = rb_surface_info.value;
-  skate3_ultrawide_target_key.viewport_x = viewport_info.xy_offset[0];
-  skate3_ultrawide_target_key.viewport_y = viewport_info.xy_offset[1];
-  skate3_ultrawide_target_key.viewport_width = viewport_info.xy_extent[0];
-  skate3_ultrawide_target_key.viewport_height = viewport_info.xy_extent[1];
-  skate3_ultrawide_target_key.color_mask = normalized_color_mask;
-  skate3_ultrawide_target_key.depth_control = normalized_depth_control.value;
-  skate3_ultrawide_target_key.pa_cl_vte_cntl = pa_cl_vte_cntl.value;
-  skate3_ultrawide_target_key.primitive_type = uint32_t(vgt_draw_initiator.prim_type);
-  skate3_ultrawide_target_key.host_vertex_shader_type =
-      uint32_t(primitive_processing_result.host_vertex_shader_type);
-  skate3_ultrawide_target_key.vertex_shader_hash = vertex_shader_hash;
-  skate3_ultrawide_target_key.pixel_shader_hash = pixel_shader_hash;
-  const Skate3UltrawideDrawState skate3_ultrawide_state =
-      SnapshotSkate3UltrawideDrawState(frame_current_);
-  const bool skate3_ultrawide_hor_plus_draw = ShouldApplySkate3UltrawideHorPlus(
-      skate3_ultrawide_target_key, primitive_polygonal,
-      primitive_processing_result.host_vertex_shader_type, pa_cl_vte_cntl, viewport_info,
-      normalized_depth_control, skate3_ultrawide_state);
-  const float skate3_ultrawide_hor_plus_scale =
-      skate3_ultrawide_hor_plus_draw ? skate3_ultrawide_state.hor_plus_scale : 1.0f;
   for (uint32_t i = 0; i < 3; ++i) {
-    const float ndc_scale =
-        i == 0 ? viewport_info.ndc_scale[i] * skate3_ultrawide_hor_plus_scale
-               : viewport_info.ndc_scale[i];
-    dirty |= system_constants_.ndc_scale[i] != ndc_scale;
+    dirty |= system_constants_.ndc_scale[i] != viewport_info.ndc_scale[i];
     dirty |= system_constants_.ndc_offset[i] != viewport_info.ndc_offset[i];
-    system_constants_.ndc_scale[i] = ndc_scale;
+    system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
     system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
   }
 

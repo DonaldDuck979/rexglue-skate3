@@ -11,6 +11,7 @@ add_library(rexcore OBJECT
     exception_handler.cpp
     filesystem.cpp
     filesystem_wildcard.cpp
+    guest_presence.cpp
     logging.cpp
     memory.cpp
     mutex.cpp
@@ -20,7 +21,6 @@ add_library(rexcore OBJECT
     string_buffer.cpp
     threading.cpp
     timer_queue.cpp
-    ultrawide_debug.cpp
     utf8.cpp
     vec128.cpp
 )
