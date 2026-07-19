@@ -170,19 +170,9 @@ REXCVAR_DEFINE_INT32(vulkan_gpu_clock_log_interval_frames, 120, "GPU/Vulkan",
     .range(0, 36000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-// Skate 3 ultrawide cvars. These mirror the Direct3D 12 backend's definitions
-// so the Hor+ classifier behaves identically on Vulkan; the D3D12 translation
-// unit is not compiled on this platform, so without these the queries below
-// would resolve to an unregistered flag (empty string -> false/0) and silently
-// disable the shadow-map skip.
-REXCVAR_DEFINE_BOOL(skate3_ultrawide_skip_shadow_targets, true, "Skate 3",
-                    "Do not apply Skate 3 Hor+ NDC correction while rendering likely shadow maps")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_ultrawide_shadow_skip_mode, 2, "Skate 3",
-                     "Shadow pass skip mode: 1 = square atlases, 2 = plus large offscreen, "
-                     "3 = plus all depth-only")
-    .range(1, 3)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// The shared Skate 3 Hor+ classifier cvars (skate3_ultrawide_skip_shadow_targets,
+// skate3_ultrawide_shadow_skip_mode) live in graphics/command_processor.cpp so
+// every backend sees one registration; the queries below resolve them by name.
 REXCVAR_DEFINE_BOOL(skate3_ultrawide_skip_screen_space_targets, false, "Skate 3",
                     "Exclude screen-space/orthographic (pre-divided XY) passes from Skate 3 Hor+ "
                     "NDC correction. Off by default so the Vulkan default classifier matches the "

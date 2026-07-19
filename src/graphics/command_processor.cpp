@@ -61,6 +61,18 @@ REXCVAR_DEFINE_INT32(scaled_resolve_texture_loads_from_shared_memory_max_pixels,
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Skate 3 Hor+ ultrawide classifier controls shared by every graphics backend.
+// Defined here (not per backend) so builds with several backends compiled in
+// register them exactly once.
+REXCVAR_DEFINE_BOOL(skate3_ultrawide_skip_shadow_targets, true, "Skate 3",
+                    "Do not apply Skate 3 Hor+ NDC correction while rendering likely shadow maps")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_ultrawide_shadow_skip_mode, 2, "Skate 3",
+                     "Shadow pass skip mode: 1 = square atlases, 2 = plus large offscreen, "
+                     "3 = plus all depth-only")
+    .range(1, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"

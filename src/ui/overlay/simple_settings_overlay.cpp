@@ -222,6 +222,10 @@ std::vector<std::string_view> GetSimpleSettingsCvars() {
   } else if (device_cvar == "vulkan_device" && HasCvar("vulkan_device")) {
     cvars.push_back("vulkan_device");
   }
+  // Persist the graphics API choice only on builds where it can be chosen.
+  if (HasCvar("gpu_backend") && HasCvar("d3d12_adapter") && HasCvar("vulkan_device")) {
+    cvars.push_back("gpu_backend");
+  }
   if (HasCvar("skate3_ultrawide")) {
     cvars.push_back("skate3_ultrawide");
   }
@@ -289,7 +293,11 @@ int ResolutionIndexFromCvar() {
 }
 
 bool HasHostFrameCapCvars() {
-  return HasCvar("d3d12_present_frame_limiter") && HasCvar("d3d12_present_frame_limiter_fps");
+  // The host present limiter is implemented by the D3D12 presenter; on builds
+  // with both backends compiled in its cvars exist even while Vulkan renders,
+  // so gate on the backend actually running.
+  return HasCvar("d3d12_present_frame_limiter") && HasCvar("d3d12_present_frame_limiter_fps") &&
+         GetGraphicsDeviceList().cvar_name != "vulkan_device";
 }
 
 // The guest-side cap paces the game's render loop at the swap boundary, so
@@ -561,6 +569,26 @@ void CopyToBuffer(char* buffer, size_t buffer_size, const std::string& value) {
 
 void SetBoolCvar(std::string_view name, bool value) {
   rex::cvar::SetFlagByName(name, value ? "true" : "false");
+}
+
+// The Graphics API row only exists on builds with both backends compiled in;
+// each backend's UI provider registers its device cvar, so their joint
+// presence identifies such a build.
+bool HasGraphicsApiChoice() {
+  return HasCvar("gpu_backend") && HasCvar("d3d12_adapter") && HasCvar("vulkan_device");
+}
+
+// 0 = Direct3D 12, 1 = Vulkan. "auto" reads as the backend actually running,
+// so the row reflects reality even after a startup fallback.
+int GraphicsApiIndexFromCvar() {
+  const std::string value = rex::cvar::Query<std::string>("gpu_backend");
+  if (value == "vulkan") {
+    return 1;
+  }
+  if (value == "d3d12") {
+    return 0;
+  }
+  return GetGraphicsDeviceList().cvar_name == "vulkan_device" ? 1 : 0;
 }
 
 bool TearingFromCvar() {
@@ -960,6 +988,7 @@ void SimpleSettingsDialog::Show() {
 
 void SimpleSettingsDialog::LoadSettingsFromCvars() {
   device_list_ = GetGraphicsDeviceList();
+  graphics_api_index_ = HasGraphicsApiChoice() ? GraphicsApiIndexFromCvar() : 0;
   device_index_ = DeviceIndexFromCvar(device_list_);
   resolution_scale_index_ = ResolutionIndexFromCvar();
   frame_cap_index_ = FrameCapIndexFromCvar();
@@ -1007,7 +1036,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
-  return device_index_ != DeviceIndexFromCvar(device_list_) ||
+  return (HasGraphicsApiChoice() && graphics_api_index_ != GraphicsApiIndexFromCvar()) ||
+         device_index_ != DeviceIndexFromCvar(device_list_) ||
          resolution_scale_index_ != ResolutionIndexFromCvar() ||
          frame_cap_index_ != FrameCapIndexFromCvar() ||
          (HasCvar("skate3_ultrawide") &&
@@ -1082,6 +1112,12 @@ void SimpleSettingsDialog::SaveVideo() {
   aspect_ratio_index_ =
       std::clamp(aspect_ratio_index_, 0, static_cast<int>(kAspectRatioLabels.size()) - 1);
   field_of_view_ = std::clamp(field_of_view_, 40.0f, 120.0f);
+  graphics_api_index_ = std::clamp(graphics_api_index_, 0, 1);
+  // Written only when the selection changed, so an untouched row keeps the
+  // cvar on "auto".
+  if (HasGraphicsApiChoice() && graphics_api_index_ != GraphicsApiIndexFromCvar()) {
+    rex::cvar::SetFlagByName("gpu_backend", graphics_api_index_ == 1 ? "vulkan" : "d3d12");
+  }
   if (!device_list_.device_names.empty() && HasCvar(device_list_.cvar_name)) {
     device_index_ = std::clamp(device_index_, 0,
                                static_cast<int>(device_list_.device_names.size()) - 1);
@@ -1207,6 +1243,22 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
   switch (category) {
     case 0: {  // Video
       header("Display");
+      if (HasGraphicsApiChoice()) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Graphics API";
+        row.desc =
+            "Which graphics API the game renders through. Both perform "
+            "similarly - try the other one if you run into driver issues. "
+            "Applied with Apply & Restart.";
+        row.options = {"DirectX 12", "Vulkan"};
+        row.index = &graphics_api_index_;
+        row.reset = [this] {
+          // The build default ("auto") prefers DirectX 12 on Windows.
+          graphics_api_index_ = 0;
+        };
+        rows.push_back(std::move(row));
+      }
       if (!device_list_.device_names.empty() && HasCvar(device_list_.cvar_name)) {
         RowSpec row;
         row.kind = RowSpec::kEnum;

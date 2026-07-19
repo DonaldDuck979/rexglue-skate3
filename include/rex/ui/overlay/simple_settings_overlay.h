@@ -96,6 +96,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
 
   // Staged setting values (committed by SaveVideo / SaveProfile).
   GraphicsDeviceList device_list_;
+  int graphics_api_index_ = 0;
   int device_index_ = 0;
   int resolution_scale_index_ = 0;
   int frame_cap_index_ = 0;

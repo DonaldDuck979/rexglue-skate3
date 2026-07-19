@@ -59,6 +59,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace rex {
 
@@ -208,6 +209,13 @@ void StartForcedExitWatchdog(const char* reason) {
 
 REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, true, "UI/Advanced",
                     "Enable the developer cvar browser on F4");
+
+REXCVAR_DEFINE_STRING(gpu_backend, "auto", "GPU",
+                      "Graphics API used for rendering (auto, d3d12, vulkan). Auto prefers "
+                      "Direct3D 12 when available. Applied at startup; when the selected API "
+                      "fails to initialize, any other compiled-in backend is tried.")
+    .allowed({"auto", "d3d12", "vulkan"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(show_fps_counter, false, "UI", "Show the guest FPS counter overlay")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -505,22 +513,75 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 }
 
 bool ReXApp::SetupPresentation() {
+  // Candidate graphics backends in preference order. The gpu_backend cvar
+  // (already loaded from the config/settings files by SetupEnvironment)
+  // reorders the list at runtime; "auto" keeps Direct3D 12 first when it is
+  // compiled in.
+  struct GraphicsCandidate {
+    const char* id;    // gpu_backend cvar value
+    const char* name;  // log-facing name
+    std::unique_ptr<rex::system::IGraphicsSystem> (*make)();
+  };
+  std::vector<GraphicsCandidate> candidates;
 #if REX_HAS_D3D12
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
-#elif REX_HAS_VULKAN
-  config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
+  candidates.push_back({"d3d12", "Direct3D 12", []() -> std::unique_ptr<rex::system::IGraphicsSystem> {
+                          return std::make_unique<rex::graphics::d3d12::D3D12GraphicsSystem>();
+                        }});
 #endif
+#if REX_HAS_VULKAN
+  candidates.push_back({"vulkan", "Vulkan", []() -> std::unique_ptr<rex::system::IGraphicsSystem> {
+                          return std::make_unique<rex::graphics::vulkan::VulkanGraphicsSystem>();
+                        }});
+#endif
+  const std::string requested = REXCVAR_GET(gpu_backend);
+  if (requested != "auto" && !candidates.empty()) {
+    bool available = false;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      if (requested == candidates[i].id) {
+        GraphicsCandidate wanted = candidates[i];
+        candidates.erase(candidates.begin() + i);
+        candidates.insert(candidates.begin(), wanted);
+        available = true;
+        break;
+      }
+    }
+    if (!available) {
+      REXLOG_WARN("gpu_backend={} is not available in this build; using {}", requested,
+                  candidates[0].id);
+    }
+  }
+
+  size_t candidate_index = 0;
+  if (!candidates.empty()) {
+    config_.graphics = candidates[candidate_index].make();
+  }
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
 
+  rex::system::IGraphicsSystem* selected_graphics = config_.graphics.get();
   OnPreSetup(config_);
+  // A consumer may substitute its own graphics system in OnPreSetup; the
+  // candidate fallback below only applies to the stock selection.
+  const bool stock_graphics = config_.graphics.get() == selected_graphics;
 
   if (config_.graphics) {
-    X_STATUS status = config_.graphics->SetupPresentation(&app_context());
-    if (XFAILED(status)) {
+    for (;;) {
+      X_STATUS status = config_.graphics->SetupPresentation(&app_context());
+      if (!XFAILED(status)) {
+        if (stock_graphics && !candidates.empty()) {
+          REXLOG_INFO("Graphics backend: {} (gpu_backend={})",
+                      candidates[candidate_index].name, requested);
+        }
+        break;
+      }
       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);
-      return false;
+      if (!stock_graphics || candidate_index + 1 >= candidates.size()) {
+        return false;
+      }
+      ++candidate_index;
+      REXLOG_WARN("Trying the {} graphics backend instead", candidates[candidate_index].name);
+      config_.graphics = candidates[candidate_index].make();
     }
   }
 

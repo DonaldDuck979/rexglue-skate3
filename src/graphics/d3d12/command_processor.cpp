@@ -58,14 +58,9 @@ REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamp_buckets, false, "GPU/D3D12",
                     "the breakdown in the FPS overlay and a periodic profile log")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(skate3_ultrawide_skip_shadow_targets, true, "Skate 3",
-                    "Do not apply Skate 3 Hor+ NDC correction while rendering likely shadow maps")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_ultrawide_shadow_skip_mode, 2, "Skate 3",
-                     "Shadow pass skip mode: 1 = square atlases, 2 = plus large offscreen, "
-                     "3 = plus all depth-only")
-    .range(1, 3)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Defined in graphics/command_processor.cpp, shared with the Vulkan backend.
+REXCVAR_DECLARE(bool, skate3_ultrawide_skip_shadow_targets);
+REXCVAR_DECLARE(int32_t, skate3_ultrawide_shadow_skip_mode);
 REXCVAR_DEFINE_BOOL(skate3_ultrawide_fake_occlusion_queries, false, "Skate 3",
                     "Return positive visibility query results while Skate 3 Hor+ ultrawide is "
                     "active so side-of-frame assets remain resident")
