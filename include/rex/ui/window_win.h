@@ -51,6 +51,7 @@ class Win32Window : public Window {
   void RequestCloseImpl() override;
 
   uint32_t GetLatestDpiImpl() const override;
+  float QueryDisplayRefreshHzImpl() const override;
 
   void ApplyNewFullscreen() override;
   void ApplyNewTitle() override;

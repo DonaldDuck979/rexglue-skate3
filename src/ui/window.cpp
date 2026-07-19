@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 
 #include <rex/assert.h>
@@ -59,6 +60,23 @@ REXCVAR_DEFINE_DOUBLE(video_mode_refresh_rate, 60.0, "GPU", "Guest video mode re
 
 namespace rex {
 namespace ui {
+
+namespace {
+// Process-wide display refresh cache (see Window::CachedDisplayRefreshHz):
+// written on the UI thread, read from any thread (frame pacers, settings UI).
+std::atomic<float> g_display_refresh_hz{0.0f};
+}  // namespace
+
+float Window::CachedDisplayRefreshHz() {
+  return g_display_refresh_hz.load(std::memory_order_relaxed);
+}
+
+void Window::UpdateCachedDisplayRefresh() {
+  const float hz = QueryDisplayRefreshHzImpl();
+  if (hz > 0.0f) {
+    g_display_refresh_hz.store(hz, std::memory_order_relaxed);
+  }
+}
 
 Window::Window(WindowedAppContext& app_context, const std::string_view title,
                uint32_t desired_logical_width, uint32_t desired_logical_height)
@@ -221,6 +239,7 @@ bool Window::Open() {
     return true;
   }
   phase_ = Phase::kOpen;
+  UpdateCachedDisplayRefresh();
 
   // Call the listeners (OnOpened with all the new state so the listeners are
   // aware that they can start interacting with the open Window, and after that,
@@ -541,6 +560,11 @@ void Window::OnFocusUpdate(bool new_has_focus, WindowDestructionReceiver& destru
     return;
   }
   has_focus_ = new_has_focus;
+  if (has_focus_) {
+    // Focus gain is the cheapest reliable moment to notice the window moved
+    // to a display with a different refresh rate.
+    UpdateCachedDisplayRefresh();
+  }
   UISetupEvent e(this);
   if (has_focus_) {
     SendEventToListeners([&e](auto listener) { listener->OnGotFocus(e); }, destruction_receiver);

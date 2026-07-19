@@ -29,6 +29,7 @@ class SDLWindow final : public Window {
 
  protected:
   uint32_t GetLatestDpiImpl() const override;
+  float QueryDisplayRefreshHzImpl() const override;
   bool OpenImpl() override;
   void RequestCloseImpl() override;
 

@@ -217,6 +217,11 @@ class Window {
     return dpi ? dpi : GetMediumDpi();
   }
 
+  // Last known refresh rate (Hz) of the display a window occupies, 0 while
+  // unknown. Published by the common code on window open and focus gain;
+  // readable from any thread (frame pacers, settings UI).
+  static float CachedDisplayRefreshHz();
+
   // Round trips are not guaranteed to return the same results.
   static constexpr uint32_t ConvertSizeDpi(uint32_t size, uint32_t new_dpi, uint32_t old_dpi) {
     // Always rounding up to prevent zero sizes (unless the input is zero) as
@@ -442,6 +447,14 @@ class Window {
   // such as the last DPI from an existing window, the system DPI, or just the
   // medium DPI (0 returned from it will also be treated as medium DPI).
   virtual uint32_t GetLatestDpiImpl() const { return GetMediumDpi(); }
+
+  // Refresh rate (Hz) of the display the window currently occupies, or 0 when
+  // the platform can't report it. UI thread only (native display queries);
+  // consumers on other threads read the cache below.
+  virtual float QueryDisplayRefreshHzImpl() const { return 0.0f; }
+  // Re-query the display refresh rate and publish it to the process-wide
+  // cache (UI thread; called by the common code on open and focus gain).
+  void UpdateCachedDisplayRefresh();
 
   // Deletion of the window may (and must) not happen in OpenImpl, the listeners
   // are deferred, so there's no need to use WindowDestructionReceiver in it.

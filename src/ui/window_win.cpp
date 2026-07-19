@@ -403,6 +403,29 @@ uint32_t Win32Window::GetLatestDpiImpl() const {
   return dpi_;
 }
 
+float Win32Window::QueryDisplayRefreshHzImpl() const {
+  if (!hwnd_) {
+    return 0.0f;
+  }
+  HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+  if (!monitor) {
+    return 0.0f;
+  }
+  MONITORINFOEXW mi = {};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfoW(monitor, &mi)) {
+    return 0.0f;
+  }
+  DEVMODEW dm = {};
+  dm.dmSize = sizeof(dm);
+  if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) ||
+      !(dm.dmFields & DM_DISPLAYFREQUENCY) || dm.dmDisplayFrequency <= 1) {
+    // 0 and 1 are the documented "hardware default" sentinels.
+    return 0.0f;
+  }
+  return float(dm.dmDisplayFrequency);
+}
+
 void Win32Window::ApplyNewFullscreen() {
   // Various functions here may send messages that may result in the
   // listeners being invoked, and potentially cause the destruction of the

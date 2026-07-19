@@ -406,6 +406,18 @@ void SDLWindow::HandleSDLEvent(const SDL_Event& event) {
 
 uint32_t SDLWindow::GetLatestDpiImpl() const { return dpi_ ? dpi_ : kDefaultDpi; }
 
+float SDLWindow::QueryDisplayRefreshHzImpl() const {
+  if (!window_) {
+    return 0.0f;
+  }
+  const SDL_DisplayID display = SDL_GetDisplayForWindow(window_);
+  if (!display) {
+    return 0.0f;
+  }
+  const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);
+  return mode != nullptr && mode->refresh_rate > 0.0f ? mode->refresh_rate : 0.0f;
+}
+
 bool SDLWindow::OpenImpl() {
   SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
   SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE;
