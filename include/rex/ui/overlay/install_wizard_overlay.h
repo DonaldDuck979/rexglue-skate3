@@ -24,9 +24,10 @@ class InstallWizardDialog final : public ImGuiDialog {
                                             std::string& error)>;
   using CompleteCallback = std::function<void()>;
 
-  InstallWizardDialog(ImGuiDrawer* drawer, std::string title, std::string intro,
-                      std::string install_directory, PickSourceCallback pick_source,
-                      InstallCallback install, CompleteCallback complete);
+  InstallWizardDialog(ImGuiDrawer* drawer, std::string title, std::string section_label,
+                      std::string intro, std::string install_directory,
+                      PickSourceCallback pick_source, InstallCallback install,
+                      CompleteCallback complete);
 
  protected:
   void OnClose() override;
@@ -45,6 +46,7 @@ class InstallWizardDialog final : public ImGuiDialog {
   void FinishInstallIfNeeded();
 
   std::string title_;
+  std::string section_label_;
   std::string intro_;
   std::string install_directory_;
   PickSourceCallback pick_source_;
@@ -59,6 +61,12 @@ class InstallWizardDialog final : public ImGuiDialog {
   std::filesystem::path source_path_;
   std::string status_;
   std::string error_;
+  // Wizard-screen navigation state (see ui/overlay/wizard_screen.h).
+  int focus_index_ = 0;
+  float highlight_anim_y_ = -1.0f;
+  // >= 0 while the completion handoff is pending: counts down the frames
+  // drawn to acknowledge the activation before the (blocking) callback runs.
+  int launch_frames_ = -1;
 };
 
 }  // namespace rex::ui

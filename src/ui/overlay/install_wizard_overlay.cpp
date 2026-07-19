@@ -10,14 +10,18 @@
 
 #include <imgui.h>
 
+#include "wizard_screen.h"
+
 namespace rex::ui {
 
 InstallWizardDialog::InstallWizardDialog(ImGuiDrawer* drawer, std::string title,
-                                         std::string intro, std::string install_directory,
+                                         std::string section_label, std::string intro,
+                                         std::string install_directory,
                                          PickSourceCallback pick_source, InstallCallback install,
                                          CompleteCallback complete)
     : ImGuiDialog(drawer),
       title_(std::move(title)),
+      section_label_(std::move(section_label)),
       intro_(std::move(intro)),
       install_directory_(std::move(install_directory)),
       pick_source_(std::move(pick_source)),
@@ -36,6 +40,14 @@ void InstallWizardDialog::PickSourceAndInstall() {
     return;
   }
   auto source_path = pick_source_();
+  // The modal picker swallows the release of whatever input activated this
+  // action; balance ImGui's state so the stuck "down" doesn't eat the next
+  // press.
+  ImGuiIO& io = ImGui::GetIO();
+  io.AddMouseButtonEvent(0, false);
+  io.AddKeyEvent(ImGuiKey_Enter, false);
+  io.AddKeyEvent(ImGuiKey_KeypadEnter, false);
+  io.AddKeyEvent(ImGuiKey_Space, false);
   if (source_path.empty()) {
     return;
   }
@@ -86,57 +98,61 @@ void InstallWizardDialog::FinishInstallIfNeeded() {
 void InstallWizardDialog::OnDraw(ImGuiIO& io) {
   FinishInstallIfNeeded();
 
-  const float width = std::min(760.0f, std::max(460.0f, io.DisplaySize.x - 64.0f));
-  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-                          ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-  ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
-
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 22.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f, 9.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12.0f, 12.0f));
-  ImGui::PushFont(nullptr, 18.0f);
-
-  if (ImGui::Begin(title_.c_str(), nullptr,
-                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
-                       ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::TextWrapped("%s", status_.c_str());
-    ImGui::Spacing();
-    ImGui::TextWrapped("Install directory: %s", install_directory_.c_str());
-
-    if (!source_path_.empty()) {
-      ImGui::TextWrapped("Source: %s", source_path_.string().c_str());
+  // The completion callback hands off to the (lengthy) game boot, freezing
+  // the last presented frame. Acknowledge the activation visually first:
+  // draw frames with the action row gone and a launch status, and only
+  // invoke the callback once one has presented - AFTER this frame's draw,
+  // so no empty frame flashes between this screen and whatever follows.
+  bool run_complete = false;
+  if (launch_frames_ >= 0) {
+    if (launch_frames_ == 0) {
+      launch_frames_ = -1;
+      run_complete = true;
+    } else {
+      --launch_frames_;
     }
-
-    if (state_ == State::kInstalling) {
-      const uint64_t total = total_bytes_.load(std::memory_order_relaxed);
-      const uint64_t copied = copied_bytes_.load(std::memory_order_relaxed);
-      const float progress =
-          total == 0 ? 0.0f : std::clamp(static_cast<float>(double(copied) / double(total)), 0.0f, 1.0f);
-      ImGui::ProgressBar(progress, ImVec2(-1.0f, 28.0f));
-    } else if (state_ == State::kFailed) {
-      ImGui::TextColored(ImVec4(0.95f, 0.28f, 0.24f, 1.0f), "%s", error_.c_str());
-    }
-
-    ImGui::Spacing();
-    if (state_ == State::kWaitingForSource || state_ == State::kFailed) {
-      if (ImGui::Button("Select ISO", ImVec2(160.0f, 42.0f))) {
-        PickSourceAndInstall();
-      }
-    } else if (state_ == State::kInstalled) {
-      if (ImGui::Button("Start Game", ImVec2(160.0f, 42.0f))) {
-        auto complete = std::move(complete_);
-        Close();
-        if (complete) {
-          complete();
-        }
-      }
-    }
-
-    ImGui::End();
   }
 
-  ImGui::PopFont();
-  ImGui::PopStyleVar(3);
+  WizardScreenSpec spec;
+  spec.title = title_.c_str();
+  spec.section = section_label_.c_str();
+  spec.paragraphs.push_back({status_, WizardScreenSpec::Emphasis::kNormal});
+  if (state_ == State::kFailed && !error_.empty()) {
+    spec.paragraphs.push_back({error_, WizardScreenSpec::Emphasis::kDanger});
+  }
+  spec.info_rows.push_back({"Install Directory", install_directory_});
+  if (!source_path_.empty()) {
+    spec.info_rows.push_back({"Source", source_path_.string()});
+  }
+  if (state_ == State::kInstalling) {
+    spec.show_progress = true;
+    spec.progress_copied = copied_bytes_.load(std::memory_order_relaxed);
+    spec.progress_total = total_bytes_.load(std::memory_order_relaxed);
+  }
+  if (state_ == State::kWaitingForSource || state_ == State::kFailed) {
+    spec.actions.push_back("Select ISO");
+  } else if (state_ == State::kInstalled && launch_frames_ < 0) {
+    spec.actions.push_back("Start Game");
+  }
+
+  const int activated =
+      DrawWizardScreen(imgui_drawer(), io, spec, focus_index_, highlight_anim_y_);
+  if (run_complete) {
+    auto complete = std::move(complete_);
+    Close();
+    if (complete) {
+      complete();
+    }
+    return;
+  }
+  if (activated == 0) {
+    if (state_ == State::kInstalled) {
+      status_ = "Starting the game...";
+      launch_frames_ = 1;
+    } else {
+      PickSourceAndInstall();
+    }
+  }
 }
 
 }  // namespace rex::ui

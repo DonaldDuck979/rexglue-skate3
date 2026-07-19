@@ -10,6 +10,8 @@
 
 #include <imgui.h>
 
+#include "wizard_screen.h"
+
 namespace rex::ui {
 
 AcquireWizardDialog::AcquireWizardDialog(ImGuiDrawer* drawer, Options options, FetchCallback fetch,
@@ -65,6 +67,14 @@ void AcquireWizardDialog::PickSourceAndInstall() {
     return;
   }
   auto source_path = pick_source_();
+  // The modal picker swallows the release of whatever input activated this
+  // action; balance ImGui's state so the stuck "down" doesn't eat the next
+  // press.
+  ImGuiIO& io = ImGui::GetIO();
+  io.AddMouseButtonEvent(0, false);
+  io.AddKeyEvent(ImGuiKey_Enter, false);
+  io.AddKeyEvent(ImGuiKey_KeypadEnter, false);
+  io.AddKeyEvent(ImGuiKey_Space, false);
   if (source_path.empty()) {
     return;
   }
@@ -108,75 +118,87 @@ void AcquireWizardDialog::FinishWorkIfNeeded() {
 void AcquireWizardDialog::OnDraw(ImGuiIO& io) {
   FinishWorkIfNeeded();
 
-  const float width = std::min(760.0f, std::max(460.0f, io.DisplaySize.x - 64.0f));
-  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-                          ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-  ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
-
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 22.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f, 9.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12.0f, 12.0f));
-  ImGui::PushFont(nullptr, 18.0f);
-
-  if (ImGui::Begin(options_.title.c_str(), nullptr,
-                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
-                       ImGuiWindowFlags_AlwaysAutoResize)) {
-    if (!options_.intro.empty()) {
-      ImGui::TextWrapped("%s", options_.intro.c_str());
-      ImGui::Spacing();
+  // The completion callback hands off to the (lengthy) game boot, freezing
+  // the last presented frame. Acknowledge the activation visually first:
+  // draw frames with the action row gone and a launch status, and only
+  // invoke the callback once one has presented - AFTER this frame's draw,
+  // so no empty frame flashes between this screen and whatever follows.
+  bool run_complete = false;
+  if (launch_frames_ >= 0) {
+    if (launch_frames_ == 0) {
+      launch_frames_ = -1;
+      run_complete = true;
+    } else {
+      --launch_frames_;
     }
-    if (!options_.target_directory.empty()) {
-      ImGui::TextWrapped("Install directory: %s", options_.target_directory.c_str());
-    }
-    ImGui::TextWrapped("%s", WorkingStatus().c_str());
-
-    if (!source_path_.empty()) {
-      ImGui::TextWrapped("Source: %s", source_path_.string().c_str());
-    }
-
-    if (state_ == State::kWorking) {
-      const uint64_t total = total_bytes_.load(std::memory_order_relaxed);
-      const uint64_t copied = copied_bytes_.load(std::memory_order_relaxed);
-      const float progress =
-          total == 0 ? 0.0f
-                     : std::clamp(static_cast<float>(double(copied) / double(total)), 0.0f, 1.0f);
-      ImGui::ProgressBar(progress, ImVec2(-1.0f, 28.0f));
-    } else if (state_ == State::kFailed) {
-      ImGui::TextColored(ImVec4(0.95f, 0.28f, 0.24f, 1.0f), "%s", error_.c_str());
-    }
-
-    ImGui::Spacing();
-    if (state_ == State::kWaitingForChoice || state_ == State::kFailed) {
-      bool first_button = true;
-      if (fetch_ && !options_.fetch_button_label.empty()) {
-        if (ImGui::Button(options_.fetch_button_label.c_str(), ImVec2(220.0f, 42.0f))) {
-          StartFetch();
-        }
-        first_button = false;
-      }
-      if (pick_source_ && install_ && !options_.pick_button_label.empty()) {
-        if (!first_button) {
-          ImGui::SameLine();
-        }
-        if (ImGui::Button(options_.pick_button_label.c_str(), ImVec2(180.0f, 42.0f))) {
-          PickSourceAndInstall();
-        }
-      }
-    } else if (state_ == State::kDone) {
-      if (ImGui::Button(options_.done_button_label.c_str(), ImVec2(160.0f, 42.0f))) {
-        auto complete = std::move(complete_);
-        Close();
-        if (complete) {
-          complete();
-        }
-      }
-    }
-
-    ImGui::End();
   }
 
-  ImGui::PopFont();
-  ImGui::PopStyleVar(3);
+  WizardScreenSpec spec;
+  spec.title = options_.title.c_str();
+  spec.section = options_.section_label.c_str();
+  if (!options_.intro.empty()) {
+    spec.paragraphs.push_back({options_.intro, WizardScreenSpec::Emphasis::kNormal});
+  }
+  // The connecting-status substitution only applies while a fetch is live.
+  const std::string& status = state_ == State::kWorking ? WorkingStatus() : status_;
+  spec.paragraphs.push_back({status, options_.intro.empty()
+                                         ? WizardScreenSpec::Emphasis::kNormal
+                                         : WizardScreenSpec::Emphasis::kDim});
+  if (state_ == State::kFailed && !error_.empty()) {
+    spec.paragraphs.push_back({error_, WizardScreenSpec::Emphasis::kDanger});
+  }
+  if (!options_.target_directory.empty()) {
+    spec.info_rows.push_back({"Install Directory", options_.target_directory});
+  }
+  if (!source_path_.empty()) {
+    spec.info_rows.push_back({"Source", source_path_.string()});
+  }
+  if (state_ == State::kWorking) {
+    spec.show_progress = true;
+    spec.progress_copied = copied_bytes_.load(std::memory_order_relaxed);
+    spec.progress_total = total_bytes_.load(std::memory_order_relaxed);
+  }
+
+  int fetch_action = -1;
+  int pick_action = -1;
+  int done_action = -1;
+  if (state_ == State::kWaitingForChoice || state_ == State::kFailed) {
+    if (fetch_ && !options_.fetch_button_label.empty()) {
+      fetch_action = static_cast<int>(spec.actions.size());
+      spec.actions.push_back(options_.fetch_button_label);
+    }
+    if (pick_source_ && install_ && !options_.pick_button_label.empty()) {
+      pick_action = static_cast<int>(spec.actions.size());
+      spec.actions.push_back(options_.pick_button_label);
+    }
+  } else if (state_ == State::kDone && launch_frames_ < 0) {
+    done_action = static_cast<int>(spec.actions.size());
+    spec.actions.push_back(options_.done_button_label);
+  }
+
+  const int activated =
+      DrawWizardScreen(imgui_drawer(), io, spec, focus_index_, highlight_anim_y_);
+  if (run_complete) {
+    auto complete = std::move(complete_);
+    Close();
+    if (complete) {
+      complete();
+    }
+    return;
+  }
+  if (activated < 0) {
+    return;
+  }
+  if (activated == fetch_action) {
+    StartFetch();
+  } else if (activated == pick_action) {
+    PickSourceAndInstall();
+  } else if (activated == done_action) {
+    if (!options_.launching_status.empty()) {
+      status_ = options_.launching_status;
+    }
+    launch_frames_ = 1;
+  }
 }
 
 }  // namespace rex::ui

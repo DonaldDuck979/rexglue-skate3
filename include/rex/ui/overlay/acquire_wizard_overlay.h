@@ -21,6 +21,7 @@ class AcquireWizardDialog final : public ImGuiDialog {
  public:
   struct Options {
     std::string title;
+    std::string section_label;  // accent section bar above the dialog body
     std::string intro;
     std::string target_directory;
     std::string initial_status;
@@ -35,6 +36,9 @@ class AcquireWizardDialog final : public ImGuiDialog {
     std::string install_working_status;
     std::string done_status;
     std::string done_button_label;
+    // Shown after the done button is activated, while the completion
+    // callback (usually the game boot) takes over.
+    std::string launching_status;
   };
 
   using PickSourceCallback = std::function<std::filesystem::path()>;
@@ -84,6 +88,12 @@ class AcquireWizardDialog final : public ImGuiDialog {
   std::filesystem::path source_path_;
   std::string status_;
   std::string error_;
+  // Wizard-screen navigation state (see ui/overlay/wizard_screen.h).
+  int focus_index_ = 0;
+  float highlight_anim_y_ = -1.0f;
+  // >= 0 while the completion handoff is pending: counts down the frames
+  // drawn to acknowledge the activation before the (blocking) callback runs.
+  int launch_frames_ = -1;
 };
 
 }  // namespace rex::ui
