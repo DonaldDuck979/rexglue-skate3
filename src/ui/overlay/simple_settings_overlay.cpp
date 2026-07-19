@@ -1754,7 +1754,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.label = "Renderer Indicator";
         row.desc =
             "Small corner readout of which renderer produced the last frame "
-            "(NATIVE or EMULATED). Applies immediately.";
+            "(NATIVE or EMULATED). Always shown while the Renderer setting "
+            "is Emulated. Applies immediately.";
         row.options = {"Off", "On"};
         row.flag = &mode_indicator_;
         row.on_enum_change = [this](int value) {
