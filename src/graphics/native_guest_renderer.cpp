@@ -7,7 +7,7 @@
 
 // Defined here (shared TU) rather than in a backend's command_processor.cpp
 // so both D3D12 and Vulkan see the same definition.
-REXCVAR_DEFINE_BOOL(native_render_suppress_emulated_draws, false, "GPU",
+REXCVAR_DEFINE_BOOL(native_render_suppress_emulated_draws, true, "GPU",
                     "While the registered native guest-output renderer is actively "
                     "replacing frames, skip emulated draw and resolve execution in the "
                     "command processor (PM4 parsing, fences, queries and memexport draws "
