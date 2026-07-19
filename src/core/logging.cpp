@@ -55,6 +55,12 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files 
     .range(1, 100)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_INT32(log_keep_sessions, 5, "Log",
+                     "Number of launches to keep sequential log files for; older sessions "
+                     "are deleted at startup so logs do not accumulate across launches")
+    .range(1, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 
 namespace {
@@ -75,18 +81,36 @@ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_di
 
   int max_seq = 0;
   std::string prefix = std::string(app_name) + "_";
+  std::vector<std::pair<int, std::filesystem::path>> session_files;
   std::error_code ec;
   for (const auto& entry : std::filesystem::directory_iterator(logs_dir, ec)) {
     if (!entry.is_regular_file())
       continue;
     auto stem = entry.path().stem().string();
-    if (stem.starts_with(prefix)) {
-      auto num_str = stem.substr(prefix.size());
-      int num = 0;
-      auto [ptr, parse_ec] = std::from_chars(num_str.data(), num_str.data() + num_str.size(), num);
-      if (parse_ec == std::errc() && ptr == num_str.data() + num_str.size())
-        max_seq = std::max(max_seq, num);
-    }
+    if (!stem.starts_with(prefix))
+      continue;
+    auto num_str = stem.substr(prefix.size());
+    int num = 0;
+    auto [ptr, parse_ec] = std::from_chars(num_str.data(), num_str.data() + num_str.size(), num);
+    if (parse_ec != std::errc() || ptr == num_str.data())
+      continue;
+    const bool full_match = ptr == num_str.data() + num_str.size();
+    // Rotated segments ("<app>_NNN.1.log") stem-parse as "NNN."; they prune
+    // with their session but don't advance the sequence.
+    if (!full_match && *ptr != '.')
+      continue;
+    if (full_match)
+      max_seq = std::max(max_seq, num);
+    session_files.emplace_back(num, entry.path());
+  }
+
+  // Prune old sessions so log files don't accumulate across launches: after
+  // this launch takes max_seq + 1, everything at or below the cutoff goes.
+  const int keep = std::max(1, REXCVAR_GET(log_keep_sessions));
+  const int cutoff = max_seq + 1 - keep;
+  for (const auto& [num, path] : session_files) {
+    if (num <= cutoff)
+      std::filesystem::remove(path, ec);
   }
 
   return logs_dir / fmt::format("{}_{:03d}.log", app_name, max_seq + 1);

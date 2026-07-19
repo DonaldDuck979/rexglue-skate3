@@ -208,8 +208,9 @@ void StartForcedExitWatchdog(const char* reason) {
 
 }  // namespace
 
-REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, true, "UI/Advanced",
-                    "Enable the developer cvar browser on F4");
+REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, false, "UI/Advanced",
+                    "Enable the developer cvar browser on F4")
+    .debug_only();
 
 REXCVAR_DEFINE_STRING(gpu_backend, "auto", "GPU",
                       "Graphics API used for rendering (auto, d3d12, vulkan). Auto prefers "

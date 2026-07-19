@@ -53,7 +53,7 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 20> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 23> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -66,6 +66,9 @@ constexpr std::array<std::string_view, 20> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene_shafts",
     "skate3_native_render_scene_haze",
     "skate3_native_render_mode_indicator",
+    "skate3_draw_distance_scale",
+    "skate3_lod_distance_scale",
+    "skate3_draw_distance_stream_probe",
     "show_fps_counter",
     "monitor",
     "mnk_sensitivity",
@@ -1439,7 +1442,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           SaveSimpleSettingsConfig(config_path_);
         };
         row.reset = [this] {
-          renderer_native_ = CvarDefaultBool("skate3_native_render_scene", false);
+          renderer_native_ = CvarDefaultBool("skate3_native_render_scene", true);
           SetBoolCvar("skate3_native_render_scene", renderer_native_);
           SaveSimpleSettingsConfig(config_path_);
         };
@@ -1759,7 +1762,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           SaveSimpleSettingsConfig(config_path_);
         };
         row.reset = [this] {
-          mode_indicator_ = CvarDefaultBool("skate3_native_render_mode_indicator", true);
+          mode_indicator_ = CvarDefaultBool("skate3_native_render_mode_indicator", false);
           SetBoolCvar("skate3_native_render_mode_indicator", mode_indicator_);
           SaveSimpleSettingsConfig(config_path_);
         };

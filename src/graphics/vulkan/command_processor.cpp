@@ -95,17 +95,6 @@ REXCVAR_DEFINE_INT32(vulkan_debug_log_team_profile_background_draws_remaining, 0
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
-REXCVAR_DEFINE_BOOL(vulkan_sync_after_resolve, false, "GPU/Vulkan",
-                    "Synchronously wait for Vulkan render-target resolves without CPU readback")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload)
-    .debug_only();
-
-REXCVAR_DEFINE_BOOL(vulkan_barrier_after_scaled_resolve, true, "GPU/Vulkan",
-                    "Submit a GPU memory barrier after scaled Vulkan render-target resolves so "
-                    "follow-up texture loads can read the scaled resolve buffer without CPU "
-                    "readback")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 REXCVAR_DEFINE_INT32(vulkan_readback_resolve_max_length, 0, "GPU/Vulkan",
                      "Maximum resolve byte length eligible for Vulkan CPU readback "
                      "(0 disables the length filter)")
@@ -164,10 +153,12 @@ REXCVAR_DEFINE_BOOL(vulkan_gpu_timestamp_buckets, false, "GPU/Vulkan",
                     "with timestamp queries and report them in the FPS overlay")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(vulkan_gpu_clock_log_interval_frames, 120, "GPU/Vulkan",
+REXCVAR_DEFINE_INT32(vulkan_gpu_clock_log_interval_frames, 0, "GPU/Vulkan",
                      "How often (in guest frames) to log the GPU clock/P-state telemetry line; "
-                     "P-state changes and large clock swings log immediately; 0 disables")
+                     "P-state changes and large clock swings log immediately; 0 (default) "
+                     "disables sampling and logging")
     .range(0, 36000)
+    .debug_only()
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // The shared Skate 3 Hor+ classifier cvars (skate3_ultrawide_skip_shadow_targets,
