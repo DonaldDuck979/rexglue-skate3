@@ -80,6 +80,18 @@ constexpr std::array<const char*, 6> kShadowQualityLabels = {
     "Off", "Auto", "512 (console)", "1024", "1536", "2048"};
 constexpr std::array<int32_t, 6> kShadowQualityTiles = {0, 0, 512, 1024, 1536, 2048};
 
+// Draw distance: one multiplier applied to both the world detail cull and
+// the character LOD switch ranges (paired hot cvars in the app layer).
+constexpr std::array<const char*, 4> kDrawDistanceLabels = {"Original", "2x",
+                                                           "3x", "5x"};
+constexpr std::array<double, 4> kDrawDistanceScales = {1.0, 2.0, 3.0, 5.0};
+
+// World streaming: pre-load radius in metres for neighbouring world cells
+// (0 = the game's own cell-boundary streaming).
+constexpr std::array<const char*, 4> kStreamProbeLabels = {
+    "Original", "Near (100 m)", "Extended (200 m)", "Far (300 m)"};
+constexpr std::array<double, 4> kStreamProbeRadii = {0.0, 100.0, 200.0, 300.0};
+
 // Audio device buffer sizes in sample frames (0 = backend default).
 constexpr std::array<const char*, 4> kAudioBufferLabels = {
     "Auto", "512 (low latency)", "1024", "2048 (most stable)"};
@@ -386,6 +398,42 @@ int ShadowQualityIndexFromCvar() {
   return ShadowQualityIndexFrom(
       rex::cvar::Query<bool>("skate3_native_render_scene_shadows"),
       rex::cvar::Query<int32_t>("skate3_native_render_scene_shadow_tile"));
+}
+
+bool HasDrawDistanceCvars() {
+  return HasCvar("skate3_draw_distance_scale") &&
+         HasCvar("skate3_lod_distance_scale");
+}
+
+template <size_t N>
+int NearestValueIndex(const std::array<double, N>& values, double value) {
+  int best = 0;
+  double best_err = std::abs(value - values[0]);
+  for (size_t i = 1; i < N; ++i) {
+    const double err = std::abs(value - values[i]);
+    if (err < best_err) {
+      best = static_cast<int>(i);
+      best_err = err;
+    }
+  }
+  return best;
+}
+
+int DrawDistanceIndexFromCvar() {
+  if (!HasDrawDistanceCvars()) {
+    return 0;
+  }
+  return NearestValueIndex(kDrawDistanceScales,
+                           rex::cvar::Query<double>("skate3_draw_distance_scale"));
+}
+
+int StreamProbeIndexFromCvar() {
+  if (!HasCvar("skate3_draw_distance_stream_probe")) {
+    return 0;
+  }
+  return NearestValueIndex(
+      kStreamProbeRadii,
+      rex::cvar::Query<double>("skate3_draw_distance_stream_probe"));
 }
 
 // The native/emulated renderer choice only means anything while the native
@@ -899,6 +947,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
       HasCvar("skate3_native_render_scene") && rex::cvar::Query<bool>("skate3_native_render_scene");
   ssao_ = HasCvar("skate3_native_render_scene_ssao") &&
           rex::cvar::Query<bool>("skate3_native_render_scene_ssao");
+  draw_distance_index_ = DrawDistanceIndexFromCvar();
+  stream_probe_index_ = StreamProbeIndexFromCvar();
   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
@@ -1261,7 +1311,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         rows.push_back(std::move(row));
       }
       if (HasRendererChoice() || HasMsaaCvar() || HasShadowQualityCvars() ||
-          HasCvar("skate3_native_render_scene_ssao")) {
+          HasCvar("skate3_native_render_scene_ssao") || HasDrawDistanceCvars()) {
         header("Quality");
       }
       if (HasRendererChoice()) {
@@ -1351,6 +1401,70 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] {
           ssao_ = CvarDefaultBool("skate3_native_render_scene_ssao", true);
           SetBoolCvar("skate3_native_render_scene_ssao", ssao_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasDrawDistanceCvars()) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Draw Distance";
+        row.desc =
+            "How far away small world objects, foliage and character detail "
+            "stay visible, as a multiple of the original console distances. "
+            "Higher settings draw more of the world and cost some "
+            "performance. Applies immediately.";
+        for (const char* label : kDrawDistanceLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &draw_distance_index_;
+        row.on_enum_change = [this](int value) {
+          value = std::clamp(value, 0,
+                             static_cast<int>(kDrawDistanceScales.size()) - 1);
+          const std::string scale = std::to_string(kDrawDistanceScales[value]);
+          rex::cvar::SetFlagByName("skate3_draw_distance_scale", scale);
+          rex::cvar::SetFlagByName("skate3_lod_distance_scale", scale);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          draw_distance_index_ = NearestValueIndex(
+              kDrawDistanceScales,
+              CvarDefaultDouble("skate3_draw_distance_scale", 2.0));
+          const std::string scale =
+              std::to_string(kDrawDistanceScales[draw_distance_index_]);
+          rex::cvar::SetFlagByName("skate3_draw_distance_scale", scale);
+          rex::cvar::SetFlagByName("skate3_lod_distance_scale", scale);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_draw_distance_stream_probe")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "World Streaming";
+        row.desc =
+            "Load neighbouring world areas before they come into view, so "
+            "buildings and trees stream in far away instead of appearing "
+            "nearby. Costs a little memory; Original is the console "
+            "behavior. Applies immediately.";
+        for (const char* label : kStreamProbeLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &stream_probe_index_;
+        row.on_enum_change = [this](int value) {
+          value = std::clamp(value, 0,
+                             static_cast<int>(kStreamProbeRadii.size()) - 1);
+          rex::cvar::SetFlagByName("skate3_draw_distance_stream_probe",
+                                   std::to_string(kStreamProbeRadii[value]));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          stream_probe_index_ = NearestValueIndex(
+              kStreamProbeRadii,
+              CvarDefaultDouble("skate3_draw_distance_stream_probe", 0.0));
+          rex::cvar::SetFlagByName(
+              "skate3_draw_distance_stream_probe",
+              std::to_string(kStreamProbeRadii[stream_probe_index_]));
           SaveSimpleSettingsConfig(config_path_);
         };
         rows.push_back(std::move(row));

@@ -116,6 +116,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // Live setting values (hot cvars, applied and saved on change).
   bool renderer_native_ = true;
   bool ssao_ = true;
+  int draw_distance_index_ = 1;
+  int stream_probe_index_ = 0;
   bool mode_indicator_ = true;
   bool fps_counter_ = false;
   bool audio_mute_ = false;
