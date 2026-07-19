@@ -53,11 +53,15 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 14> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 18> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
     "skate3_native_render_scene_shadow_tile",
+    "skate3_native_render_scene_shadow_static_casters",
+    "skate3_native_render_scene_shadow_static_strength",
+    "skate3_native_render_scene_shadow_static_size",
+    "skate3_native_render_scene_shadow_pcss",
     "skate3_native_render_scene_ssao",
     "skate3_native_render_mode_indicator",
     "show_fps_counter",
@@ -79,6 +83,12 @@ constexpr std::array<int32_t, 4> kMsaaSamples = {1, 2, 4, 8};
 constexpr std::array<const char*, 6> kShadowQualityLabels = {
     "Off", "Auto", "512 (console)", "1024", "1536", "2048"};
 constexpr std::array<int32_t, 6> kShadowQualityTiles = {0, 0, 512, 1024, 1536, 2048};
+
+// Enhanced (static sun) shadow map resolution per cascade tile.
+constexpr std::array<const char*, 4> kStaticShadowResLabels = {"1024", "2048",
+                                                               "4096", "8192"};
+constexpr std::array<int32_t, 4> kStaticShadowResSizes = {1024, 2048, 4096,
+                                                          8192};
 
 // Draw distance: one multiplier applied to both the world detail cull and
 // the character LOD switch ranges (paired hot cvars in the app layer).
@@ -398,6 +408,29 @@ int ShadowQualityIndexFromCvar() {
   return ShadowQualityIndexFrom(
       rex::cvar::Query<bool>("skate3_native_render_scene_shadows"),
       rex::cvar::Query<int32_t>("skate3_native_render_scene_shadow_tile"));
+}
+
+bool HasStaticShadowCvars() {
+  return HasCvar("skate3_native_render_scene_shadow_static_casters") &&
+         HasCvar("skate3_native_render_scene_shadow_static_size");
+}
+
+int StaticShadowResIndexFrom(int32_t size) {
+  int best = 0;
+  for (int i = 0; i < static_cast<int>(kStaticShadowResSizes.size()); ++i) {
+    if (size >= kStaticShadowResSizes[i]) {
+      best = i;
+    }
+  }
+  return best;
+}
+
+int StaticShadowResIndexFromCvar() {
+  if (!HasStaticShadowCvars()) {
+    return 2;
+  }
+  return StaticShadowResIndexFrom(
+      rex::cvar::Query<int32_t>("skate3_native_render_scene_shadow_static_size"));
 }
 
 bool HasDrawDistanceCvars() {
@@ -934,6 +967,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
       HasCvar("skate3_ultrawide") && rex::cvar::Query<bool>("skate3_ultrawide") ? 1 : 0;
   msaa_index_ = MsaaIndexFromCvar();
   shadow_quality_index_ = ShadowQualityIndexFromCvar();
+  static_shadow_res_index_ = StaticShadowResIndexFromCvar();
   monitor_index_ = MonitorIndexFromCvar();
   audio_buffer_index_ = AudioBufferIndexFromCvar();
   language_index_ = LanguageIndexFromCvar();
@@ -947,6 +981,17 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
       HasCvar("skate3_native_render_scene") && rex::cvar::Query<bool>("skate3_native_render_scene");
   ssao_ = HasCvar("skate3_native_render_scene_ssao") &&
           rex::cvar::Query<bool>("skate3_native_render_scene_ssao");
+  static_shadows_ =
+      HasCvar("skate3_native_render_scene_shadow_static_casters") &&
+      rex::cvar::Query<bool>("skate3_native_render_scene_shadow_static_casters");
+  static_shadow_strength_ =
+      HasCvar("skate3_native_render_scene_shadow_static_strength")
+          ? float(std::clamp(rex::cvar::Query<double>(
+                                 "skate3_native_render_scene_shadow_static_strength"),
+                             0.0, 1.0))
+          : 1.0f;
+  shadow_pcss_ = HasCvar("skate3_native_render_scene_shadow_pcss") &&
+                 rex::cvar::Query<bool>("skate3_native_render_scene_shadow_pcss");
   draw_distance_index_ = DrawDistanceIndexFromCvar();
   stream_probe_index_ = StreamProbeIndexFromCvar();
   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
@@ -969,6 +1014,8 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
           (aspect_ratio_index_ != 0) != rex::cvar::Query<bool>("skate3_ultrawide")) ||
          (HasMsaaCvar() && msaa_index_ != MsaaIndexFromCvar()) ||
          (HasShadowQualityCvars() && shadow_quality_index_ != ShadowQualityIndexFromCvar()) ||
+         (HasStaticShadowCvars() &&
+          static_shadow_res_index_ != StaticShadowResIndexFromCvar()) ||
          (HasCvar("monitor") && monitor_index_ != MonitorIndexFromCvar()) ||
          (HasCvar("audio_device_sample_frames") &&
           audio_buffer_index_ != AudioBufferIndexFromCvar()) ||
@@ -1096,6 +1143,14 @@ void SimpleSettingsDialog::SaveVideo() {
       rex::cvar::SetFlagByName("skate3_native_render_scene_shadow_tile",
                                std::to_string(kShadowQualityTiles[shadow_quality_index_]));
     }
+  }
+  if (HasStaticShadowCvars()) {
+    static_shadow_res_index_ = std::clamp(
+        static_shadow_res_index_, 0,
+        static_cast<int>(kStaticShadowResSizes.size()) - 1);
+    rex::cvar::SetFlagByName(
+        "skate3_native_render_scene_shadow_static_size",
+        std::to_string(kStaticShadowResSizes[static_shadow_res_index_]));
   }
   if (HasCvar("monitor")) {
     monitor_index_ = std::clamp(monitor_index_, 0, static_cast<int>(kMonitorLabels.size()) - 1);
@@ -1381,6 +1436,103 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           shadow_quality_index_ = ShadowQualityIndexFrom(
               CvarDefaultBool("skate3_native_render_scene_shadows", true),
               int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 0.0)));
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_native_render_scene_shadow_static_casters")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Enhanced Shadows";
+        row.desc =
+            "Real-time sun shadows cast by buildings, trees and props from a "
+            "dedicated sun-aligned shadow map; the original game only bakes "
+            "these into the world. Also shades the volumetric sun shafts. "
+            "Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &static_shadows_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("skate3_native_render_scene_shadow_static_casters",
+                      value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          static_shadows_ = CvarDefaultBool(
+              "skate3_native_render_scene_shadow_static_casters", true);
+          SetBoolCvar("skate3_native_render_scene_shadow_static_casters",
+                      static_shadows_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasStaticShadowCvars()) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Enhanced Shadow Resolution";
+        row.desc =
+            "Resolution per cascade of the enhanced shadow map. Higher is "
+            "sharper at distance but uses more video memory (roughly 50 MB "
+            "at 2048, 200 MB at 4096, 800 MB at 8192).";
+        for (const char* label : kStaticShadowResLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &static_shadow_res_index_;
+        row.reset = [this] {
+          static_shadow_res_index_ = StaticShadowResIndexFrom(int32_t(
+              CvarDefaultDouble("skate3_native_render_scene_shadow_static_size",
+                                4096.0)));
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_native_render_scene_shadow_static_strength")) {
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = "Enhanced Shadow Strength";
+        row.desc =
+            "How dark the enhanced shadows get (1 matches the game's dynamic "
+            "shadows). Lower values blend them with the baked lighting where "
+            "the two disagree. Applies immediately.";
+        row.value = &static_shadow_strength_;
+        row.min = 0.0f;
+        row.max = 1.0f;
+        row.step = 0.05f;
+        row.fmt = "%.2f";
+        row.on_value_change = [this] {
+          static_shadow_strength_ =
+              std::clamp(static_shadow_strength_, 0.0f, 1.0f);
+          rex::cvar::SetFlagByName(
+              "skate3_native_render_scene_shadow_static_strength",
+              std::to_string(static_shadow_strength_));
+        };
+        row.reset = [this] {
+          static_shadow_strength_ = float(CvarDefaultDouble(
+              "skate3_native_render_scene_shadow_static_strength", 1.0));
+          rex::cvar::SetFlagByName(
+              "skate3_native_render_scene_shadow_static_strength",
+              std::to_string(static_shadow_strength_));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_native_render_scene_shadow_pcss")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Soft Shadows";
+        row.desc =
+            "Contact-hardening soft shadows: crisp where a shadow meets its "
+            "caster, progressively softer with distance, following the sun's "
+            "angular size. Off uses fixed-width filtering. Applies "
+            "immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &shadow_pcss_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("skate3_native_render_scene_shadow_pcss", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          shadow_pcss_ =
+              CvarDefaultBool("skate3_native_render_scene_shadow_pcss", true);
+          SetBoolCvar("skate3_native_render_scene_shadow_pcss", shadow_pcss_);
+          SaveSimpleSettingsConfig(config_path_);
         };
         rows.push_back(std::move(row));
       }

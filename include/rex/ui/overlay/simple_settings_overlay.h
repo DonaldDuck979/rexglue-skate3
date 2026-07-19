@@ -102,6 +102,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   int aspect_ratio_index_ = 0;
   int msaa_index_ = 2;
   int shadow_quality_index_ = 2;
+  int static_shadow_res_index_ = 2;
   int monitor_index_ = 0;
   int audio_buffer_index_ = 0;
   int language_index_ = 0;
@@ -116,6 +117,9 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // Live setting values (hot cvars, applied and saved on change).
   bool renderer_native_ = true;
   bool ssao_ = true;
+  bool static_shadows_ = true;
+  float static_shadow_strength_ = 1.0f;
+  bool shadow_pcss_ = true;
   int draw_distance_index_ = 1;
   int stream_probe_index_ = 0;
   bool mode_indicator_ = true;
