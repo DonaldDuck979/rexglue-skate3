@@ -36,6 +36,14 @@ std::filesystem::path GetExecutablePath();
 // Get executable folder.
 std::filesystem::path GetExecutableFolder();
 
+// Get the application's root folder: the executable folder, or, when the
+// executable lives inside a macOS application bundle
+// ("<root>/<name>.app/Contents/MacOS/<exe>"), the folder containing the
+// bundle. User-facing files (config, game data, saves, DLC, logs) resolve
+// against this so a bundled app keeps them beside the bundle rather than
+// inside it.
+std::filesystem::path GetAppRootFolder();
+
 // Get user folder.
 std::filesystem::path GetUserFolder();
 

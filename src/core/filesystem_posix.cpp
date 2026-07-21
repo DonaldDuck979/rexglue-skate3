@@ -95,6 +95,21 @@ std::filesystem::path GetExecutableFolder() {
   return GetExecutablePath().parent_path();
 }
 
+std::filesystem::path GetAppRootFolder() {
+  auto folder = GetExecutableFolder();
+#if REX_PLATFORM_MAC
+  // <root>/<name>.app/Contents/MacOS/<exe> -> <root>
+  if (folder.filename() == "MacOS") {
+    const auto contents = folder.parent_path();
+    const auto bundle = contents.parent_path();
+    if (contents.filename() == "Contents" && bundle.extension() == ".app") {
+      return bundle.parent_path();
+    }
+  }
+#endif
+  return folder;
+}
+
 std::filesystem::path GetUserFolder() {
   // get preferred data home
   char* home = std::getenv("XDG_DATA_HOME");

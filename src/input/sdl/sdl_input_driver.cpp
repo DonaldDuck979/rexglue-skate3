@@ -16,6 +16,7 @@
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
@@ -96,18 +97,23 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       }
       SDL_Gamepad_initialized_ = true;
 
-      // Load custom controller mappings if available
+      // Load custom controller mappings if available. A relative path is
+      // resolved against the application root rather than the working
+      // directory, which is undefined when launched from a bundle/Finder.
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
+        if (mappings_path.is_relative()) {
+          mappings_path = rex::filesystem::GetAppRootFolder() / mappings_path;
+        }
         if (!std::filesystem::exists(mappings_path)) {
           REXLOG_WARN("SDL GameControllerDB: file '{}' does not exist.",
-                      REXCVAR_GET(hid_mappings_file));
+                      mappings_path.string());
         } else {
           auto mappings_result =
-              SDL_AddGamepadMappingsFromFile(REXCVAR_GET(hid_mappings_file).c_str());
+              SDL_AddGamepadMappingsFromFile(mappings_path.string().c_str());
           if (mappings_result < 0) {
             REXLOG_ERROR("SDL GameControllerDB: error loading file '{}': {}.",
-                         REXCVAR_GET(hid_mappings_file), mappings_result);
+                         mappings_path.string(), mappings_result);
           } else {
             REXLOG_INFO("SDL GameControllerDB: loaded {} mappings.", mappings_result);
           }

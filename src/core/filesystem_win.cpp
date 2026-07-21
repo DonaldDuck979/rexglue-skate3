@@ -65,6 +65,12 @@ std::filesystem::path GetExecutableFolder() {
   return GetExecutablePath().parent_path();
 }
 
+std::filesystem::path GetAppRootFolder() {
+  // Application bundles are a macOS concept; the executable folder is the
+  // application root everywhere else.
+  return GetExecutableFolder();
+}
+
 std::filesystem::path GetUserFolder() {
   std::filesystem::path result;
   PWSTR path;

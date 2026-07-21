@@ -312,7 +312,9 @@ bool ReXApp::OnInitialize() {
 }
 
 bool ReXApp::SetupEnvironment() {
-  auto exe_dir = rex::filesystem::GetExecutableFolder();
+  // App root, not executable folder: inside a macOS .app bundle the config
+  // and logs stay next to the bundle, where users can find them.
+  auto exe_dir = rex::filesystem::GetAppRootFolder();
   auto config_path = exe_dir / (std::string(GetName()) + ".toml");
 
   // Load config before resolving cvar-backed paths such as game_data_root.
