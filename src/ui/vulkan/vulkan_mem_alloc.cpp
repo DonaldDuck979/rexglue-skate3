@@ -85,6 +85,14 @@ VmaAllocator CreateVmaAllocator(const VulkanDevice* const vulkan_device,
   allocator_create_info.pVulkanFunctions = &vma_vulkan_functions;
   allocator_create_info.instance = vulkan_instance->instance();
   allocator_create_info.vulkanApiVersion = vulkan_device->properties().apiVersion;
+  // A VkDeviceMemory block only returns to the OS once every allocation in
+  // it is freed. With the 256 MB default block size, mixed-lifetime cache
+  // allocations keep every block partially occupied, so device memory
+  // freed by cache eviction stays resident for the whole session (a
+  // monotonic VRAM ratchet across content changes). 64 MB blocks empty and
+  // release far more often, while the allocation count stays orders of
+  // magnitude under maxMemoryAllocationCount.
+  allocator_create_info.preferredLargeHeapBlockSize = 64ull << 20;
   VmaAllocator allocator;
   if (vmaCreateAllocator(&allocator_create_info, &allocator) != VK_SUCCESS) {
     REXLOG_ERROR("Failed to create a Vulkan Memory Allocator instance");
