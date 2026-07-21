@@ -28,6 +28,13 @@
 
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
 
+REXCVAR_DEFINE_BOOL(draw_resolution_scaled_half_pixel_offset, true, "GPU",
+                    "With resolution scaling, apply the Direct3D 9 half-pixel offset as half a "
+                    "host pixel instead of half a guest pixel. Keeps the first host row and "
+                    "column of every render target region covered, so scaled resolves need no "
+                    "edge fill and resolve boundaries inside the frame (predicated tiling "
+                    "splits) show no seam.");
+
 REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
                     "Fill half pixel offset during resolution scale resolve");
 
@@ -323,8 +330,23 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
     offset_add_xy[1] += float(pa_sc_window_offset.window_y_offset);
   }
   if (REXCVAR_GET(half_pixel_offset) && pa_su_vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero) {
-    offset_add_xy[0] += 0.5f;
-    offset_add_xy[1] += 0.5f;
+    if (REXCVAR_GET(draw_resolution_scaled_half_pixel_offset) &&
+        (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1)) {
+      // Half a HOST pixel, expressed in guest units. A half-guest-pixel offset
+      // becomes one or more whole host pixels under resolution scaling,
+      // pushing all coverage off the first host row/column of every render
+      // target region; resolves then have to fill the uncovered edge by
+      // duplicating the adjacent row/column, which shows as a seam wherever a
+      // resolve boundary crosses the frame interior (predicated tiling
+      // splits the scene into multiple EDRAM tiles). Half a host pixel keeps
+      // the Direct3D 9 rasterization convention with every host pixel still
+      // covered, so no fill is needed.
+      offset_add_xy[0] += 0.5f / float(draw_resolution_scale_x);
+      offset_add_xy[1] += 0.5f / float(draw_resolution_scale_y);
+    } else {
+      offset_add_xy[0] += 0.5f;
+      offset_add_xy[1] += 0.5f;
+    }
   }
 
   // The maximum value is at least the maximum host render target size anyway -
@@ -1026,11 +1048,14 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   uint32_t edram_base_offset_tiles =
       base_offset_y_tiles * surface_pitch_tiles + base_offset_x_tiles;
 
-  // Write the color/depth EDRAM info.
+  // Write the color/depth EDRAM info. With the host-pixel offset mode there
+  // is no coverage gap along resolve region edges, and filling would instead
+  // overwrite valid pixels with their neighbors.
   bool fill_half_pixel_offset =
       (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) &&
       REXCVAR_GET(resolve_resolution_scale_fill_half_pixel_offset) &&
       REXCVAR_GET(half_pixel_offset) &&
+      !REXCVAR_GET(draw_resolution_scaled_half_pixel_offset) &&
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero;
   int32_t exp_bias = is_depth ? 0 : rb_copy_dest_info.copy_dest_exp_bias;
   ResolveEdramInfo depth_edram_info;
