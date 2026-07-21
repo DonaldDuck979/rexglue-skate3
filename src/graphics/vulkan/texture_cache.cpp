@@ -47,17 +47,19 @@ REXCVAR_DEFINE_INT32(vulkan_debug_log_3d_as_2d_remaining, 0, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
-REXCVAR_DEFINE_BOOL(vulkan_texel_buffer_texture_loads, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_texel_buffer_texture_loads, false, "GPU/Vulkan",
                     "Read guest texture data through uniform texel buffers instead of raw "
                     "storage buffer loads where a texel-buffer variant of the load shader is "
-                    "available - much faster for the tiled access pattern on some hosts")
+                    "available - much faster for the tiled access pattern on some hosts, but "
+                    "reported to regress badly on others; off by default")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_storage_image_texture_loads, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_storage_image_texture_loads, false, "GPU/Vulkan",
                     "Write guest texture data directly from the load shader through a storage "
                     "image where a variant of the load shader is available, instead of going "
                     "through an intermediate buffer and a buffer-to-image copy - the copy is "
-                    "several times slower than device bandwidth on some hosts")
+                    "several times slower than device bandwidth on some hosts, but reported to "
+                    "regress badly on others; off by default")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
