@@ -1422,7 +1422,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       {
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "Vertical Synchronisation";
+        row.label = "V-Sync";
         row.desc =
             "Waits for the display before presenting frames. Adds latency and can cause "
             "judder with the frame pacing this port uses.";
@@ -1435,10 +1435,10 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       {
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "Variable Refresh / Tearing";
+        row.label = "VRR / Tearing";
         row.desc =
-            "Allows uncapped presentation with variable-refresh displays (G-Sync / "
-            "FreeSync). Recommended on.";
+            "Allows uncapped presentation with variable-refresh-rate displays "
+            "(G-Sync / FreeSync). Recommended on.";
         row.options = {"Off", "On"};
         row.flag = &tearing_;
         row.reset = [this] { tearing_ = TearingDefault(); };
@@ -1471,7 +1471,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       if (HasMsaaCvar()) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "Anti-Aliasing (MSAA)";
+        row.label = "MSAA Anti-Aliasing";
         row.desc =
             "Multisampling for the native renderer. Smooths distant thin geometry "
             "(railings, wires) that shimmers otherwise.";
@@ -1565,7 +1565,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       if (HasCvar("skate3_native_render_scene_shadow_pcss")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "Soft Shadows";
+        row.label = "PCSS Shadows";
         row.desc =
             "Contact-hardening soft shadows (PCSS): crisp where a shadow "
             "meets its caster, progressively softer with distance, following "
@@ -1589,11 +1589,11 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       if (HasCvar("skate3_native_render_scene_ssao")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "Ambient Occlusion";
+        row.label = "GTAO Ambient Occlusion";
         row.desc =
-            "Soft contact shading where surfaces meet (under ledges, rails, "
-            "vehicles, the skater). Native renderer only; applies "
-            "immediately.";
+            "Ground-truth ambient occlusion: soft contact shading where "
+            "surfaces meet (under ledges, rails, vehicles, the skater). "
+            "Native renderer only; applies immediately.";
         row.options = {"Off", "On"};
         row.flag = &ssao_;
         row.on_enum_change = [this](int value) {
