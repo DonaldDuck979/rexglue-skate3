@@ -1471,7 +1471,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       if (HasMsaaCvar()) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "MSAA Anti-Aliasing";
+        row.label = "Anti-Aliasing (MSAA)";
         row.desc =
             "Multisampling for the native renderer. Smooths distant thin geometry "
             "(railings, wires) that shimmers otherwise.";
@@ -1589,11 +1589,11 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       if (HasCvar("skate3_native_render_scene_ssao")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "GTAO Ambient Occlusion";
+        row.label = "Ambient Occlusion";
         row.desc =
-            "Ground-truth ambient occlusion: soft contact shading where "
-            "surfaces meet (under ledges, rails, vehicles, the skater). "
-            "Native renderer only; applies immediately.";
+            "Ground-truth ambient occlusion (GTAO): soft contact shading "
+            "where surfaces meet (under ledges, rails, vehicles, the "
+            "skater). Native renderer only; applies immediately.";
         row.options = {"Off", "On"};
         row.flag = &ssao_;
         row.on_enum_change = [this](int value) {
