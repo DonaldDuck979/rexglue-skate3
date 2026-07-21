@@ -1262,8 +1262,9 @@ class NrDeviceVulkan : public nrhi::Device {
       std::lock_guard<std::mutex> lock(mutex_);
       // Bounded per frame: the eviction sweeps retire thousands of objects
       // at once, and destroying them all in one frame is its own hitch (the
-      // remainder drains over the following frames).
-      DrainRetired(cp_->GetCompletedSubmission(), 512);
+      // remainder drains over the following frames). 256 objects measured
+      // ~5 ms worst case through the allocator.
+      DrainRetired(cp_->GetCompletedSubmission(), 256);
     }
     ++frame_index_;
     if ((frame_index_ % 600) == 0) {
@@ -1282,11 +1283,18 @@ class NrDeviceVulkan : public nrhi::Device {
                              (unsigned long long)(budgets[i].usage >> 20),
                              (unsigned long long)(budgets[i].budget >> 20));
       }
-      REXLOG_INFO("nrhi-vulkan mem: {} | bufs upload dl={}MB host={}MB, default dl={}MB host={}MB",
-                  line, g_buf_bytes_upload_dl.load(std::memory_order_relaxed) >> 20,
-                  g_buf_bytes_upload_host.load(std::memory_order_relaxed) >> 20,
-                  g_buf_bytes_default_dl.load(std::memory_order_relaxed) >> 20,
-                  g_buf_bytes_default_host.load(std::memory_order_relaxed) >> 20);
+      size_t retired_backlog = 0;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        retired_backlog = retired_.size();
+      }
+      REXLOG_INFO(
+          "nrhi-vulkan mem: {} | bufs upload dl={}MB host={}MB, default dl={}MB host={}MB | "
+          "retired={}",
+          line, g_buf_bytes_upload_dl.load(std::memory_order_relaxed) >> 20,
+          g_buf_bytes_upload_host.load(std::memory_order_relaxed) >> 20,
+          g_buf_bytes_default_dl.load(std::memory_order_relaxed) >> 20,
+          g_buf_bytes_default_host.load(std::memory_order_relaxed) >> 20, retired_backlog);
     }
     ring_region_base_ = uint32_t(frame_index_ % kRingRegions) * kRingRegionSize;
     ring_region_offset_ = 0;

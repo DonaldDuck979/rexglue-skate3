@@ -904,13 +904,41 @@ class NrDeviceD3D12 : public nrhi::Device {
                         uint32_t height, nrhi::Texture** guest_output_out) {
     guest_output_state_ = guest_output_internal_state;
     cmd_.ResetFrameState();
+    const auto maint_t0 = std::chrono::steady_clock::now();
+    const size_t dissolved_count = dissolved_views_.size();
     FlushDissolvedViews();
+    const auto drain_t0 = std::chrono::steady_clock::now();
+    size_t released = 0;
+    size_t backlog = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // Bounded per frame: the eviction sweeps retire thousands of objects
       // at once, and releasing them all in one frame is its own hitch (the
-      // remainder drains over the following frames).
-      DrainRetired(cp_->GetCompletedSubmission(), 512);
+      // remainder drains over the following frames). Committed-resource
+      // releases are kernel-priced, so the budget stays small.
+      released = DrainRetired(cp_->GetCompletedSubmission(), 256);
+      backlog = retired_.size();
+    }
+    // Frame-maintenance attribution (this work runs outside the app's
+    // RenderScene timers, so a sustained cost here is otherwise invisible).
+    // Throttled 8 per 5 s.
+    const auto maint_end = std::chrono::steady_clock::now();
+    const int64_t maint_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(maint_end - maint_t0).count();
+    if (maint_us >= 2000) {
+      static std::chrono::steady_clock::time_point s_window_start{};
+      static uint32_t s_window_count = 0;
+      if (maint_end - s_window_start > std::chrono::seconds(5)) {
+        s_window_start = maint_end;
+        s_window_count = 0;
+      }
+      if (++s_window_count <= 8) {
+        const int64_t drain_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(maint_end - drain_t0).count();
+        REXLOG_INFO(
+            "nrhi-d3d12: SLOW frame maintenance {}us: dissolve={}us/{} drain={}us/{} backlog={}",
+            maint_us, maint_us - drain_us, dissolved_count, drain_us, released, backlog);
+      }
     }
     NrTextureD3D12*& wrapper = guest_outputs_[guest_output_resource];
     if (wrapper != nullptr &&
@@ -1047,7 +1075,7 @@ class NrDeviceD3D12 : public nrhi::Device {
     uint32_t count;
   };
 
-  void DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX) {
+  size_t DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX) {
     size_t released = 0;
     std::erase_if(retired_, [&](const RetiredObject& r) {
       if (r.submission < completed && released < max_objects) {
@@ -1062,6 +1090,7 @@ class NrDeviceD3D12 : public nrhi::Device {
     srv_slots_.Drain(completed);
     rtv_slots_.Drain(completed);
     dsv_slots_.Drain(completed);
+    return released;
   }
 
   void DestroyGuestOutputWrapperLocked(NrTextureD3D12* wrapper) {
