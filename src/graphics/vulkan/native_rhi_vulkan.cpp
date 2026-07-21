@@ -497,7 +497,20 @@ class NrDeviceVulkan : public nrhi::Device {
   static constexpr VkDeviceSize kSsboBindRange = 65536;  // covered by kBufferPadding
 
   static constexpr uint32_t kRingRegions = 8;
-  static constexpr uint32_t kRingRegionSize = 1024 * 1024;
+  static constexpr uint32_t kRingRegionSize = 2 * 1024 * 1024;
+  // Mirrors VulkanCommandProcessor::kMaxFramesInFlight (private there): the
+  // CP fences frame N so that frame N - kCpFramesInFlight has fully executed
+  // before N records.
+  static constexpr uint32_t kCpFramesInFlight = 3;
+  // Ring regions provably idle while a frame records, usable as overflow
+  // space for frames whose constants exceed one region. Of the kRingRegions
+  // regions, the recording frame's own region, the kCpFramesInFlight - 1
+  // regions behind it (the GPU may not have read them yet) and the
+  // kCpFramesInFlight - 1 regions ahead of it (the next frames record into
+  // them before this frame executes) are live; the rest belong to frames the
+  // in-flight fence has already retired.
+  static constexpr uint32_t kRingOverflowRegions =
+      kRingRegions + 1 - 2 * kCpFramesInFlight;
 
   explicit NrDeviceVulkan(VulkanCommandProcessor* cp)
       : cp_(cp), vulkan_device_(cp->GetVulkanDevice()) {
@@ -1290,14 +1303,18 @@ class NrDeviceVulkan : public nrhi::Device {
       }
       REXLOG_INFO(
           "nrhi-vulkan mem: {} | bufs upload dl={}MB host={}MB, default dl={}MB host={}MB | "
-          "retired={}",
+          "retired={} | ring peak={}KB ovf={}",
           line, g_buf_bytes_upload_dl.load(std::memory_order_relaxed) >> 20,
           g_buf_bytes_upload_host.load(std::memory_order_relaxed) >> 20,
           g_buf_bytes_default_dl.load(std::memory_order_relaxed) >> 20,
-          g_buf_bytes_default_host.load(std::memory_order_relaxed) >> 20, retired_backlog);
+          g_buf_bytes_default_host.load(std::memory_order_relaxed) >> 20, retired_backlog,
+          ring_peak_bytes_ >> 10, ring_overflow_count_);
     }
     ring_region_base_ = uint32_t(frame_index_ % kRingRegions) * kRingRegionSize;
     ring_region_offset_ = 0;
+    ring_overflow_hops_ = 0;
+    ring_peak_bytes_ = std::max(ring_peak_bytes_, ring_frame_bytes_);
+    ring_frame_bytes_ = 0;
     cmd_.ResetFrameState();
     // Close any emulated render pass and flush the CP's queued barriers: the
     // raw commands recorded below (and by the app callback) go into the same
@@ -1394,20 +1411,46 @@ class NrDeviceVulkan : public nrhi::Device {
     NrProfScope prof_scope(prof_.const_slice);
     uint32_t aligned = (size_bytes + 255u) & ~255u;
     if (ring_region_offset_ + aligned > kRingRegionSize) {
-      // Region exhausted: wrap to the region start. A visual glitch (draws
-      // early in the frame may see late constants) beats a crash.
-      if (!ring_wrap_logged_) {
-        ring_wrap_logged_ = true;
-        REXLOG_ERROR(
-            "nrhi-vulkan: root-constant ring region exhausted ({} bytes/frame), wrapping - "
-            "constants may glitch this session",
-            kRingRegionSize);
+      if (ring_overflow_hops_ < kRingOverflowRegions) {
+        // Region exhausted: continue in a region the in-flight fence has
+        // already retired (see kRingOverflowRegions). Wrapping to the region
+        // start instead silently overwrote the frame's EARLIEST recorded
+        // draws - the shadow-atlas caster pass - so oversized frames (static
+        // sun-map rebuilds, dense views) dropped every dynamic shadow for
+        // exactly one frame: a character/vehicle shadow blink unique to this
+        // backend (D3D12 uses true root constants).
+        ring_region_base_ =
+            uint32_t((frame_index_ + kCpFramesInFlight + ring_overflow_hops_) %
+                     kRingRegions) *
+            kRingRegionSize;
+        ring_region_offset_ = 0;
+        ++ring_overflow_hops_;
+        ++ring_overflow_count_;
+        if (ring_overflow_count_ == 1 || (ring_overflow_count_ & 1023u) == 0) {
+          REXLOG_INFO(
+              "nrhi-vulkan: root-constant region overflow (> {} bytes this frame), "
+              "continuing in idle region (hop {}/{}, n={})",
+              kRingRegionSize, ring_overflow_hops_, kRingOverflowRegions,
+              ring_overflow_count_);
+        }
+      } else {
+        // Every safe region is full (> kRingRegionSize * (1 +
+        // kRingOverflowRegions) bytes in one frame): wrap to the current
+        // region's start. A visual glitch beats a crash.
+        if (!ring_wrap_logged_) {
+          ring_wrap_logged_ = true;
+          REXLOG_ERROR(
+              "nrhi-vulkan: root-constant ring exhausted past every overflow region "
+              "({} bytes/frame), wrapping - constants may glitch this session",
+              kRingRegionSize * (1 + kRingOverflowRegions));
+        }
+        ring_region_offset_ = 0;
       }
-      ring_region_offset_ = 0;
     }
     uint32_t offset = ring_region_base_ + ring_region_offset_;
     std::memcpy(ring_mapping_ + offset, data, size_bytes);
     ring_region_offset_ += aligned;
+    ring_frame_bytes_ += aligned;
     return offset;
   }
 
@@ -2065,6 +2108,14 @@ class NrDeviceVulkan : public nrhi::Device {
   uint64_t frame_index_ = 0;
   uint32_t ring_region_base_ = 0;
   uint32_t ring_region_offset_ = 0;
+  // Overflow regions consumed by the recording frame / total overflow events
+  // this session (see AllocateConstantSlice).
+  uint32_t ring_overflow_hops_ = 0;
+  uint64_t ring_overflow_count_ = 0;
+  // Constant bytes allocated by the recording frame and the session peak,
+  // reported with the periodic memory log to keep region sizing honest.
+  uint32_t ring_frame_bytes_ = 0;
+  uint32_t ring_peak_bytes_ = 0;
   bool ring_wrap_logged_ = false;
 
   // White 1x1 fallback.
