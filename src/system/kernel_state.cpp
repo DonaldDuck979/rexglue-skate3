@@ -12,6 +12,11 @@
 #include <cstring>
 #include <string>
 
+#include <rex/platform.h>
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#endif
+
 #include <fmt/format.h>
 
 #include <rex/assert.h>
@@ -863,6 +868,21 @@ void KernelState::TerminateTitle() {
   global_lock.lock();
 #else
   // Suspend all running guest threads so they stop touching shared state.
+  //
+  // Guest threads allocate on the process heap constantly (kernel calls,
+  // capture hooks), and SuspendThread stops a thread at an arbitrary
+  // instruction: without protection one can be caught inside the allocator
+  // OWNING the heap lock, and the thread-object frees below then deadlock
+  // the close forever (observed: UI thread parked in RtlpFreeHeap while the
+  // suspended guest render thread sat in RtlpAllocateHeap). Holding the heap
+  // lock across the suspension makes that state unreachable: a thread inside
+  // the allocator finishes before HeapLock returns, and later entrants block
+  // without owning the lock. The lock is reentrant for this thread, so the
+  // bookkeeping below may still allocate.
+#if REX_PLATFORM_WIN32
+  HANDLE process_heap = GetProcessHeap();
+  HeapLock(process_heap);
+#endif
   std::vector<XThread*> suspended_threads;
   for (auto it = threads_by_id_.begin(); it != threads_by_id_.end(); ++it) {
     if (!XThread::IsInThread(it->second) && it->second->is_guest_thread() &&
@@ -871,6 +891,9 @@ void KernelState::TerminateTitle() {
       suspended_threads.push_back(it->second);
     }
   }
+#if REX_PLATFORM_WIN32
+  HeapUnlock(process_heap);
+#endif
 
   // Terminate each suspended thread. Must drop the lock since Terminate waits.
   global_lock.unlock();

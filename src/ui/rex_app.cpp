@@ -47,13 +47,21 @@
 #include <sys/utsname.h>
 #endif
 
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <fmt/format.h>
 #include <imgui.h>
 #include <toml++/toml.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -206,8 +214,30 @@ void LogLinuxRuntimeDiagnostics() {
 void StartForcedExitWatchdog(const char* reason) {
   std::thread([reason]() {
     std::this_thread::sleep_for(std::chrono::seconds(10));
-    REXLOG_WARN("{} watchdog exiting process after shutdown timeout", reason);
+    // The teardown this guards can wedge with the process heap lock orphaned
+    // (a guest thread suspended or terminated mid-allocation), so the kill
+    // path must not allocate or run lock-taking shutdown: logging and
+    // std::_Exit are both off-limits on Windows (ExitProcess acquires the
+    // heap lock inside RtlExitUserProcess, deadlocking the watchdog itself).
+    // TerminateProcess skips user-mode cleanup entirely; on POSIX std::_Exit
+    // is a plain exit_group with no lock use. The marker is emitted through
+    // heap-free primitives only.
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "%s watchdog terminating process after shutdown timeout\n",
+                  reason);
+#if REX_PLATFORM_WIN32
+    OutputDebugStringA(msg);
+    HANDLE log_handle = GetStdHandle(STD_ERROR_HANDLE);
+    if (log_handle != INVALID_HANDLE_VALUE && log_handle != nullptr) {
+      DWORD written = 0;
+      WriteFile(log_handle, msg, DWORD(std::strlen(msg)), &written, nullptr);
+    }
+    TerminateProcess(GetCurrentProcess(), EXIT_SUCCESS);
+#else
+    ssize_t written = write(STDERR_FILENO, msg, std::strlen(msg));
+    (void)written;
     std::_Exit(EXIT_SUCCESS);
+#endif
   }).detach();
 }
 
