@@ -27,6 +27,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/audio/audio_driver.h>
+#include <rex/platform.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 #include <toml++/toml.hpp>
@@ -53,7 +54,7 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 23> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -74,6 +75,7 @@ constexpr std::array<std::string_view, 23> kOptionalSimpleSettingsCvars = {
     "mnk_sensitivity",
     "hid_rumble_enabled",
     "menu_chord",
+    "input_backend",
     "audio_mute",
     "audio_device_sample_frames",
     "user_language"};
@@ -576,6 +578,21 @@ void SetBoolCvar(std::string_view name, bool value) {
   rex::cvar::SetFlagByName(name, value ? "true" : "false");
 }
 
+// The Controller Backend row is Windows-only: every other platform always
+// runs the SDL input driver, so there is nothing to choose.
+bool HasInputBackendChoice() {
+#if REX_PLATFORM_WIN32
+  return HasCvar("input_backend");
+#else
+  return false;
+#endif
+}
+
+// 0 = XInput, 1 = SDL.
+int InputBackendIndexFromCvar() {
+  return rex::cvar::Query<std::string>("input_backend") == "sdl" ? 1 : 0;
+}
+
 // The Graphics API row only exists on builds with both backends compiled in;
 // each backend's UI provider registers its device cvar, so their joint
 // presence identifies such a build.
@@ -1040,6 +1057,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                          : 1.0f;
   chord_custom_.clear();
   chord_index_ = HasCvar("menu_chord") ? MenuChordIndexFromCvar(&chord_custom_) : 0;
+  input_backend_index_ = HasInputBackendChoice() ? InputBackendIndexFromCvar() : 0;
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
@@ -1822,8 +1840,31 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasCvar("hid_rumble_enabled") || HasCvar("menu_chord")) {
+      if (HasInputBackendChoice() || HasCvar("hid_rumble_enabled") || HasCvar("menu_chord")) {
         header("Controller");
+      }
+      if (HasInputBackendChoice()) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Controller Backend";
+        row.desc =
+            "Which API reads controllers. XInput supports Xbox controllers; "
+            "SDL also supports PlayStation, Switch and most generic "
+            "controllers without extra software. Applies after restarting "
+            "the game.";
+        row.value_note = "Restart to apply";
+        row.options = {"XInput", "SDL"};
+        row.index = &input_backend_index_;
+        row.on_enum_change = [this](int value) {
+          rex::cvar::SetFlagByName("input_backend", value == 1 ? "sdl" : "xinput");
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          input_backend_index_ = 0;
+          rex::cvar::SetFlagByName("input_backend", "xinput");
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
       }
       if (HasCvar("hid_rumble_enabled")) {
         RowSpec row;

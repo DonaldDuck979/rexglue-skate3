@@ -130,6 +130,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool rumble_ = true;
   float mnk_sensitivity_ = 1.0f;
   int chord_index_ = 0;
+  int input_backend_index_ = 0;
   std::string chord_custom_;
 
   // Navigation state.
