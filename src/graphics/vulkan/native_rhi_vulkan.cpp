@@ -248,8 +248,9 @@ class NrBufferVulkan : public nrhi::Buffer {
   VkBuffer buffer = VK_NULL_HANDLE;
   VmaAllocation allocation = VK_NULL_HANDLE;
   void* mapping = nullptr;
-  uint64_t size_ = 0;  // the app-requested size (allocation is padded)
+  uint64_t size_ = 0;  // the app-requested size (kFull allocations are padded)
   HeapKind heap = HeapKind::kDefault;
+  nrhi::BufferBindClass bind_class = nrhi::BufferBindClass::kFull;
   bool device_local = false;  // memory-type DEVICE_LOCAL (diagnostics)
 };
 
@@ -384,10 +385,11 @@ struct NrFrameProf {
   Bucket view_create;
   Bucket const_slice;
   Bucket pipeline_build;
+  Bucket drain;
   void Reset() { *this = NrFrameProf{}; }
   uint64_t Total() const {
     return pass_open.us + flush_barriers.us + copies.us + table_miss.us + set0_miss.us +
-           view_destroy.us + view_create.us + const_slice.us + pipeline_build.us;
+           view_destroy.us + view_create.us + const_slice.us + pipeline_build.us + drain.us;
   }
 };
 
@@ -535,6 +537,7 @@ class NrDeviceVulkan : public nrhi::Device {
     // Callers guarantee GPU idle; release everything immediately.
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
     const VkDevice device = vulkan_device_->device();
+    FlushDissolvedViews();
     DrainRetired(~0ull);
     for (auto& entry : set0_sets_) {
       dfn.vkFreeDescriptorSets(device, entry.second.pool, 1, &entry.second.set);
@@ -649,12 +652,31 @@ class NrDeviceVulkan : public nrhi::Device {
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VmaAllocationCreateInfo alloc_info = {};
+    // The descriptor-window padding only matters for buffers that can be
+    // bound through dynamic-offset UBO/SSBO descriptors; narrower bind
+    // classes skip it (and the descriptor usage bits).
+    const bool descriptor_bindable = desc.bind_class == nrhi::BufferBindClass::kFull;
+    const uint64_t padding = descriptor_bindable ? kBufferPadding : 0;
+    VkBufferUsageFlags app_usage;
+    switch (desc.bind_class) {
+      case nrhi::BufferBindClass::kCopySrc:
+        app_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        break;
+      case nrhi::BufferBindClass::kVertexIndex:
+        app_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        break;
+      case nrhi::BufferBindClass::kFull:
+      default:
+        app_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        break;
+    }
     switch (desc.heap) {
       case HeapKind::kUpload:
-        info.size = desc.size + kBufferPadding;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        info.size = desc.size + padding;
+        info.usage = app_usage;
         alloc_info.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
                            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
@@ -676,13 +698,14 @@ class NrDeviceVulkan : public nrhi::Device {
         break;
       case HeapKind::kDefault:
       default:
-        info.size = desc.size + kBufferPadding;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        info.size = desc.size + padding;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | app_usage;
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         break;
     }
+    // Unpadded classes could otherwise reach vkCreateBuffer with size 0
+    // (invalid); the padded classes never could.
+    info.size = std::max<VkDeviceSize>(info.size, 4);
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     VmaAllocationInfo result_info = {};
@@ -712,6 +735,7 @@ class NrDeviceVulkan : public nrhi::Device {
     b->mapping = result_info.pMappedData;  // persistent map for host heaps
     b->size_ = desc.size;
     b->heap = desc.heap;
+    b->bind_class = desc.bind_class;
     b->device_local = mem_dl;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -806,22 +830,25 @@ class NrDeviceVulkan : public nrhi::Device {
     // Retire cached set-0 descriptor sets whose buffer tuple references this
     // buffer. set0_sets_ is render-thread-only, like the D3D12 backend's
     // bindings_: buffer destruction of bound buffers happens on the render
-    // thread.
+    // thread. Non-kFull buffers can never appear in a descriptor tuple, so
+    // their destruction (the mesh/staging churn path) skips the scan.
     const uint64_t submission = cp_->GetCurrentSubmission();
-    for (auto it = set0_sets_.begin(); it != set0_sets_.end();) {
-      bool references = false;
-      for (uint32_t i = 0; i < it->first.count; ++i) {
-        if (it->first.buffers[i] == b->buffer) {
-          references = true;
-          break;
+    if (b->bind_class == nrhi::BufferBindClass::kFull) {
+      for (auto it = set0_sets_.begin(); it != set0_sets_.end();) {
+        bool references = false;
+        for (uint32_t i = 0; i < it->first.count; ++i) {
+          if (it->first.buffers[i] == b->buffer) {
+            references = true;
+            break;
+          }
         }
-      }
-      if (references) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        RetireDescriptorSetLocked(it->second, submission);
-        it = set0_sets_.erase(it);
-      } else {
-        ++it;
+        if (references) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          RetireDescriptorSetLocked(it->second, submission);
+          it = set0_sets_.erase(it);
+        } else {
+          ++it;
+        }
       }
     }
     if (b->heap == HeapKind::kUpload) {
@@ -864,15 +891,33 @@ class NrDeviceVulkan : public nrhi::Device {
 
   void DestroyDeferred(nrhi::TextureView* view) override {
     if (view == nullptr) return;
-    NrProfScope prof_scope(prof_.view_destroy);
+    // Destruction is batched: the view object stays allocated (so its
+    // address cannot be reused by a new view while stale cache keys still
+    // hold it) and FlushDissolvedViews sweeps the descriptor-set cache ONCE
+    // per frame for the whole batch. The eviction sweeps retire ~1500 views
+    // in a single frame; a per-view cache scan was a measured 10-15 ms
+    // recurring hitch.
     auto* v = static_cast<NrTextureViewVulkan*>(view);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      live_views_.erase(v);
+    }
+    dissolved_views_.push_back(v);
+  }
+
+  // Render thread, once per frame (and at device destruction): retire every
+  // cached texture descriptor set referencing a view destroyed since the
+  // last flush, then retire the views themselves.
+  void FlushDissolvedViews() {
+    if (dissolved_views_.empty()) return;
+    NrProfScope prof_scope(prof_.view_destroy);
     const uint64_t submission = cp_->GetCurrentSubmission();
-    // Retire every cached texture descriptor set this view participates in
-    // (render-thread-only cache, mirroring the D3D12 backend's bindings_).
+    std::unordered_set<const NrTextureViewVulkan*> dissolved(dissolved_views_.begin(),
+                                                             dissolved_views_.end());
     for (auto it = table_sets_.begin(); it != table_sets_.end();) {
       bool references = false;
       for (uint32_t i = 0; i < it->first.count; ++i) {
-        if (it->first.views[i] == v) {
+        if (dissolved.count(it->first.views[i]) != 0) {
           references = true;
           break;
         }
@@ -886,12 +931,14 @@ class NrDeviceVulkan : public nrhi::Device {
       }
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    live_views_.erase(v);
-    RetiredObject r;
-    r.submission = submission;
-    r.view = v->view;
-    retired_.push_back(r);
-    delete v;
+    for (NrTextureViewVulkan* v : dissolved_views_) {
+      RetiredObject r;
+      r.submission = submission;
+      r.view = v->view;
+      retired_.push_back(r);
+      delete v;
+    }
+    dissolved_views_.clear();
   }
 
   void DestroyDeferred(nrhi::Pipeline* pipeline) override {
@@ -1210,9 +1257,13 @@ class NrDeviceVulkan : public nrhi::Device {
                         bool guest_output_ever_written, uint32_t width, uint32_t height,
                         nrhi::Texture** guest_output_out) {
     prof_.Reset();
+    FlushDissolvedViews();
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      DrainRetired(cp_->GetCompletedSubmission());
+      // Bounded per frame: the eviction sweeps retire thousands of objects
+      // at once, and destroying them all in one frame is its own hitch (the
+      // remainder drains over the following frames).
+      DrainRetired(cp_->GetCompletedSubmission(), 512);
     }
     ++frame_index_;
     if ((frame_index_ % 600) == 0) {
@@ -1307,13 +1358,14 @@ class NrDeviceVulkan : public nrhi::Device {
         REXLOG_INFO(
             "nrhi-vulkan: SLOW frame {}us: pass_open={}us/{} flush={}us/{} copies={}us/{} "
             "table_miss={}us/{} set0_miss={}us/{} view_destroy={}us/{} view_create={}us/{} "
-            "const={}us/{} pso={}us/{}",
+            "const={}us/{} pso={}us/{} drain={}us/{}",
             total_us, prof_.pass_open.us, prof_.pass_open.count, prof_.flush_barriers.us,
             prof_.flush_barriers.count, prof_.copies.us, prof_.copies.count, prof_.table_miss.us,
             prof_.table_miss.count, prof_.set0_miss.us, prof_.set0_miss.count,
             prof_.view_destroy.us, prof_.view_destroy.count, prof_.view_create.us,
             prof_.view_create.count, prof_.const_slice.us, prof_.const_slice.count,
-            prof_.pipeline_build.us, prof_.pipeline_build.count);
+            prof_.pipeline_build.us, prof_.pipeline_build.count, prof_.drain.us,
+            prof_.drain.count);
       }
     }
   }
@@ -1742,11 +1794,14 @@ class NrDeviceVulkan : public nrhi::Device {
     retired_.push_back(r);
   }
 
-  void DrainRetired(uint64_t completed) {
+  void DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX) {
+    NrProfScope prof_scope(prof_.drain);
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
     const VkDevice device = vulkan_device_->device();
+    size_t destroyed = 0;
     std::erase_if(retired_, [&](const RetiredObject& r) {
-      if (r.submission >= completed) return false;
+      if (r.submission >= completed || destroyed >= max_objects) return false;
+      ++destroyed;
       if (r.framebuffer != VK_NULL_HANDLE) dfn.vkDestroyFramebuffer(device, r.framebuffer, nullptr);
       if (r.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device, r.view, nullptr);
       for (VkPipeline pipeline : r.pipelines) {
@@ -2026,6 +2081,11 @@ class NrDeviceVulkan : public nrhi::Device {
   std::unordered_set<NrTextureViewVulkan*> live_views_;
   std::unordered_set<NrPipelineVulkan*> live_pipelines_;
   std::unordered_set<NrShaderVulkan*> live_shaders_;
+
+  // Views destroyed since the last FlushDissolvedViews (render thread only).
+  // The objects stay allocated until the flush so stale descriptor-set cache
+  // keys can never collide with a newly created view at the same address.
+  std::vector<NrTextureViewVulkan*> dissolved_views_;
 
   std::map<RenderPassKey, VkRenderPass> render_passes_;
   std::map<FramebufferKey, VkFramebuffer> framebuffers_;
@@ -2312,13 +2372,23 @@ void NrCmdVulkan::SetTextures(uint32_t param, nrhi::TextureView* const* views, u
   if (layout_ == nullptr || param >= layout_->param_count) return;
   const NrBindingLayoutVulkan::ParamInfo& p = layout_->params[param];
   if (p.kind != nrhi::BindingParamKind::kTextureTable) return;
+  // Consecutive draws mostly rebind the same tuple (shadow atlas, cube map,
+  // white fallback); leaving the table clean skips the per-draw descriptor
+  // set lookup and rebind entirely.
+  bool changed = false;
   for (uint32_t i = 0; i < p.table_size; ++i) {
     // Missing tail entries (table declares N, bound M<N) and null entries
     // fall back to the backend's 1x1 white.
-    table_views_[p.table_index][i] =
+    NrTextureViewVulkan* view =
         i < count ? static_cast<NrTextureViewVulkan*>(views[i]) : nullptr;
+    if (table_views_[p.table_index][i] != view) {
+      table_views_[p.table_index][i] = view;
+      changed = true;
+    }
   }
-  table_dirty_[p.table_index] = true;
+  if (changed) {
+    table_dirty_[p.table_index] = true;
+  }
 }
 
 void NrCmdVulkan::SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) {

@@ -235,9 +235,20 @@ class Pipeline {
 // Descriptors.
 // ---------------------------------------------------------------------------
 
+// Binding classes a buffer will be used with. kFull is the historical
+// default (constant buffer / buffer SRV / vertex / index / copy source).
+// Narrower classes let backends drop the descriptor-window padding that only
+// dynamic-offset constant/SRV binds need, and request narrower usage.
+enum class BufferBindClass : uint32_t {
+  kFull,
+  kVertexIndex,  // vertex/index binds and copy source only
+  kCopySrc,      // copy source only (texture upload staging)
+};
+
 struct BufferDesc {
   uint64_t size = 0;
   HeapKind heap = HeapKind::kDefault;
+  BufferBindClass bind_class = BufferBindClass::kFull;
 };
 
 struct TextureDesc {

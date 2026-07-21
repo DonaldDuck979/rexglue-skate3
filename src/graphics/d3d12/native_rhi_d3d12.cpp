@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -395,7 +396,26 @@ class NrCmdD3D12 : public nrhi::Cmd {
                ResourceState after) override;
   void FlushBarriers() override;
 
+  // Called at frame begin and on root-signature changes: the fresh deferred
+  // command list / new root signature carries no bindings, so the latched
+  // tuples must not suppress the first re-bind.
+  void ResetFrameState() {
+    std::memset(last_table_views_, 0, sizeof(last_table_views_));
+    std::memset(last_table_counts_, 0, sizeof(last_table_counts_));
+  }
+
   NrDeviceD3D12* device = nullptr;
+
+ private:
+  void BindTextureTable(uint32_t param, NrTextureViewD3D12* const* views, uint32_t count);
+
+  // Last tuple bound per root param: consecutive draws mostly rebind the
+  // same views (shadow atlas, cube map, white fallback), skipping both the
+  // binding-cache lookup and the root-table re-record. A zero count is the
+  // empty/invalid state; real bindings always have count >= 1.
+  NrTextureViewD3D12* last_table_views_[nrhi::kMaxBindingParams]
+                                       [nrhi::kMaxTextureTableSize] = {};
+  uint32_t last_table_counts_[nrhi::kMaxBindingParams] = {};
 };
 
 class NrDeviceD3D12 : public nrhi::Device {
@@ -432,6 +452,7 @@ class NrDeviceD3D12 : public nrhi::Device {
 
   ~NrDeviceD3D12() override {
     // Callers guarantee GPU idle; release everything immediately.
+    FlushDissolvedViews();
     DrainRetired(~0ull);
     for (auto& entry : guest_outputs_) {
       entry.second->resource->Release();
@@ -585,21 +606,36 @@ class NrDeviceD3D12 : public nrhi::Device {
 
   void DestroyDeferred(nrhi::TextureView* view) override {
     if (view == nullptr) return;
-    auto* v = static_cast<NrTextureViewD3D12*>(view);
+    // Destruction is batched: the view object stays allocated (so its
+    // address cannot be reused while stale binding-cache keys still hold it)
+    // and FlushDissolvedViews sweeps the binding cache ONCE per frame for
+    // the whole batch instead of once per destroyed view.
+    dissolved_views_.push_back(static_cast<NrTextureViewD3D12*>(view));
+  }
+
+  // Render thread, once per frame (and at device destruction): retire every
+  // shader-visible binding referencing a view destroyed since the last
+  // flush, then retire the views themselves.
+  void FlushDissolvedViews() {
+    if (dissolved_views_.empty()) return;
+    std::unordered_set<const NrTextureViewD3D12*> dissolved(dissolved_views_.begin(),
+                                                            dissolved_views_.end());
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t submission = cp_->GetCurrentSubmission();
-    staging_slots_.Retire(v->staging_slot, 1, submission);
-    // Retire every shader-visible binding this view participates in.
     std::erase_if(bindings_, [&](auto& entry) {
       for (uint32_t i = 0; i < entry.first.count; ++i) {
-        if (entry.first.views[i] == v) {
+        if (dissolved.count(entry.first.views[i]) != 0) {
           srv_slots_.Retire(entry.second.first_slot, entry.second.count, submission);
           return true;
         }
       }
       return false;
     });
-    delete v;
+    for (NrTextureViewD3D12* v : dissolved_views_) {
+      staging_slots_.Retire(v->staging_slot, 1, submission);
+      delete v;
+    }
+    dissolved_views_.clear();
   }
 
   void DestroyDeferred(nrhi::Pipeline* pipeline) override {
@@ -867,9 +903,14 @@ class NrDeviceD3D12 : public nrhi::Device {
                         D3D12_RESOURCE_STATES guest_output_internal_state, uint32_t width,
                         uint32_t height, nrhi::Texture** guest_output_out) {
     guest_output_state_ = guest_output_internal_state;
+    cmd_.ResetFrameState();
+    FlushDissolvedViews();
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      DrainRetired(cp_->GetCompletedSubmission());
+      // Bounded per frame: the eviction sweeps retire thousands of objects
+      // at once, and releasing them all in one frame is its own hitch (the
+      // remainder drains over the following frames).
+      DrainRetired(cp_->GetCompletedSubmission(), 512);
     }
     NrTextureD3D12*& wrapper = guest_outputs_[guest_output_resource];
     if (wrapper != nullptr &&
@@ -1006,9 +1047,11 @@ class NrDeviceD3D12 : public nrhi::Device {
     uint32_t count;
   };
 
-  void DrainRetired(uint64_t completed) {
+  void DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX) {
+    size_t released = 0;
     std::erase_if(retired_, [&](const RetiredObject& r) {
-      if (r.submission < completed) {
+      if (r.submission < completed && released < max_objects) {
+        ++released;
         if (r.resource) r.resource->Release();
         if (r.pso) r.pso->Release();
         return true;
@@ -1053,6 +1096,10 @@ class NrDeviceD3D12 : public nrhi::Device {
   SlotAllocator dsv_slots_;
   std::vector<RetiredObject> retired_;
   std::map<BindingKey, Binding> bindings_;
+  // Views destroyed since the last FlushDissolvedViews (render thread only).
+  // The objects stay allocated until the flush so stale binding-cache keys
+  // can never collide with a newly created view at the same address.
+  std::vector<NrTextureViewD3D12*> dissolved_views_;
   std::map<ID3D12Resource*, NrTextureD3D12*> guest_outputs_;
   D3D12_RESOURCE_STATES guest_output_state_ = D3D12_RESOURCE_STATE_COMMON;
 };
@@ -1062,6 +1109,8 @@ void NrCmdD3D12::SetBindingLayout(nrhi::BindingLayout* layout) {
   DeferredCommandList& list = device->cp()->GetDeferredCommandList();
   list.SetDescriptorHeaps(device->srv_heap(), nullptr);
   list.D3DSetGraphicsRootSignature(l->root_signature);
+  // Root-signature semantics: all bindings reset.
+  ResetFrameState();
 }
 
 void NrCmdD3D12::SetPipeline(nrhi::Pipeline* pipeline) {
@@ -1085,22 +1134,31 @@ void NrCmdD3D12::SetBufferSrv(uint32_t param, nrhi::Buffer* buffer, uint64_t off
       param, static_cast<NrBufferD3D12*>(buffer)->gpu_va + offset);
 }
 
+void NrCmdD3D12::BindTextureTable(uint32_t param, NrTextureViewD3D12* const* views,
+                                  uint32_t count) {
+  if (param >= nrhi::kMaxBindingParams) return;
+  if (count == last_table_counts_[param] &&
+      std::memcmp(last_table_views_[param], views, count * sizeof(views[0])) == 0) {
+    return;  // identical tuple already bound on this root param
+  }
+  D3D12_GPU_DESCRIPTOR_HANDLE handle;
+  if (device->GetBinding(views, count, &handle)) {
+    device->cp()->GetDeferredCommandList().D3DSetGraphicsRootDescriptorTable(param, handle);
+    std::memcpy(last_table_views_[param], views, count * sizeof(views[0]));
+    last_table_counts_[param] = count;
+  }
+}
+
 void NrCmdD3D12::SetTexture(uint32_t param, nrhi::TextureView* view) {
   NrTextureViewD3D12* views[1] = {static_cast<NrTextureViewD3D12*>(view)};
-  D3D12_GPU_DESCRIPTOR_HANDLE handle;
-  if (device->GetBinding(views, 1, &handle)) {
-    device->cp()->GetDeferredCommandList().D3DSetGraphicsRootDescriptorTable(param, handle);
-  }
+  BindTextureTable(param, views, 1);
 }
 
 void NrCmdD3D12::SetTexturePair(uint32_t param, nrhi::TextureView* first,
                                 nrhi::TextureView* second) {
   NrTextureViewD3D12* views[2] = {static_cast<NrTextureViewD3D12*>(first),
                                   static_cast<NrTextureViewD3D12*>(second)};
-  D3D12_GPU_DESCRIPTOR_HANDLE handle;
-  if (device->GetBinding(views, 2, &handle)) {
-    device->cp()->GetDeferredCommandList().D3DSetGraphicsRootDescriptorTable(param, handle);
-  }
+  BindTextureTable(param, views, 2);
 }
 
 void NrCmdD3D12::SetTextures(uint32_t param, nrhi::TextureView* const* views, uint32_t count) {
@@ -1109,10 +1167,7 @@ void NrCmdD3D12::SetTextures(uint32_t param, nrhi::TextureView* const* views, ui
   for (uint32_t i = 0; i < count; ++i) {
     typed[i] = static_cast<NrTextureViewD3D12*>(views[i]);
   }
-  D3D12_GPU_DESCRIPTOR_HANDLE handle;
-  if (device->GetBinding(typed, count, &handle)) {
-    device->cp()->GetDeferredCommandList().D3DSetGraphicsRootDescriptorTable(param, handle);
-  }
+  BindTextureTable(param, typed, count);
 }
 
 void NrCmdD3D12::SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) {
