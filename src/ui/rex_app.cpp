@@ -197,6 +197,12 @@ void LogLinuxRuntimeDiagnostics() {
   LogEnvIfSet("VK_DRIVER_FILES");
 }
 
+#endif
+
+// Once a close is requested the process must terminate even if a teardown
+// step deadlocks (a wedged GPU worker or guest thread otherwise leaves a
+// not-responding process the user has to kill): give the orderly shutdown a
+// grace window, then force the exit.
 void StartForcedExitWatchdog(const char* reason) {
   std::thread([reason]() {
     std::this_thread::sleep_for(std::chrono::seconds(10));
@@ -204,7 +210,6 @@ void StartForcedExitWatchdog(const char* reason) {
     std::_Exit(EXIT_SUCCESS);
   }).detach();
 }
-#endif
 
 }  // namespace
 
@@ -772,9 +777,7 @@ void ReXApp::OnKeyDown(ui::KeyEvent& e) {
 void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
-#if REX_PLATFORM_LINUX
-  StartForcedExitWatchdog("Linux window close");
-#endif
+  StartForcedExitWatchdog("Window close");
   shutting_down_.store(true, std::memory_order_release);
 #if REX_PLATFORM_MAC
   if (main_thread_ && main_thread_->is_running()) {
