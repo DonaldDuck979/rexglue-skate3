@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <d3dcompiler.h>
+#include <dxgi1_4.h>
 
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/logging.h>
@@ -450,6 +451,18 @@ class NrDeviceD3D12 : public nrhi::Device {
     srv_slots_.capacity = kShaderVisibleViews;
     rtv_slots_.capacity = kRtvSlots;
     dsv_slots_.capacity = kDsvSlots;
+    // Resolve the device's adapter for the periodic VRAM telemetry
+    // (process-local usage vs the OS-granted budget, the same numbers the
+    // OS shows per process). Optional: the log line is skipped when any
+    // step fails.
+    IDXGIFactory4* factory4 = nullptr;
+    IDXGIFactory2* factory = provider.GetDXGIFactory();
+    if (factory != nullptr &&
+        SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory4)))) {
+      factory4->EnumAdapterByLuid(device_->GetAdapterLuid(),
+                                  IID_PPV_ARGS(&adapter3_));
+      factory4->Release();
+    }
     release_thread_ = std::thread([this] { ReleaseThreadMain(); });
   }
 
@@ -457,6 +470,9 @@ class NrDeviceD3D12 : public nrhi::Device {
     // Callers guarantee GPU idle; release everything. The release thread
     // drains its queue before exiting, so every retirement is released
     // before the heaps below go away.
+    if (adapter3_ != nullptr) {
+      adapter3_->Release();
+    }
     FlushDissolvedViews();
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -931,6 +947,24 @@ class NrDeviceD3D12 : public nrhi::Device {
       released = DrainRetired(cp_->GetCompletedSubmission());
       backlog = retired_.size();
     }
+    // Periodic VRAM budget line (mirrors the Vulkan backend's): local =
+    // dedicated VRAM this process holds, the number that ratchets when a
+    // cache retains superseded content across map changes.
+    ++frame_index_;
+    if (adapter3_ != nullptr && (frame_index_ % 600) == 0) {
+      DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+      DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal{};
+      if (SUCCEEDED(adapter3_->QueryVideoMemoryInfo(
+              0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+          SUCCEEDED(adapter3_->QueryVideoMemoryInfo(
+              0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))) {
+        REXLOG_INFO(
+            "nrhi-d3d12 mem: local use={}MB budget={}MB | nonlocal use={}MB "
+            "budget={}MB | retired={}",
+            local.CurrentUsage >> 20, local.Budget >> 20,
+            nonlocal.CurrentUsage >> 20, nonlocal.Budget >> 20, backlog);
+      }
+    }
     // Frame-maintenance attribution (this work runs outside the app's
     // RenderScene timers, so a sustained cost here is otherwise invisible).
     // Throttled 8 per 5 s.
@@ -1146,6 +1180,10 @@ class NrDeviceD3D12 : public nrhi::Device {
 
   D3D12CommandProcessor* cp_;
   ID3D12Device* device_ = nullptr;
+  // Adapter interface for the periodic VRAM telemetry; null when the query
+  // chain is unavailable (the log line is simply skipped).
+  IDXGIAdapter3* adapter3_ = nullptr;
+  uint64_t frame_index_ = 0;
   NrCmdD3D12 cmd_;
 
   ID3D12DescriptorHeap* staging_heap_ = nullptr;
