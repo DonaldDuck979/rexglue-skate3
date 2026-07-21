@@ -46,16 +46,22 @@ int main(int argc, char** argv) {
 
     bool initialized = app->OnInitialize();
     result = initialized ? app_context.RunMainLoop() : EXIT_FAILURE;
+#if REX_PLATFORM_MAC
+    // Skip app/runtime teardown entirely: guest threads cannot be reliably
+    // stopped on Darwin (pthread_cancel only lands at cancellation points,
+    // never in CPU-bound recompiled code), so the destructor chain races
+    // still-running guest threads over freed kernel objects and turns a
+    // normal quit into the macOS crash-reporter dialog. Flush the logs and
+    // leave; the OS reclaims everything else. Flush-only on purpose -
+    // ShutdownLogging destroys sinks a straggler thread may still be using.
+    rex::FlushLogging();
+    std::_Exit(result);
+#else
     app->InvokeOnDestroy();
+#endif
   }
 
   rex::ShutdownLogging();
-#if REX_PLATFORM_MAC
-  // After explicit app teardown and log flushing, avoid macOS/SDL/global static
-  // teardown paths that can change a clean Close Game exit into status 1.
-  std::_Exit(result);
-#else
   SDL_Quit();
-#endif
   return result;
 }

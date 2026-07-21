@@ -75,5 +75,8 @@ extern "C" int main(int argc_pre_gtk, char** argv_pre_gtk) {
   // Logging may still be needed in the destructors.
   rex::ShutdownLogging();
 
-  return result;
+  // Guest threads that could not be cancelled may still be running; global
+  // static destruction under them can turn a clean quit into an abort or a
+  // nonzero exit status. Everything is flushed - end the process here.
+  std::_Exit(result);
 }

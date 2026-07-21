@@ -72,6 +72,13 @@ void InitLoggingEarly();
 void ShutdownLogging();
 
 /**
+ * Flush all loggers without shutting the logging system down. Safe to call
+ * while other threads may still be logging; intended for fast-exit paths
+ * that end the process with _Exit right after flushing.
+ */
+void FlushLogging();
+
+/**
  * Register a new log category at runtime.
  *
  * The returned handle can be used with REXLOG_CAT_* macros and all

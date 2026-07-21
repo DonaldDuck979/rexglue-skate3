@@ -292,6 +292,16 @@ void InitLogging(const char* log_file, spdlog::level::level_enum level) {
   InitLogging(config);
 }
 
+void FlushLogging() {
+  std::lock_guard lock(g_mutex);
+  if (!g_initialized && !g_early_initialized)
+    return;
+
+  for (auto& entry : g_registry)
+    if (entry.logger)
+      entry.logger->flush();
+}
+
 void ShutdownLogging() {
   std::lock_guard lock(g_mutex);
   if (!g_initialized && !g_early_initialized)
