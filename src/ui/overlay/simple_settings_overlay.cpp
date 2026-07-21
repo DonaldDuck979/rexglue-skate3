@@ -1567,9 +1567,10 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.kind = RowSpec::kEnum;
         row.label = "Soft Shadows";
         row.desc =
-            "Contact-hardening soft shadows: crisp where a shadow meets its "
-            "caster, progressively softer with distance, following the sun's "
-            "angular size. Off uses fixed-width filtering. Applies "
+            "Contact-hardening soft shadows (PCSS): crisp where a shadow "
+            "meets its caster, progressively softer with distance, following "
+            "the sun's angular size. Off uses fixed-width filtering. The most "
+            "expensive shadow option at high render scales. Applies "
             "immediately.";
         row.options = {"Off", "On"};
         row.flag = &shadow_pcss_;
