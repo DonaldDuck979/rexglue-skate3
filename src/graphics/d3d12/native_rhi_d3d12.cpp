@@ -398,6 +398,7 @@ class NrCmdD3D12 : public nrhi::Cmd {
   void Barrier(nrhi::Texture* texture, ResourceState before,
                ResourceState after) override;
   void FlushBarriers() override;
+  void ProfileRegion(nrhi::ProfileStage stage) override;
 
   // Called at frame begin and on root-signature changes: the fresh deferred
   // command list / new root signature carries no bindings, so the latched
@@ -407,9 +408,20 @@ class NrCmdD3D12 : public nrhi::Cmd {
     std::memset(last_table_counts_, 0, sizeof(last_table_counts_));
   }
 
+  // Frame begin only (never on root-signature changes): each frame gets a
+  // fresh timestamp-query range, so an open profile region must not carry an
+  // end query across frames.
+  void ResetProfileRegion() { profile_region_query_ = UINT32_MAX; }
+
   NrDeviceD3D12* device = nullptr;
 
  private:
+  // Start query of the open ProfileRegion span, UINT32_MAX when none. Unlike
+  // Vulkan's auto-closing regions, D3D12 buckets are explicit begin/end query
+  // pairs; an unended pair would read stale readback memory, so every opened
+  // region is closed by the next mark (kTail closes without opening).
+  uint32_t profile_region_query_ = UINT32_MAX;
+
   void BindTextureTable(uint32_t param, NrTextureViewD3D12* const* views, uint32_t count);
 
   // Last tuple bound per root param: consecutive draws mostly rebind the
@@ -936,6 +948,7 @@ class NrDeviceD3D12 : public nrhi::Device {
                         uint32_t height, nrhi::Texture** guest_output_out) {
     guest_output_state_ = guest_output_internal_state;
     cmd_.ResetFrameState();
+    cmd_.ResetProfileRegion();
     const auto maint_t0 = std::chrono::steady_clock::now();
     const size_t dissolved_count = dissolved_views_.size();
     FlushDissolvedViews();
@@ -1416,6 +1429,47 @@ void NrCmdD3D12::Barrier(nrhi::Texture* texture, ResourceState before, ResourceS
 }
 
 void NrCmdD3D12::FlushBarriers() { device->cp()->SubmitBarriers(); }
+
+rex::perf::DrawBucket ProfileStageBucket(nrhi::ProfileStage stage) {
+  switch (stage) {
+    case nrhi::ProfileStage::kCommit:
+      return rex::perf::DrawBucket::kNativeCommit;
+    case nrhi::ProfileStage::kShadow:
+      return rex::perf::DrawBucket::kNativeShadow;
+    case nrhi::ProfileStage::kStaticSun:
+      return rex::perf::DrawBucket::kNativeSun;
+    case nrhi::ProfileStage::kMain:
+      return rex::perf::DrawBucket::kNativeMain;
+    case nrhi::ProfileStage::kResolve:
+      return rex::perf::DrawBucket::kNativeResolve;
+    case nrhi::ProfileStage::kAmbientOcclusion:
+      return rex::perf::DrawBucket::kNativeAo;
+    case nrhi::ProfileStage::kSsr:
+      return rex::perf::DrawBucket::kNativeSsr;
+    case nrhi::ProfileStage::kVolumetrics:
+      return rex::perf::DrawBucket::kNativeVol;
+    case nrhi::ProfileStage::kBloom:
+      return rex::perf::DrawBucket::kNativeBloom;
+    case nrhi::ProfileStage::k2d:
+      return rex::perf::DrawBucket::kNative2d;
+    case nrhi::ProfileStage::kTail:
+      return rex::perf::DrawBucket::kNativeTail;
+  }
+  return rex::perf::DrawBucket::kNativeScene;
+}
+
+void NrCmdD3D12::ProfileRegion(nrhi::ProfileStage stage) {
+  if (profile_region_query_ != UINT32_MAX) {
+    device->cp()->EndGpuTimestampedDraw(profile_region_query_);
+    profile_region_query_ = UINT32_MAX;
+  }
+  if (stage == nrhi::ProfileStage::kTail) {
+    // No frame-end query to pair with on D3D12; the tail lands in the
+    // profiler's untimed remainder.
+    return;
+  }
+  profile_region_query_ = device->cp()->BeginGpuTimestampedDraw(ProfileStageBucket(stage));
+}
 
 }  // namespace
 

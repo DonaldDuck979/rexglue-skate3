@@ -398,6 +398,26 @@ struct Rect {
   int32_t bottom = 0;
 };
 
+// GPU-time attribution stages for ProfileRegion: the renderer marks the start
+// of each of its passes and the command processor's timestamp-bucket profiler
+// (d3d12_gpu_timestamp_buckets / vulkan_gpu_timestamp_buckets) reports the
+// per-stage GPU spans. kTail marks the end of the last stage; on Vulkan the
+// span from kTail to frame end is reported as its own bucket, on D3D12 it
+// stays in the profiler's untimed remainder.
+enum class ProfileStage : uint8_t {
+  kCommit,     // content-store commits, decode uploads, eviction
+  kShadow,     // dynamic caster shadow atlas + blur
+  kStaticSun,  // static sun-shadow cascade renders
+  kMain,       // main scene pass (opaque + transparent)
+  kResolve,    // MSAA resolve + outline composite
+  kAmbientOcclusion,
+  kSsr,
+  kVolumetrics,
+  kBloom,  // bloom pyramid + tonemap
+  k2d,     // photo grab, blur chains, 2D overlay replay
+  kTail,   // after the last stage: backend/present tail
+};
+
 // ---------------------------------------------------------------------------
 // Command recording. Wraps the command processor's deferred command list for
 // the current frame; valid only inside the render callback, render thread
@@ -468,6 +488,11 @@ class Cmd {
   virtual void Barrier(Texture* texture, ResourceState before,
                        ResourceState after) = 0;
   virtual void FlushBarriers() = 0;
+
+  // Marks the start of a renderer pass for GPU-time attribution (closing the
+  // previously marked stage). No-op while the backend's timestamp-bucket
+  // profiler is disabled; see ProfileStage for the reporting semantics.
+  virtual void ProfileRegion(ProfileStage stage) = 0;
 
  protected:
   virtual ~Cmd() = default;

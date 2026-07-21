@@ -440,6 +440,7 @@ class NrCmdVulkan : public nrhi::Cmd {
                            uint32_t height) override;
   void Barrier(nrhi::Texture* texture, ResourceState before, ResourceState after) override;
   void FlushBarriers() override;
+  void ProfileRegion(nrhi::ProfileStage stage) override;
 
   // --- frame handling (driven by the device) ---
   void ResetFrameState();
@@ -2691,6 +2692,41 @@ void NrCmdVulkan::FlushBarriers() {
   // CP's SubmitBarriers only closes its own tracked pass).
   EndRenderPassIfOpen();
   device->cp()->SubmitBarriers(true);
+}
+
+rex::perf::DrawBucket ProfileStageBucket(nrhi::ProfileStage stage) {
+  switch (stage) {
+    case nrhi::ProfileStage::kCommit:
+      return rex::perf::DrawBucket::kNativeCommit;
+    case nrhi::ProfileStage::kShadow:
+      return rex::perf::DrawBucket::kNativeShadow;
+    case nrhi::ProfileStage::kStaticSun:
+      return rex::perf::DrawBucket::kNativeSun;
+    case nrhi::ProfileStage::kMain:
+      return rex::perf::DrawBucket::kNativeMain;
+    case nrhi::ProfileStage::kResolve:
+      return rex::perf::DrawBucket::kNativeResolve;
+    case nrhi::ProfileStage::kAmbientOcclusion:
+      return rex::perf::DrawBucket::kNativeAo;
+    case nrhi::ProfileStage::kSsr:
+      return rex::perf::DrawBucket::kNativeSsr;
+    case nrhi::ProfileStage::kVolumetrics:
+      return rex::perf::DrawBucket::kNativeVol;
+    case nrhi::ProfileStage::kBloom:
+      return rex::perf::DrawBucket::kNativeBloom;
+    case nrhi::ProfileStage::k2d:
+      return rex::perf::DrawBucket::kNative2d;
+    case nrhi::ProfileStage::kTail:
+      return rex::perf::DrawBucket::kNativeTail;
+  }
+  return rex::perf::DrawBucket::kNativeScene;
+}
+
+void NrCmdVulkan::ProfileRegion(nrhi::ProfileStage stage) {
+  // Region semantics: beginning a bucket closes the active one, and the CP
+  // closes the last bucket at frame end - so the kTail mark records the
+  // present/submission tail as its own span.
+  device->cp()->BeginGpuTimestampedRegion(ProfileStageBucket(stage));
 }
 
 }  // namespace
