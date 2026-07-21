@@ -12,9 +12,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -448,12 +450,26 @@ class NrDeviceD3D12 : public nrhi::Device {
     srv_slots_.capacity = kShaderVisibleViews;
     rtv_slots_.capacity = kRtvSlots;
     dsv_slots_.capacity = kDsvSlots;
+    release_thread_ = std::thread([this] { ReleaseThreadMain(); });
   }
 
   ~NrDeviceD3D12() override {
-    // Callers guarantee GPU idle; release everything immediately.
+    // Callers guarantee GPU idle; release everything. The release thread
+    // drains its queue before exiting, so every retirement is released
+    // before the heaps below go away.
     FlushDissolvedViews();
-    DrainRetired(~0ull);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      DrainRetired(~0ull);
+    }
+    {
+      std::lock_guard<std::mutex> lock(release_mutex_);
+      release_exit_ = true;
+    }
+    release_cv_.notify_one();
+    if (release_thread_.joinable()) {
+      release_thread_.join();
+    }
     for (auto& entry : guest_outputs_) {
       entry.second->resource->Release();
       delete entry.second;
@@ -912,11 +928,7 @@ class NrDeviceD3D12 : public nrhi::Device {
     size_t backlog = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      // Bounded per frame: the eviction sweeps retire thousands of objects
-      // at once, and releasing them all in one frame is its own hitch (the
-      // remainder drains over the following frames). Committed-resource
-      // releases are kernel-priced, so the budget stays small.
-      released = DrainRetired(cp_->GetCompletedSubmission(), 256);
+      released = DrainRetired(cp_->GetCompletedSubmission());
       backlog = retired_.size();
     }
     // Frame-maintenance attribution (this work runs outside the app's
@@ -1075,22 +1087,50 @@ class NrDeviceD3D12 : public nrhi::Device {
     uint32_t count;
   };
 
-  size_t DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX) {
-    size_t released = 0;
-    std::erase_if(retired_, [&](const RetiredObject& r) {
-      if (r.submission < completed && released < max_objects) {
-        ++released;
-        if (r.resource) r.resource->Release();
-        if (r.pso) r.pso->Release();
-        return true;
-      }
-      return false;
-    });
+  // Hands GPU-completed retirements to the release thread. Committed
+  // resource Release calls are kernel-priced (~150 us each measured); a
+  // sustained eviction feed released on the render thread was a whole-frame
+  // stall, so the render thread only moves pointers. Callers hold mutex_.
+  size_t DrainRetired(uint64_t completed) {
+    size_t moved = 0;
+    {
+      std::lock_guard<std::mutex> release_lock(release_mutex_);
+      std::erase_if(retired_, [&](const RetiredObject& r) {
+        if (r.submission < completed) {
+          ++moved;
+          release_queue_.push_back(r);
+          return true;
+        }
+        return false;
+      });
+    }
+    if (moved != 0) {
+      release_cv_.notify_one();
+    }
     staging_slots_.Drain(completed);
     srv_slots_.Drain(completed);
     rtv_slots_.Drain(completed);
     dsv_slots_.Drain(completed);
-    return released;
+    return moved;
+  }
+
+  void ReleaseThreadMain() {
+    std::vector<RetiredObject> batch;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lock(release_mutex_);
+        release_cv_.wait(lock, [&] { return release_exit_ || !release_queue_.empty(); });
+        if (release_queue_.empty() && release_exit_) {
+          return;
+        }
+        batch.swap(release_queue_);
+      }
+      for (const RetiredObject& r : batch) {
+        if (r.resource) r.resource->Release();
+        if (r.pso) r.pso->Release();
+      }
+      batch.clear();
+    }
   }
 
   void DestroyGuestOutputWrapperLocked(NrTextureD3D12* wrapper) {
@@ -1118,7 +1158,14 @@ class NrDeviceD3D12 : public nrhi::Device {
 
   // mutex_ guards the slot allocators and retired_ (creation and deferred
   // destruction are thread-safe); bindings_ is render-thread-only.
+  // release_mutex_ guards release_queue_/release_exit_ and nests inside
+  // mutex_ (the release thread never takes mutex_).
   std::mutex mutex_;
+  std::thread release_thread_;
+  std::mutex release_mutex_;
+  std::condition_variable release_cv_;
+  std::vector<RetiredObject> release_queue_;
+  bool release_exit_ = false;
   SlotAllocator staging_slots_;
   SlotAllocator srv_slots_;
   SlotAllocator rtv_slots_;
