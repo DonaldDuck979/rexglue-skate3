@@ -2497,7 +2497,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
-  if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
+  // While the native guest-output renderer is suppressing emulated draws,
+  // batch everything into the end-of-frame submission: the mid-frame
+  // primary-buffer submits carry only the small exempt composition passes,
+  // and the GPU then idles until the native pass arrives (a measured
+  // ~0.3 ms/frame starvation bubble). The emulated path keeps the
+  // per-buffer submits for its own pacing.
+  if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) &&
+      !ShouldSuppressEmulatedDraws() && submission_open_ &&
       CanEndSubmissionImmediately()) {
     EndSubmission(false);
   }
