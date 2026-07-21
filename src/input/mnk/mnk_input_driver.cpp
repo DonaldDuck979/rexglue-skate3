@@ -167,6 +167,27 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   std::lock_guard lock(state_mutex_);
 
+#if REX_PLATFORM_WIN32
+  // A mouse button pressed inside the client area but released outside it
+  // never delivers its WM_xBUTTONUP (the window does not capture the mouse
+  // during presses), which would leave the bind - triggers by default - held
+  // indefinitely. Reconcile against the live button state each poll.
+  // GetAsyncKeyState reports PHYSICAL buttons while mouse messages follow the
+  // logical (possibly swapped) mapping, so honor SM_SWAPBUTTON.
+  {
+    const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+    const auto reconcile = [this](VirtualKey vk, int host_vk) {
+      const uint16_t idx = static_cast<uint16_t>(vk);
+      if (key_down_[idx] && !(GetAsyncKeyState(host_vk) & 0x8000)) {
+        key_down_[idx] = false;
+      }
+    };
+    reconcile(VirtualKey::kLButton, swapped ? VK_RBUTTON : VK_LBUTTON);
+    reconcile(VirtualKey::kRButton, swapped ? VK_LBUTTON : VK_RBUTTON);
+    reconcile(VirtualKey::kMButton, VK_MBUTTON);
+  }
+#endif
+
   uint16_t buttons = 0;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
     buttons |= X_INPUT_GAMEPAD_A;
