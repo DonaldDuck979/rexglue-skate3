@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <utility>
 
 #include <rex/assert.h>
@@ -43,6 +44,13 @@ REXCVAR_DEFINE_INT32(presenter_strict_guest_output_backpressure_timeout_ms, 100,
                      "Maximum time strict guest output backpressure may wait before allowing a "
                      "mailbox frame replacement")
     .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(presenter_present_cadence_log, false, "UI/Presenter",
+                    "Log guest present cadence statistics every 600 swaps: average/max "
+                    "swap-to-swap interval, standard deviation, and frame-to-frame jitter "
+                    "(mean absolute successive difference). Attributes perceived judder to "
+                    "irregular present timing versus low frame rate.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
@@ -585,6 +593,40 @@ bool Presenter::RefreshGuestOutput(
       return false;
     }
     guest_output_active_last_refresh_ = true;
+    // Present-cadence telemetry: the interval between guest output refreshes
+    // is the cadence the host presents at (painting is triggered per
+    // refresh), which VRR displays turn directly into perceived smoothness.
+    // jitter = mean absolute successive frame-to-frame difference, the
+    // judder-relevant metric; sd and max catch slow drift and hitches.
+    if (REXCVAR_GET(presenter_present_cadence_log)) {
+      static std::chrono::steady_clock::time_point s_cad_prev{};
+      static double s_cad_sum = 0, s_cad_sumsq = 0, s_cad_max = 0;
+      static double s_cad_jitter_sum = 0, s_cad_last = 0;
+      static uint32_t s_cad_n = 0;
+      const auto cad_now = std::chrono::steady_clock::now();
+      if (s_cad_prev.time_since_epoch().count() != 0) {
+        const double ms =
+            std::chrono::duration<double, std::milli>(cad_now - s_cad_prev).count();
+        s_cad_sum += ms;
+        s_cad_sumsq += ms * ms;
+        s_cad_max = std::max(s_cad_max, ms);
+        if (s_cad_n != 0) {
+          s_cad_jitter_sum += std::abs(ms - s_cad_last);
+        }
+        s_cad_last = ms;
+        if (++s_cad_n >= 600) {
+          const double avg = s_cad_sum / s_cad_n;
+          const double var = std::max(0.0, s_cad_sumsq / s_cad_n - avg * avg);
+          REXLOG_INFO(
+              "present-cadence: avg={:.2f}ms sd={:.2f} jitter={:.3f} max={:.2f} "
+              "(600 swaps)",
+              avg, std::sqrt(var), s_cad_jitter_sum / (s_cad_n - 1), s_cad_max);
+          s_cad_sum = s_cad_sumsq = s_cad_max = s_cad_jitter_sum = s_cad_last = 0;
+          s_cad_n = 0;
+        }
+      }
+      s_cad_prev = cad_now;
+    }
     if (GuestFrameStatsEnabled()) {
       std::lock_guard<std::mutex> stats_lock(guest_frame_stats_mutex_);
       guest_frame_timestamps_[guest_frame_timestamp_next_] = std::chrono::steady_clock::now();
