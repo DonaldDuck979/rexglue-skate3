@@ -25,6 +25,7 @@
 // write-combined: never read it back; readback memory must be read through
 // InvalidateForRead.
 
+#include <cstddef>
 #include <cstdint>
 
 namespace rex::graphics::nrhi {
