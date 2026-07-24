@@ -56,6 +56,13 @@ REXCVAR_DEFINE_BOOL(vulkan_deferred_resolve_clears, false, "GPU/Vulkan",
                     "with an attachment clear per resolve")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_allow_inexact_rt_transfers, false, "GPU/Vulkan",
+                    "Allow the host render target path on devices lacking integer sampled-image "
+                    "MSAA or UINT transfer format support, degrading render target ownership "
+                    "transfers from bit-exact to approximate (for non-conformant drivers such as "
+                    "Vulkan-on-D3D12, where the fragment shader interlock path is unavailable)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 // DEFINE_string(
 //     render_target_path_vulkan, "",
 //     "Render target emulation path to use on Vulkan.\n"
@@ -429,6 +436,11 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
           "can't be bit-exact on this device; switching to fragment shader "
           "interlock path for D3D12 parity");
       path_ = Path::kPixelShaderInterlock;
+    } else if (REXCVAR_GET(vulkan_allow_inexact_rt_transfers)) {
+      REXGPU_WARN(
+          "VulkanRenderTargetCache: Proceeding with non-bit-exact host render "
+          "target ownership transfers (vulkan_allow_inexact_rt_transfers); "
+          "emulated rendering may be inaccurate on this device");
     } else {
       REXGPU_ERROR(
           "VulkanRenderTargetCache: Bit-exact host render target ownership "
