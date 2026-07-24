@@ -431,7 +431,12 @@ bool ReXApp::SetupEnvironment() {
   if (std::filesystem::exists(config_path_))
     REXLOG_INFO("Loaded config: {}", config_path_.filename().string());
 
-  REXLOG_INFO("{} starting", GetName());
+  // Include the build title so support logs identify the exact build.
+  if (auto build_title = GetBuildTitle(); !build_title.empty()) {
+    REXLOG_INFO("{} starting {}", GetName(), build_title);
+  } else {
+    REXLOG_INFO("{} starting", GetName());
+  }
   if (!game_data_root_.empty()) {
     REXLOG_INFO("  Game directory: {}", game_data_root_.string());
   }
