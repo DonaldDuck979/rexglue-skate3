@@ -424,13 +424,19 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
     const float cy = y + row_h * 0.5f;
     AddTextVCentered(dl, bold_ol, label_size, col_x + 18.0f * s, cy, kColRowText, row.label);
     // Long paths shrink toward 15*s, then ellipsize from the FRONT - the
-    // filename tail is the informative part.
+    // filename tail is the informative part. The step walks the unquantized
+    // size so it always makes progress: font_px() snaps to buckets a little
+    // over a pixel wide, so at small viewport scales a step is narrower than
+    // one bucket and re-quantizing the previous result returns it unchanged.
     const float label_w = bold_ol->CalcTextSizeA(label_size, FLT_MAX, 0.0f, row.label).x;
     const float max_w = col_w - 36.0f * s - label_w - 24.0f * s;
-    float vsize = font_px(18.0f * s);
-    while (vsize > 15.0f * s &&
+    const float min_vsize = 15.0f * s;
+    float raw_vsize = 18.0f * s;
+    float vsize = font_px(raw_vsize);
+    while (raw_vsize > min_vsize &&
            font->CalcTextSizeA(vsize, FLT_MAX, 0.0f, row.value.c_str()).x > max_w) {
-      vsize = font_px(vsize - 0.5f * s);
+      raw_vsize = std::max(min_vsize, raw_vsize - 0.5f * s);
+      vsize = font_px(raw_vsize);
     }
     std::string shown = row.value;
     while (shown.size() > 1 &&
