@@ -63,6 +63,9 @@ size_t page_size();
 // This is likely 64KiB.
 size_t allocation_granularity();
 
+// Statically recompiled guest code executes from the host image, never from
+// guest pages, so the execute variants only describe guest-side intent: the
+// platform allocators serve them without the host execute bit (W^X).
 enum class PageAccess {
   kNoAccess = 0,
   kReadOnly = 1 << 0,
@@ -81,16 +84,6 @@ enum class DeallocationType {
   kRelease = 1 << 0,
   kDecommit = 1 << 1,
 };
-
-// Whether the host allows the pages to be allocated or mapped with
-// PageAccess::kExecuteReadWrite - if not, separate mappings backed by the same
-// memory-mapped file must be used to write to executable pages.
-bool IsWritableExecutableMemorySupported();
-
-// Whether PageAccess::kExecuteReadWrite is a supported and preferred way of
-// writing executable memory, useful for simulating how Xenia would work without
-// writable executable memory on a system with it.
-bool IsWritableExecutableMemoryPreferred();
 
 // Allocates a block of memory at the given page-aligned base address.
 // Fails if the memory is not available.

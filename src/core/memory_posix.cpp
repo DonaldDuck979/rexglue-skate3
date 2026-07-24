@@ -118,17 +118,17 @@ uint32_t ToPosixProtectFlags(PageAccess access) {
     case PageAccess::kReadWrite:
       return PROT_READ | PROT_WRITE;
     case PageAccess::kExecuteReadOnly:
-      return PROT_READ | PROT_EXEC;
+      // Statically recompiled guest code executes from the host image, never
+      // from guest pages, so execute requests are served without PROT_EXEC.
+      // This keeps the process W^X: no path through this layer can create
+      // executable memory.
+      return PROT_READ;
     case PageAccess::kExecuteReadWrite:
-      return PROT_READ | PROT_WRITE | PROT_EXEC;
+      return PROT_READ | PROT_WRITE;
     default:
       assert_unhandled_case(access);
       return PROT_NONE;
   }
-}
-
-bool IsWritableExecutableMemorySupported() {
-  return true;
 }
 
 // TODO(tomc): this needs to go somewhere else. we should utilize the platform namespace more.

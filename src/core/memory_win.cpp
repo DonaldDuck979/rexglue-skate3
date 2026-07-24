@@ -50,9 +50,13 @@ DWORD ToWin32ProtectFlags(PageAccess access) {
     case PageAccess::kReadWrite:
       return PAGE_READWRITE;
     case PageAccess::kExecuteReadOnly:
-      return PAGE_EXECUTE_READ;
+      // Statically recompiled guest code executes from the host image, never
+      // from guest pages, so execute requests are served without the execute
+      // bit. This keeps the process W^X: no path through this layer can
+      // create executable memory.
+      return PAGE_READONLY;
     case PageAccess::kExecuteReadWrite:
-      return PAGE_EXECUTE_READWRITE;
+      return PAGE_READWRITE;
     default:
       assert_unhandled_case(access);
       return PAGE_NOACCESS;
@@ -79,16 +83,6 @@ PageAccess ToXeniaProtectFlags(DWORD access) {
     default:
       return PageAccess::kNoAccess;
   }
-}
-
-bool IsWritableExecutableMemorySupported() {
-#ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
-  return true;
-#else
-  // To test FromApp functions on desktop, undefine
-  // REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS and link to WindowsApp.lib.
-  return false;
-#endif
 }
 
 void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
@@ -206,10 +200,11 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
       file_access = FILE_MAP_ALL_ACCESS;
       break;
     case PageAccess::kExecuteReadOnly:
-      file_access = FILE_MAP_READ | FILE_MAP_EXECUTE;
+      // See ToWin32ProtectFlags: guest memory is never host-executable.
+      file_access = FILE_MAP_READ;
       break;
     case PageAccess::kExecuteReadWrite:
-      file_access = FILE_MAP_ALL_ACCESS | FILE_MAP_EXECUTE;
+      file_access = FILE_MAP_ALL_ACCESS;
       break;
     case PageAccess::kNoAccess:
     default:
