@@ -808,19 +808,31 @@ Presenter::GuestFrameStats Presenter::GetGuestFrameStats() const {
   }
   const double span_to_now_seconds =
       std::chrono::duration_cast<std::chrono::duration<double>>(now - oldest_in_window).count();
-  if (span_to_now_seconds > 0.0) {
-    stats.fps = double(frames_in_window) / span_to_now_seconds;
-  }
+  double span_between_frames_seconds = 0.0;
   if (frames_in_window >= 2) {
-    const double span_between_frames_seconds =
+    span_between_frames_seconds =
         std::chrono::duration_cast<std::chrono::duration<double>>(newest_in_window -
                                                                   oldest_in_window)
             .count();
-    if (span_between_frames_seconds > 0.0) {
-      stats.frame_time_ms =
-          span_between_frames_seconds * 1000.0 / double(frames_in_window - 1);
-    }
-  } else if (stats.fps > 0.0) {
+  }
+  if (span_between_frames_seconds > 0.0 && span_to_now_seconds > 0.0) {
+    const double mean_interval_seconds =
+        span_between_frames_seconds / double(frames_in_window - 1);
+    stats.frame_time_ms = mean_interval_seconds * 1000.0;
+    // Rate = frame intervals per second, not frames per second: N frames span
+    // only N - 1 intervals, so dividing the frame count by the span reads up
+    // to one FPS high (oscillating with sampling phase, e.g. 140-141 at a
+    // steady 140). The partial interval elapsed since the newest frame is
+    // included so a steady source reads exactly its rate regardless of
+    // phase, but clamped to one interval so the estimate still decays toward
+    // zero when the guest stops producing frames.
+    const double partial_interval = std::min(
+        (span_to_now_seconds - span_between_frames_seconds) / mean_interval_seconds, 1.0);
+    stats.fps = (double(frames_in_window - 1) + partial_interval) / span_to_now_seconds;
+  } else if (span_to_now_seconds > 0.0) {
+    // A single frame in the window (or coincident timestamps): no interval to
+    // measure, keep the frame-count estimate.
+    stats.fps = double(frames_in_window) / span_to_now_seconds;
     stats.frame_time_ms = 1000.0 / stats.fps;
   }
   return stats;
