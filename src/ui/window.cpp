@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <iterator>
 
 #include <rex/assert.h>
@@ -76,6 +77,17 @@ void Window::UpdateCachedDisplayRefresh() {
   if (hz > 0.0f) {
     g_display_refresh_hz.store(hz, std::memory_order_relaxed);
   }
+}
+
+float Window::AutoFrameCapHz(float refresh_hz) {
+  if (refresh_hz < 30.0f) {
+    return 0.0f;
+  }
+  // 4 FPS of margin or 5% of the refresh rate, whichever is larger (see the
+  // declaration): 4 FPS is 6.7% of headroom at 60 Hz but only 0.2 ms of
+  // present slack at 144 Hz, within routine thread-scheduling jitter.
+  const float margin = std::max(4.0f, refresh_hz * 0.05f);
+  return std::floor(refresh_hz - margin);
 }
 
 Window::Window(WindowedAppContext& app_context, const std::string_view title,

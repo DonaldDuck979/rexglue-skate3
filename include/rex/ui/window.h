@@ -222,6 +222,15 @@ class Window {
   // readable from any thread (frame pacers, settings UI).
   static float CachedDisplayRefreshHz();
 
+  // Refresh-derived automatic frame cap for the given display refresh rate,
+  // 0 while the refresh is unknown. Presents run with tearing allowed, so on
+  // a VRR display any present arriving faster than the panel's minimum
+  // refresh period tears; the cap must sit far enough below the refresh rate
+  // that swap-to-present jitter cannot cross it. A fixed margin that is
+  // ample at 60 Hz is too thin at 144 Hz, so the margin scales with the
+  // refresh rate. Single source of the policy for pacers and settings UI.
+  static float AutoFrameCapHz(float refresh_hz);
+
   // Round trips are not guaranteed to return the same results.
   static constexpr uint32_t ConvertSizeDpi(uint32_t size, uint32_t new_dpi, uint32_t old_dpi) {
     // Always rounding up to prevent zero sizes (unless the input is zero) as

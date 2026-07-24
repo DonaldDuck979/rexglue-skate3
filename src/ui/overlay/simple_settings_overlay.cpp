@@ -1351,10 +1351,12 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
             "Auto tracks the current display and does exactly that. Frames above the "
             "refresh rate cannot be shown and only make steady motion judder.";
         if (FrameCapHasAuto()) {
-          const float hz = rex::ui::Window::CachedDisplayRefreshHz();
+          // Same policy the guest pacer applies (see Window::AutoFrameCapHz).
+          const float auto_cap =
+              rex::ui::Window::AutoFrameCapHz(rex::ui::Window::CachedDisplayRefreshHz());
           row.options.push_back(
-              hz >= 30.0f
-                  ? "Auto (" + std::to_string(int(hz) - 4) + " FPS)"
+              auto_cap > 0.0f
+                  ? "Auto (" + std::to_string(int(auto_cap)) + " FPS)"
                   : std::string("Auto"));
         }
         for (size_t i = 1; i < kFrameCapLabels.size(); ++i) {
