@@ -84,6 +84,36 @@ endif()
 
 if(WIN32)
     target_link_libraries(rexruntime PRIVATE ws2_32)
+
+    # Version metadata for the runtime DLL. Unsigned binaries without any
+    # version resource are prone to antivirus false positives; embedding
+    # identity here also lets crash dumps and support logs name the build.
+    # The embedding application may override these before including the SDK.
+    enable_language(RC)
+    if(NOT REXGLUE_RUNTIME_RC_VERSION)
+        set(REXGLUE_RUNTIME_RC_VERSION "0,0,0,0")
+    endif()
+    if(NOT REXGLUE_RUNTIME_RC_VERSION_STRING)
+        set(REXGLUE_RUNTIME_RC_VERSION_STRING "0.0.0")
+    endif()
+    if(NOT REXGLUE_RUNTIME_RC_PRODUCT_NAME)
+        set(REXGLUE_RUNTIME_RC_PRODUCT_NAME "rexglue")
+    endif()
+    if(NOT REXGLUE_RUNTIME_RC_COMPANY)
+        set(REXGLUE_RUNTIME_RC_COMPANY "rexglue project")
+    endif()
+    if(NOT REXGLUE_RUNTIME_RC_DESCRIPTION)
+        set(REXGLUE_RUNTIME_RC_DESCRIPTION "rexglue guest runtime library")
+    endif()
+    if(NOT REXGLUE_RUNTIME_RC_COPYRIGHT)
+        set(REXGLUE_RUNTIME_RC_COPYRIGHT "(c) rexglue contributors")
+    endif()
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/rexruntime_version.rc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/rexruntime_version.rc
+        @ONLY)
+    target_sources(rexruntime PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}/rexruntime_version.rc)
 endif()
 
 if(REXGLUE_USE_D3D12)
