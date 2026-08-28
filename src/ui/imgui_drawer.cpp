@@ -700,7 +700,12 @@ void ImGuiDrawer::RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_conte
 
   immediate_drawer_->Begin(ui_draw_context, io.DisplaySize.x, io.DisplaySize.y);
 
-  for (int i = 0; i < data->CmdListsCount; ++i) {
+  // NB: iterate CmdLists.Size, NOT the obsolete CmdListsCount. Stock imgui 1.92
+  // leaves CmdListsCount at 0 (it's an IMGUI_DISABLE_OBSOLETE_FUNCTIONS field it
+  // no longer maintains); CmdLists (the ImVector) is the source of truth. The
+  // vanished rexglue imgui fork still set CmdListsCount, so the old loop worked
+  // there but rendered nothing against the substituted stock imgui.
+  for (int i = 0; i < data->CmdLists.Size; ++i) {
     const auto cmd_list = data->CmdLists[i];
 
     ImmediateDrawBatch batch;

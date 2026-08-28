@@ -112,8 +112,14 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/rexruntime_version.rc.in
         ${CMAKE_CURRENT_BINARY_DIR}/rexruntime_version.rc
         @ONLY)
-    target_sources(rexruntime PRIVATE
-        ${CMAKE_CURRENT_BINARY_DIR}/rexruntime_version.rc)
+    # [skate3-online patch] rc.exe fails under the clang/ninja toolchain
+    # (cmake_llvm_rc passes -MD/-MF to rc.exe -> fatal RC1107), the same reason
+    # the freetype version .rc is dropped in thirdparty/CMakeLists.txt. The
+    # resource is DLL metadata only, so skip compiling it in this toolchain.
+    if(NOT (CMAKE_RC_COMPILER MATCHES "rc.exe$" AND CMAKE_GENERATOR MATCHES "Ninja"))
+        target_sources(rexruntime PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR}/rexruntime_version.rc)
+    endif()
 endif()
 
 if(REXGLUE_USE_D3D12)

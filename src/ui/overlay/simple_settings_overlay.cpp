@@ -54,7 +54,8 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 25> kOptionalSimpleSettingsCvars = {
+    "skate3_net_hud",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -130,6 +131,13 @@ constexpr std::array<const char*, 4> kMenuChordLabels = {"RB + Start", "LB + RB 
 constexpr std::array<const char*, 5> kMonitorLabels = {"Auto", "Monitor 1", "Monitor 2",
                                                        "Monitor 3", "Monitor 4"};
 
+// Game Modes tab (Online play). Spot Battle: 1-6 rounds, 45-60s per round.
+constexpr std::array<const char*, 6> kSpotRoundLabels = {"1", "2", "3", "4", "5", "6"};
+constexpr std::array<const char*, 4> kSpotTimeLabels = {"45s", "50s", "55s", "60s"};
+constexpr std::array<int32_t, 4> kSpotTimeSeconds = {45, 50, 55, 60};
+// S.K.A.T.E.: 1-3 rounds (25s per attempt is fixed in the game logic).
+constexpr std::array<const char*, 3> kSkateRoundLabels = {"1", "2", "3"};
+
 // X_INPUT_GAMEPAD_* button bits, mirrored locally to keep the UI overlay
 // decoupled from the kernel input headers.
 constexpr uint16_t kPadDpadUp = 0x0001;
@@ -148,12 +156,17 @@ struct CategoryInfo {
   const char* name;
   const char* desc;
 };
-constexpr std::array<CategoryInfo, 5> kCategories = {{
+constexpr std::array<CategoryInfo, 10> kCategories = {{
     {"Video", "Display, resolution, framerate and renderer quality settings."},
     {"Controls", "Controller, mouse and keyboard input settings."},
     {"Audio", "Sound output settings."},
     {"Profile", "Local player profile and sign-in."},
     {"System", "Game language, pending changes and closing the settings."},
+    {"Online", "Fan-made online play: host a session or join one by IP (LAN)."},
+    {"Accessibility", "On-screen overlays: FPS counter, renderer indicator and net HUD."},
+    {"Username", "The name other players see you as online."},
+    {"Game Modes", "Start an online Spot Battle or S.K.A.T.E. game for the session."},
+    {"Party", "Party up with other players by name -- optionally private (party-only)."},
 }};
 
 // Navigation repeat pacing (seconds).
@@ -975,7 +988,11 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
                                            CloseSettingsCallback close_settings,
                                            CloseGameCallback close_game,
                                            RestartGameCallback restart_game,
-                                           PollGamepadCallback poll_gamepad)
+                                           PollGamepadCallback poll_gamepad,
+                                           OnlineStatusCallback online_status,
+                                           OnlineActionCallback online_connect,
+                                           OnlineActionCallback online_disconnect,
+                                           PartyStatusCallback party_status)
     : ImGuiDialog(drawer),
       config_path_(std::move(config_path)),
       load_profiles_(std::move(load_profiles)),
@@ -983,7 +1000,11 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
       close_settings_(std::move(close_settings)),
       close_game_(std::move(close_game)),
       restart_game_(std::move(restart_game)),
-      poll_gamepad_(std::move(poll_gamepad)) {
+      poll_gamepad_(std::move(poll_gamepad)),
+      online_status_(std::move(online_status)),
+      online_connect_(std::move(online_connect)),
+      online_disconnect_(std::move(online_disconnect)),
+      party_status_(std::move(party_status)) {
   ReloadProfiles();
   LoadSettingsFromCvars();
   SetDrawActive(false);
@@ -1050,6 +1071,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
+  net_hud_ = HasCvar("skate3_net_hud") && rex::cvar::Query<bool>("skate3_net_hud");
   audio_mute_ = HasCvar("audio_mute") && rex::cvar::Query<bool>("audio_mute");
   rumble_ = HasCvar("hid_rumble_enabled") && rex::cvar::Query<bool>("hid_rumble_enabled");
   mnk_sensitivity_ = HasCvar("mnk_sensitivity")
@@ -1058,6 +1080,26 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   chord_custom_.clear();
   chord_index_ = HasCvar("menu_chord") ? MenuChordIndexFromCvar(&chord_custom_) : 0;
   input_backend_index_ = HasInputBackendChoice() ? InputBackendIndexFromCvar() : 0;
+  // Online: seed the staged host/port/name/mode fields from the net cvars. Only
+  // reseed while NOT editing text, so a live edit isn't clobbered by the
+  // per-open reload (Show() and Revert both call this).
+  if (!editing_text_) {
+    if (HasCvar("skate3_net_host")) {
+      CopyToBuffer(net_host_buf_, sizeof(net_host_buf_),
+                   rex::cvar::Query<std::string>("skate3_net_host"));
+    }
+    if (HasCvar("skate3_net_name")) {
+      CopyToBuffer(net_name_buf_, sizeof(net_name_buf_),
+                   rex::cvar::Query<std::string>("skate3_net_name"));
+    }
+    if (HasCvar("skate3_net_port")) {
+      std::snprintf(net_port_buf_, sizeof(net_port_buf_), "%d",
+                    rex::cvar::Query<int32_t>("skate3_net_port"));
+    }
+    if (HasCvar("skate3_net_mode")) {
+      net_is_client_ = rex::cvar::Query<std::string>("skate3_net_mode") == "client";
+    }
+  }
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
@@ -1750,48 +1792,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasCvar("show_fps_counter") || HasCvar("skate3_native_render_mode_indicator")) {
-        header("Interface");
-      }
-      if (HasCvar("show_fps_counter")) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "FPS Counter";
-        row.desc = "Show the framerate overlay in the corner. Applies immediately.";
-        row.options = {"Off", "On"};
-        row.flag = &fps_counter_;
-        row.on_enum_change = [this](int value) {
-          SetBoolCvar("show_fps_counter", value != 0);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        row.reset = [this] {
-          fps_counter_ = CvarDefaultBool("show_fps_counter", false);
-          SetBoolCvar("show_fps_counter", fps_counter_);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        rows.push_back(std::move(row));
-      }
-      if (HasCvar("skate3_native_render_mode_indicator")) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Renderer Indicator";
-        row.desc =
-            "Small corner readout of which renderer produced the last frame "
-            "(NATIVE or EMULATED). Always shown while the Renderer setting "
-            "is Emulated. Applies immediately.";
-        row.options = {"Off", "On"};
-        row.flag = &mode_indicator_;
-        row.on_enum_change = [this](int value) {
-          SetBoolCvar("skate3_native_render_mode_indicator", value != 0);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        row.reset = [this] {
-          mode_indicator_ = CvarDefaultBool("skate3_native_render_mode_indicator", false);
-          SetBoolCvar("skate3_native_render_mode_indicator", mode_indicator_);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        rows.push_back(std::move(row));
-      }
+      // The FPS Counter / Renderer Indicator / Net HUD overlays live in their
+      // own "Accessibility" category (case 6) so they group with the net HUD.
       break;
     }
     case 1: {  // Controls
@@ -2061,6 +2063,464 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.desc = "Return to the game.";
         row.action = [this] { Hide(); };
         rows.push_back(std::move(row));
+      }
+      break;
+    }
+    case 5: {  // Online
+      // Available only when the game supplied a connect hook and defines the net
+      // cvars (i.e. it was built with fan-made online play). Otherwise a single
+      // greyed row explains why the category is empty.
+      const bool net_ok = static_cast<bool>(online_connect_) && HasCvar("skate3_net_enable");
+      if (!net_ok) {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Online play unavailable";
+        row.desc = "This build was compiled without fan-made online play.";
+        row.enabled = false;
+        rows.push_back(std::move(row));
+        break;
+      }
+      const SimpleSettingsOnlineStatus st =
+          online_status_ ? online_status_() : SimpleSettingsOnlineStatus{};
+      // Session settings are locked while a session is live: disconnect first to
+      // change role/address/port/name.
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Mode";
+        row.desc = "Host a session for others to join, or join an existing host by IP.";
+        row.options = {"Host", "Join"};
+        row.flag = &net_is_client_;
+        row.enabled = !st.active;
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kText;
+        row.label = "Host IP";
+        row.desc =
+            "Address of the host to join (its LAN IP, e.g. 192.168.1.42). "
+            "Select to edit with the keyboard.";
+        row.text_buf = net_host_buf_;
+        row.text_buf_size = sizeof(net_host_buf_);
+        row.enabled = net_is_client_ && !st.active;  // only meaningful when joining
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kText;
+        row.label = "Port";
+        row.desc = "UDP port to host on / connect to. Both sides must use the same port.";
+        row.text_buf = net_port_buf_;
+        row.text_buf_size = sizeof(net_port_buf_);
+        row.enabled = !st.active;
+        rows.push_back(std::move(row));
+      }
+      // (Player Name moved to its own "Username" category, case 7.)
+      // Always-visible status bar (a section header whose label is the live
+      // session state). net_state_line_ is a member so the pointer stays valid
+      // through this frame's render.
+      net_state_line_ =
+          "Status: " + (st.state_line.empty() ? std::string("offline") : st.state_line);
+      if (!st.detail_line.empty()) {
+        net_state_line_ += " - " + st.detail_line;
+      }
+      header(net_state_line_.c_str());
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = net_is_client_ ? "Join Session" : "Start Hosting";
+        row.desc = net_is_client_
+                       ? "Connect to the host at the IP and port above."
+                       : "Start hosting on the port above and wait for a player to join.";
+        row.enabled = !st.active;
+        row.action = [this] {
+          // Commit the staged UI values into the net cvars, arm online play,
+          // then hand off to the game to actually start the session.
+          rex::cvar::SetFlagByName("skate3_net_mode", net_is_client_ ? "client" : "host");
+          rex::cvar::SetFlagByName("skate3_net_host", net_host_buf_);
+          if (net_port_buf_[0] != '\0') {
+            rex::cvar::SetFlagByName("skate3_net_port", net_port_buf_);
+          }
+          rex::cvar::SetFlagByName("skate3_net_name", net_name_buf_);
+          rex::cvar::SetFlagByName("skate3_net_enable", "true");
+          if (online_connect_) {
+            online_connect_();
+          }
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Disconnect";
+        row.desc = "End the current online session and return to single player.";
+        row.enabled = st.active;
+        row.danger = true;
+        row.action = [this] {
+          if (online_disconnect_) {
+            online_disconnect_();
+          }
+        };
+        rows.push_back(std::move(row));
+      }
+      // (Game modes moved to their own "Game Modes" category, case 8.)
+      break;
+    }
+    case 6: {  // Accessibility -- on-screen overlay toggles (all hot cvars).
+      bool any = false;
+      if (HasCvar("show_fps_counter")) {
+        any = true;
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "FPS Counter";
+        row.desc = "Show the framerate overlay in the corner. Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &fps_counter_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("show_fps_counter", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          fps_counter_ = CvarDefaultBool("show_fps_counter", false);
+          SetBoolCvar("show_fps_counter", fps_counter_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_native_render_mode_indicator")) {
+        any = true;
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Renderer Indicator";
+        row.desc =
+            "Small corner readout of which renderer produced the last frame "
+            "(NATIVE or EMULATED). Always shown while the Renderer setting "
+            "is Emulated. Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &mode_indicator_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("skate3_native_render_mode_indicator", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          mode_indicator_ = CvarDefaultBool("skate3_native_render_mode_indicator", false);
+          SetBoolCvar("skate3_native_render_mode_indicator", mode_indicator_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_net_hud")) {
+        any = true;
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Net Debug HUD";
+        row.desc =
+            "Show the online debug overlay (player list, scores, ping and last "
+            "trick, top-left). The game-mode scoreboard is separate and always "
+            "shows during a Spot Battle / S.K.A.T.E. game. Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &net_hud_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("skate3_net_hud", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          net_hud_ = CvarDefaultBool("skate3_net_hud", false);
+          SetBoolCvar("skate3_net_hud", net_hud_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (!any) {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "No overlays available";
+        row.desc = "This build defines no overlay toggles.";
+        row.enabled = false;
+        rows.push_back(std::move(row));
+      }
+      break;
+    }
+    case 7: {  // Username -- the online display name (skate3_net_name).
+      if (!HasCvar("skate3_net_name")) {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Username unavailable";
+        row.desc = "This build was compiled without fan-made online play.";
+        row.enabled = false;
+        rows.push_back(std::move(row));
+        break;
+      }
+      const SimpleSettingsOnlineStatus st =
+          online_status_ ? online_status_() : SimpleSettingsOnlineStatus{};
+      {
+        RowSpec row;
+        row.kind = RowSpec::kText;
+        row.label = "Player Name";
+        row.desc =
+            "The name other players see you as online. Select to edit with the "
+            "keyboard. If two players share a name, a number is added "
+            "automatically (e.g. \"Bob (1)\"). Change it before you connect.";
+        row.text_buf = net_name_buf_;
+        row.text_buf_size = sizeof(net_name_buf_);
+        row.enabled = !st.active;  // locked while a session is live.
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Save Name";
+        row.desc = st.active
+                       ? "Disconnect first to change your name."
+                       : "Apply this name so it's used the next time you connect.";
+        row.enabled = !st.active;
+        row.action = [this] {
+          rex::cvar::SetFlagByName("skate3_net_name", net_name_buf_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      break;
+    }
+    case 8: {  // Game Modes -- start an online Spot Battle or S.K.A.T.E. game.
+      const bool has_spot = HasCvar("skate3_mode_start");
+      const bool has_skate = HasCvar("skate3_skate_start");
+      if (!has_spot && !has_skate) {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Game modes unavailable";
+        row.desc = "This build was compiled without fan-made online play.";
+        row.enabled = false;
+        rows.push_back(std::move(row));
+        break;
+      }
+      const SimpleSettingsOnlineStatus st =
+          online_status_ ? online_status_() : SimpleSettingsOnlineStatus{};
+      // Modes need a live session with other players; keep the controls
+      // greyed and explain why until one is running.
+      if (!st.active) {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Not in a session";
+        row.desc =
+            "Host or join a session (Online tab) and get everyone into Free "
+            "Play first, then start a mode here.";
+        row.enabled = false;
+        rows.push_back(std::move(row));
+      }
+      if (has_spot) {
+        header("Spot Battle");
+        {
+          RowSpec row;
+          row.kind = RowSpec::kEnum;
+          row.label = "Rounds";
+          row.desc = "How many back-to-back Spot Battle rounds to play (1-6).";
+          for (const char* label : kSpotRoundLabels) row.options.push_back(label);
+          row.index = &spot_rounds_index_;
+          row.enabled = st.active;
+          row.reset = [this] { spot_rounds_index_ = 0; };
+          rows.push_back(std::move(row));
+        }
+        {
+          RowSpec row;
+          row.kind = RowSpec::kEnum;
+          row.label = "Round Length";
+          row.desc = "How long each Spot Battle round's active window lasts.";
+          for (const char* label : kSpotTimeLabels) row.options.push_back(label);
+          row.index = &spot_time_index_;
+          row.enabled = st.active;
+          row.reset = [this] {
+            spot_time_index_ = static_cast<int>(kSpotTimeSeconds.size()) - 1;  // 60s
+          };
+          rows.push_back(std::move(row));
+        }
+        {
+          RowSpec row;
+          row.kind = RowSpec::kAction;
+          row.label = "Start Spot Battle";
+          row.desc = "Start a Spot Battle for everyone in the session -- biggest "
+                     "line wins each round.";
+          row.enabled = st.active;
+          row.action = [this] {
+            const int ti = std::clamp(spot_time_index_, 0,
+                                      static_cast<int>(kSpotTimeSeconds.size()) - 1);
+            const int rounds = std::clamp(spot_rounds_index_, 0,
+                                          static_cast<int>(kSpotRoundLabels.size()) - 1) +
+                               1;
+            rex::cvar::SetFlagByName("skate3_mode_rounds", std::to_string(rounds));
+            rex::cvar::SetFlagByName("skate3_mode_start",
+                                     std::to_string(kSpotTimeSeconds[ti]));
+            Hide();  // close the menu so the round starts on-screen.
+          };
+          rows.push_back(std::move(row));
+        }
+      }
+      if (has_skate) {
+        header("S.K.A.T.E.");
+        {
+          RowSpec row;
+          row.kind = RowSpec::kEnum;
+          row.label = "Rounds";
+          row.desc =
+              "How many S.K.A.T.E. rounds to play (1-3). Each turn gives 25s to "
+              "land a trick.";
+          for (const char* label : kSkateRoundLabels) row.options.push_back(label);
+          row.index = &skate_rounds_index_;
+          row.enabled = st.active;
+          row.reset = [this] { skate_rounds_index_ = 0; };
+          rows.push_back(std::move(row));
+        }
+        {
+          RowSpec row;
+          row.kind = RowSpec::kAction;
+          row.label = "Start S.K.A.T.E.";
+          row.desc = "Start a S.K.A.T.E. game: set a trick, everyone else has to "
+                     "match it or take a letter.";
+          row.enabled = st.active;
+          row.action = [this] {
+            const int rounds = std::clamp(skate_rounds_index_, 0,
+                                          static_cast<int>(kSkateRoundLabels.size()) - 1) +
+                               1;
+            rex::cvar::SetFlagByName("skate3_skate_start", std::to_string(rounds));
+            Hide();  // close the menu so the game starts on-screen.
+          };
+          rows.push_back(std::move(row));
+        }
+      }
+      break;
+    }
+    case 9: {  // Party -- invite by name, accept incoming, leave, privacy.
+      const bool net_ok = HasCvar("skate3_party_invite") &&
+                          HasCvar("skate3_party_accept") &&
+                          HasCvar("skate3_party_leave") &&
+                          static_cast<bool>(party_status_);
+      if (!net_ok) {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Party unavailable";
+        row.desc = "This build was compiled without the party system.";
+        row.enabled = false;
+        rows.push_back(std::move(row));
+        break;
+      }
+      const SimpleSettingsOnlineStatus st =
+          online_status_ ? online_status_() : SimpleSettingsOnlineStatus{};
+      const SimpleSettingsPartyView pv = party_status_();
+      // Status header: solo / member of X's party / leader of your party.
+      net_state_line_ = pv.in_party
+                            ? (pv.you_are_leader
+                                   ? std::string("Party: You lead (") +
+                                         std::to_string(pv.members.size()) + ")"
+                                   : std::string("Party: with ") + pv.leader_name)
+                            : std::string("Solo (no party)");
+      if (pv.in_party && pv.is_private) net_state_line_ += " -- PRIVATE";
+      header(net_state_line_.c_str());
+      if (!st.active) {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Not in a session";
+        row.desc =
+            "Host or join a session (Online tab) first. You can only party up "
+            "with players who are in the same session as you.";
+        row.enabled = false;
+        rows.push_back(std::move(row));
+        break;
+      }
+      // Invite by name.
+      {
+        RowSpec row;
+        row.kind = RowSpec::kText;
+        row.label = "Invite Name";
+        row.desc =
+            "Type the display name of the player to invite, then select "
+            "\"Send Invite\" below. Name must match exactly (case-sensitive).";
+        row.text_buf = party_invite_buf_;
+        row.text_buf_size = sizeof(party_invite_buf_);
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Send Invite";
+        row.desc =
+            "Invite the player named above to your party. If you're solo, you "
+            "become the leader of your own new party when you invite.";
+        row.enabled = party_invite_buf_[0] != '\0';
+        row.action = [this] {
+          rex::cvar::SetFlagByName("skate3_party_invite", party_invite_buf_);
+          party_invite_buf_[0] = '\0';
+        };
+        rows.push_back(std::move(row));
+      }
+      // RowSpec::label/desc are const char*, so any dynamically-built string
+      // needs storage that outlives the vector<RowSpec>. These per-frame
+      // buffers are refilled every rebuild -- cleared here, appended below.
+      party_label_pool_.clear();
+      // Pending invites (one action row each).
+      if (!pv.invites.empty()) {
+        header("Incoming Invites");
+        for (const std::string& from : pv.invites) {
+          std::string label = "Accept from " + from;
+          party_label_pool_.push_back(std::move(label));
+          RowSpec row;
+          row.kind = RowSpec::kAction;
+          row.label = party_label_pool_.back().c_str();
+          row.desc = "Accept this invite and join their party.";
+          const std::string captured_from = from;
+          row.action = [captured_from] {
+            rex::cvar::SetFlagByName("skate3_party_accept", captured_from);
+          };
+          rows.push_back(std::move(row));
+        }
+      }
+      // Party actions (only meaningful when in a party).
+      if (pv.in_party) {
+        header("Party");
+        if (pv.you_are_leader) {
+          RowSpec row;
+          row.kind = RowSpec::kEnum;
+          row.label = "Private Party";
+          row.desc =
+              "PRIVATE hides everyone outside your party -- they won't appear "
+              "in your world and won't be included in your Spot Battle / "
+              "S.K.A.T.E. rounds. Members inherit this from the leader.";
+          row.options = {"Public", "Private"};
+          party_private_index_ = pv.is_private;   // reflect live state each frame.
+          row.flag = &party_private_index_;
+          row.on_enum_change = [](int value) {
+            rex::cvar::SetFlagByName("skate3_party_private",
+                                     value != 0 ? "true" : "false");
+          };
+          rows.push_back(std::move(row));
+        }
+        {
+          RowSpec row;
+          row.kind = RowSpec::kAction;
+          row.label = "Leave Party";
+          row.desc = "Leave the party and go back to solo.";
+          row.danger = true;
+          row.action = [] {
+            rex::cvar::SetFlagByName("skate3_party_leave", "true");
+          };
+          rows.push_back(std::move(row));
+        }
+        // Roster (informational -- one action-disabled row per member).
+        header("Members");
+        for (const SimpleSettingsPartyMember& m : pv.members) {
+          std::string label = m.name;
+          if (m.leader) label += " (leader)";
+          if (m.local) label += " -- you";
+          party_label_pool_.push_back(std::move(label));
+          RowSpec row;
+          row.kind = RowSpec::kAction;
+          row.label = party_label_pool_.back().c_str();
+          row.desc = m.leader
+                         ? "Party leader -- can toggle Private and disband."
+                         : "Party member.";
+          row.enabled = false;
+          rows.push_back(std::move(row));
+        }
       }
       break;
     }

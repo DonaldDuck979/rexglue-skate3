@@ -243,7 +243,9 @@ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
 REX_EXPORT_STUB(__imp__XNetLogonGetState);
 REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+// [skate3-online] XNetLogonGetTitleID: real implementation lives in xam_net.cpp.
+// (Was a stub returning 0; game bailed on 0 title id.)
+// REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
 REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
 REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);

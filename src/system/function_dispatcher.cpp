@@ -13,7 +13,10 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <atomic>
+
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -22,6 +25,19 @@
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
+
+// Opt-in stability band-aid: when a recompiled indirect call targets a function
+// that is not in the dispatch table (a recomp gap, or a corrupted/garbage guest
+// function pointer), survive it by logging and returning 0 (r3=0) instead of
+// aborting the whole process. Many guest call sites null-check the returned
+// pointer and handle it gracefully, so this can keep a session alive through an
+// otherwise-fatal glitch. Off by default: the default stays a hard abort so
+// real bugs are not silently masked.
+REXCVAR_DEFINE_BOOL(
+    soft_invalid_indirect_calls, false, "Recomp",
+    "Survive a call to an invalid/unregistered guest function by returning 0 "
+    "instead of aborting. Off = abort (default). A band-aid for recomp gaps / "
+    "guest heap corruption; may let the game continue in a degraded state.");
 
 namespace rex::runtime {
 
@@ -35,6 +51,32 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+  // [diag] Before aborting, record the guest CALLER (lr = the return address
+  // just past the bctrl) and the first args (r3 is typically the 'this' pointer
+  // for a virtual call). This lets a null/unregistered indirect call be traced
+  // back to the guest function that made it, instead of only knowing the callee
+  // was null. Still fatal; this only adds context to the crash log.
+  const bool soft = REXCVAR_GET(soft_invalid_indirect_calls);
+  // Rate-limit the log in soft mode (it can fire every frame), but always log
+  // the first occurrences and periodically thereafter.
+  static std::atomic<uint32_t> s_seen{0};
+  const uint32_t n = s_seen.fetch_add(1, std::memory_order_relaxed);
+  if (!soft || n < 16 || (n & 511u) == 0) {
+    REXLOG_ERROR(
+        "[diag] invalid indirect call: target={:#010x} caller_lr={:#010x} "
+        "r3={:#010x} r4={:#010x} r5={:#010x} r11={:#010x} (n={}, soft={})",
+        ctx.last_indirect_target, static_cast<uint32_t>(ctx.lr),
+        static_cast<uint32_t>(ctx.r3.u64), static_cast<uint32_t>(ctx.r4.u64),
+        static_cast<uint32_t>(ctx.r5.u64), static_cast<uint32_t>(ctx.r11.u64), n,
+        soft);
+  }
+  if (soft) {
+    // Return 0 to the caller (r3 is the PPC return-value register). Call sites
+    // that null-check the result will take their error path; the process keeps
+    // running instead of aborting on this one call.
+    ctx.r3.u64 = 0;
+    return;
+  }
   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
             ctx.last_indirect_target);
 }

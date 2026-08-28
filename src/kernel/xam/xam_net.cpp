@@ -12,9 +12,11 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdio>
 #include <cstring>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -28,6 +30,47 @@
 #include <rex/system/xsocket.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+// [skate3-online] Packet log: reveals every real network call the game makes.
+// Default ON so the first session after this build produces a log we can read
+// without having to enable a cvar; turn off with `skate3_net_packet_log 0`
+// once we've captured the endpoints.
+REXCVAR_DEFINE_BOOL(skate3_net_packet_log, false, "Net",
+                    "Diagnostic: log every socket send/recv/connect/DNS lookup "
+                    "the game makes (dest IP:port + len + first 16 bytes hex) "
+                    "plus XLIVEBASE message codes. Default OFF (this was an "
+                    "EA-Nation investigation aid; noisy). Enable with "
+                    "`skate3_net_packet_log 1` only when debugging the game's "
+                    "own network calls.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [skate3-online] The "online" IP reported to the game by XNetGetTitleXnAddr
+// (the inaOnline field = this console's address as the outside world sees it).
+// Reporting a non-zero online address + the ONLINE status flag is what makes
+// the game believe it has an online presence and proceed to actually connect
+// to EA Nation (instead of polling forever then "lost connection to EA
+// Nation"). Defaults to James's known home PUBLIC IP; update it here if the
+// ISP reassigns it (a public IP can be dynamic). Empty = fall back to the
+// machine's local IP.
+REXCVAR_DEFINE_STRING(skate3_xnet_online_ip, "74.221.197.102", "Net",
+                      "Public IP reported to the game as its online address "
+                      "(XNetGetTitleXnAddr inaOnline). Set to your current "
+                      "home public IP; empty = use the local IP. Only used when "
+                      "skate3_xnet_report_online is on.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [skate3-online] Master gate for the "report a real online presence" behavior
+// in XNetGetTitleXnAddr. DEFAULT OFF: with it on, the game believes it's online
+// and actively tries to connect to EA Nation -- which dead-ends at EA's
+// console-certificate auth and shows the user "Connecting to EA Nation... /
+// You have lost your connection to EA Nation" errors. For the SHIPPING fan-
+// online build we want the game to sit quietly "not online" (our own netplay
+// is the online path), so this stays off. Kept as a cvar so the EA-Nation /
+// revival-server experiment can be resumed later with `skate3_xnet_report_online 1`.
+REXCVAR_DEFINE_BOOL(skate3_xnet_report_online, false, "Net",
+                    "EXPERIMENTAL: report a real online presence to the game so "
+                    "its own EA Nation / Xbox LIVE client tries to connect. "
+                    "Default OFF (the connection dead-ends at EA's auth; leave "
+                    "off unless experimenting with real/revival servers).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 #if REX_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
@@ -46,6 +89,64 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+// [skate3-online] Packet-log helpers. Format sockaddr fields safely regardless
+// of rex::be's implicit-conversion behavior by extracting raw bytes (sin_addr
+// and sin_port are always stored network byte order per XSOCKADDR_IN's comment).
+static void FormatSockaddr(const N_XSOCKADDR_IN* sa, char* out, size_t out_sz) {
+  if (!sa) { std::snprintf(out, out_sz, "?"); return; }
+  const uint8_t* ab = reinterpret_cast<const uint8_t*>(&sa->sin_addr);
+  const uint8_t* pb = reinterpret_cast<const uint8_t*>(&sa->sin_port);
+  const uint16_t port = (uint16_t(pb[0]) << 8) | uint16_t(pb[1]);
+  std::snprintf(out, out_sz, "%u.%u.%u.%u:%u",
+                ab[0], ab[1], ab[2], ab[3], port);
+}
+// First 16 bytes of a payload as hex, for quick fingerprinting of packets.
+static void FormatHexPeek(const void* data, size_t len, char* out, size_t out_sz) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  const size_t n = std::min<size_t>(len, 16);
+  size_t off = 0;
+  for (size_t i = 0; i < n && off + 3 < out_sz; ++i) {
+    off += std::snprintf(out + off, out_sz - off, "%02x ", p[i]);
+  }
+  if (off > 0 && out[off - 1] == ' ') out[off - 1] = 0;
+  else if (off < out_sz) out[off] = 0;
+}
+static inline bool PacketLogEnabled() {
+  return REXCVAR_GET(skate3_net_packet_log);
+}
+
+// [skate3-online] Best-effort primary outbound local IPv4, in network byte
+// order. Opens a UDP socket and "connects" it toward a public address (UDP
+// connect sends nothing -- it just makes the OS pick the default-route
+// interface), then reads back which local address that is. Falls back to
+// loopback. Windows-only (this file's winsock path is Win32); other platforms
+// return loopback.
+static uint32_t PrimaryLocalIPv4NBO() {
+#if REX_PLATFORM_WIN32
+  SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (s == INVALID_SOCKET) {
+    return htonl(INADDR_LOOPBACK);
+  }
+  sockaddr_in probe = {};
+  probe.sin_family = AF_INET;
+  probe.sin_port = htons(53);
+  probe.sin_addr.s_addr = inet_addr("8.8.8.8");
+  uint32_t ip = htonl(INADDR_LOOPBACK);
+  if (::connect(s, reinterpret_cast<sockaddr*>(&probe), sizeof(probe)) == 0) {
+    sockaddr_in local = {};
+    int len = static_cast<int>(sizeof(local));
+    if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0 &&
+        local.sin_addr.s_addr != 0) {
+      ip = local.sin_addr.s_addr;  // already network byte order.
+    }
+  }
+  ::closesocket(s);
+  return ip;
+#else
+  return htonl(INADDR_LOOPBACK);
+#endif
+}
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
 enum {
@@ -180,6 +281,9 @@ struct XNetStartupParams {
 XNetStartupParams xnet_startup_params = {0};
 
 u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
+  if (PacketLogEnabled()) {
+    REXKRNL_INFO("[net-pkt] XNetStartup caller={}", caller);
+  }
   if (params) {
     assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
     std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
@@ -433,27 +537,67 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-  // Just return a loopback address atm.
-  addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
-  addr_ptr->inaOnline.s_addr = 0;
-  addr_ptr->wPortOnline = 0;
+  // Default (shipping) behavior: report loopback with NO online presence, so
+  // the game stays quietly offline and doesn't try to reach EA Nation (which
+  // dead-ends at EA's console-cert auth). Our own netplay is the online path.
+  // The EA-Nation experiment path below only runs under skate3_xnet_report_online.
+  if (!REXCVAR_GET(skate3_xnet_report_online)) {
+    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+    addr_ptr->inaOnline.s_addr = 0;
+    addr_ptr->wPortOnline = 0;
+    std::memset(addr_ptr->abEnet, 0xCC, 6);   // non-zero MAC (RakNet needs it).
+    std::memset(addr_ptr->abOnline, 0, 20);
+    return XnAddrStatus::XNET_GET_XNADDR_STATIC;
+  }
+
+  // [skate3-online] EXPERIMENTAL: report a REAL online presence so the game
+  // stops polling "am I online?" and proceeds to actually connect to EA Nation.
+  //   ina         = this machine's real local IPv4 (a bindable local interface;
+  //                 must NOT be a remote/VPS address or the game may fail to
+  //                 bind a socket to it).
+  //   inaOnline   = our home PUBLIC IP (skate3_xnet_online_ip cvar) = this
+  //                 console's address as the outside world sees it. Falls back
+  //                 to the local IP when the cvar is empty/unparseable.
+  //   wPortOnline = a non-zero online port (assigned as a plain host value; the
+  //                 guest reads XNADDR big-endian, so a small value is fine).
+  //   status now includes XNET_GET_XNADDR_ONLINE so the poll resolves "online".
+  const uint32_t local_ip = PrimaryLocalIPv4NBO();
+  uint32_t online_ip = local_ip;
+  const std::string online_ip_str =
+      rex::cvar::Query<std::string>("skate3_xnet_online_ip");
+  if (!online_ip_str.empty()) {
+    const uint32_t parsed = inet_addr(online_ip_str.c_str());
+    if (parsed != INADDR_NONE) {
+      online_ip = parsed;  // network byte order.
+    }
+  }
+  addr_ptr->ina.s_addr = local_ip;
+  addr_ptr->inaOnline.s_addr = online_ip;
+  addr_ptr->wPortOnline = 34643;  // plain value; guest reads big-endian.
 
   // TODO(gibbed): A proper mac address.
   // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
-  // numbers. A zero value will cause RakPeer::Startup to fail. This causes
-  // 58411436 to crash on startup.
-  // The 360-specific code is scrubbed from the RakNet repo, but there's still
-  // traces of what it's doing which match the game code.
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L382
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4527
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4467
-  // "Mac address is a poor solution because you can't have multiple connections
-  // from the same system"
+  // numbers. A zero value will cause RakPeer::Startup to fail.
   std::memset(addr_ptr->abEnet, 0xCC, 6);
-
   std::memset(addr_ptr->abOnline, 0, 20);
 
-  return XnAddrStatus::XNET_GET_XNADDR_STATIC;
+  // Rate-limited: the game may poll this many times; log the first call and
+  // then sparsely, so the EA-connection packets we care about aren't buried.
+  static uint32_t s_xnaddr_calls = 0;
+  if (PacketLogEnabled() && (s_xnaddr_calls++ % 500) == 0) {
+    const uint8_t* lb = reinterpret_cast<const uint8_t*>(&local_ip);
+    const uint8_t* ob = reinterpret_cast<const uint8_t*>(&online_ip);
+    REXKRNL_INFO(
+        "[net-pkt] XNetGetTitleXnAddr caller={} #{} local={}.{}.{}.{} "
+        "online={}.{}.{}.{}:34643 status=STATIC|GATEWAY|DNS|ONLINE",
+        caller, s_xnaddr_calls, lb[0], lb[1], lb[2], lb[3],
+        ob[0], ob[1], ob[2], ob[3]);
+  }
+
+  return XnAddrStatus::XNET_GET_XNADDR_STATIC |
+         XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
+         XnAddrStatus::XNET_GET_XNADDR_DNS |
+         XnAddrStatus::XNET_GET_XNADDR_ONLINE;
 }
 
 u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -507,6 +651,13 @@ u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
 }
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
+  if (PacketLogEnabled()) {
+    // `host` is a guest string; log whatever hostname the game asked for --
+    // often EA / Xbox LIVE FQDNs (e.g. easo.ea.com, xboxlive.com, xhttp.msft.net).
+    // Even though the lookup is stubbed, this reveals the game's INTENT.
+    const char* h = host ? host.host_address() : "(null)";
+    REXKRNL_INFO("[net-pkt] DnsLookup host='{}' event={}", h, event_handle);
+  }
   // TODO(gibbed): actually implement this
   if (pdns) {
     auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
@@ -586,9 +737,17 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
 
     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
     XThread::SetLastError(error);
+    if (PacketLogEnabled()) {
+      REXKRNL_INFO("[net-pkt] socket af={} type={} proto={} -> FAILED err={:#x}",
+                   af, type, protocol, error);
+    }
     return -1;
   }
 
+  if (PacketLogEnabled()) {
+    REXKRNL_INFO("[net-pkt] socket af={} type={} proto={} -> handle={}",
+                 af, type, protocol, socket->handle());
+  }
   return socket->handle();
 }
 
@@ -667,6 +826,11 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
 
   N_XSOCKADDR_IN native_name(name);
+  if (PacketLogEnabled()) {
+    char addr[48];
+    FormatSockaddr(&native_name, addr, sizeof(addr));
+    REXKRNL_INFO("[net-pkt] bind sock={} local={}", socket_handle, addr);
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
@@ -685,6 +849,12 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
   }
 
   N_XSOCKADDR native_name(name);
+  if (PacketLogEnabled()) {
+    // XSOCKADDR is generic; cast to sockaddr_in-shaped for logging (family+port+addr layout).
+    char dst[48];
+    FormatSockaddr(reinterpret_cast<const N_XSOCKADDR_IN*>(&native_name), dst, sizeof(dst));
+    REXKRNL_INFO("[net-pkt] connect sock={} dst={}", socket_handle, dst);
+  }
   X_STATUS status = socket->Connect(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
@@ -849,7 +1019,14 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
-  return socket->Recv(buf_ptr, buf_len, flags);
+  int ret = socket->Recv(buf_ptr, buf_len, flags);
+  if (PacketLogEnabled() && ret > 0) {
+    char peek[64];
+    FormatHexPeek(buf_ptr, static_cast<size_t>(ret), peek, sizeof(peek));
+    REXKRNL_INFO("[net-pkt] recv sock={} len={} data=[{}]",
+                 socket_handle, ret, peek);
+  }
+  return ret;
 }
 
 u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
@@ -879,6 +1056,13 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
     *fromlen_ptr = native_fromlen;
   }
 
+  if (PacketLogEnabled() && ret > 0) {
+    char src[48], peek[64];
+    FormatSockaddr(&native_from, src, sizeof(src));
+    FormatHexPeek(buf_ptr, static_cast<size_t>(ret), peek, sizeof(peek));
+    REXKRNL_INFO("[net-pkt] recvfrom sock={} src={} len={} data=[{}]",
+                 socket_handle, src, ret, peek);
+  }
   if (ret == -1) {
 // TODO: Better way of getting the error code
 #if REX_PLATFORM_WIN32
@@ -900,6 +1084,12 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
+  if (PacketLogEnabled()) {
+    char peek[64];
+    FormatHexPeek(buf_ptr, static_cast<size_t>(buf_len), peek, sizeof(peek));
+    REXKRNL_INFO("[net-pkt] send sock={} len={} data=[{}]",
+                 socket_handle, buf_len, peek);
+  }
   return socket->Send(buf_ptr, buf_len, flags);
 }
 
@@ -913,7 +1103,23 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
+  if (PacketLogEnabled()) {
+    char dst[48], peek[64];
+    FormatSockaddr(&native_to, dst, sizeof(dst));
+    FormatHexPeek(buf_ptr, static_cast<size_t>(buf_len), peek, sizeof(peek));
+    REXKRNL_INFO("[net-pkt] sendto sock={} dst={} len={} data=[{}]",
+                 socket_handle, dst, buf_len, peek);
+  }
   return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+}
+
+// [skate3-online] XNetLogonGetTitleID: was a stub returning 0, causing the
+// game to abort its XLive activation before any packets were built. Returns
+// Skate 3's Xbox LIVE title ID = 0x454108E6 (same value seen in the save
+// folder path <XUID>/454108E6/... produced by the game itself). No args; the
+// title ID is a compile-time property of the xex.
+u32 XNetLogonGetTitleID_entry() {
+  return 0x454108E6u;
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
@@ -982,6 +1188,8 @@ REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
 REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
 REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
 REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
+// [skate3-online] Real XNetLogonGetTitleID (was REX_EXPORT_STUB in xam_misc.cpp).
+REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
 
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);

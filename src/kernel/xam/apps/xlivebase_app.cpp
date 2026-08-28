@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstring>
+
+#include <rex/cvar.h>
 #include <rex/kernel/xam/apps/xlivebase_app.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -29,6 +32,13 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
                                             uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
+  // [skate3-online] Trace EVERY XLIVEBASE message the game sends, gated behind
+  // the packet-log cvar (off by default; this was an EA-Nation investigation
+  // aid). Enable with `skate3_net_packet_log 1` to see the full sequence.
+  if (rex::cvar::Query<bool>("skate3_net_packet_log")) {
+    REXKRNL_INFO("[xlive-trace] XLIVEBASE msg={:08X} buf={:08X} len={:08X}",
+                 message, buffer_ptr, buffer_length);
+  }
   switch (message) {
     case 0x00058004: {
       // Called on startup, seems to just return a bool in the buffer.
@@ -49,6 +59,23 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       // XONLINE_SERVICE_INFO structure.
       REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
       return 0x80151802;  // ERROR_CONNECTION_INVALID
+    }
+    case 0x00058009: {
+      // [skate3-online] Was returning "Unimplemented" and blocking Skate 3's
+      // XLive activation upstream of the socket layer. Neighboring messages
+      // in the 0x58000-0x58020 range are XLive Logon service selectors
+      // (GetLogonId=0x58004, GetNatType=0x58006, GetServiceInfo=0x58007,
+      // Enumerate=0x58020). 0x58009 hasn't been publicly identified but
+      // the game supplies a 16-byte output buffer -- zero-fill it and return
+      // SUCCESS so the game proceeds; if it later checks specific fields
+      // we'll see that as the next stub firing and iterate. Matches the
+      // permissive-success pattern of 0x58046 already in this file.
+      REXKRNL_DEBUG("XLiveBase58009({:08X}, {:08X}) -> SUCCESS/empty",
+                    buffer_ptr, buffer_length);
+      if (buffer && buffer_length > 0) {
+        std::memset(buffer, 0, buffer_length);
+      }
+      return X_E_SUCCESS;
     }
     case 0x00058020: {
       // 0x00058004 is called right before this.

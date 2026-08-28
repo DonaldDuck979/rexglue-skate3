@@ -35,6 +35,18 @@ REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 REXCVAR_DEFINE_UINT32(xam_signin_ui_auto_close_ms, 1200, "Kernel",
                       "Duration to keep the stubbed sign-in UI active before auto-closing");
 
+// [skate3-online] Force the sign-in / online-enabled / privilege gates to
+// report "signed in to LIVE" regardless of whether the local profile is
+// actually configured that way. Lets a fresh install go online without first
+// hand-editing profiles.toml + live_signed_in. The ORIGINAL is_live_signed_in()
+// checks are preserved as comments in the affected _entry functions below so
+// this can be reverted by flipping the cvar OFF. Default TRUE for our fork.
+REXCVAR_DEFINE_BOOL(skate3_bypass_signin_gate, true, "Kernel",
+                    "Force the Xbox LIVE sign-in gate to always report signed in. "
+                    "Set false to restore the original signed-in-only-if-profile-"
+                    "is-configured behavior (see xam_user.cpp).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -78,8 +90,19 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
   uint32_t signin_state = 0;
   if (user_index < 4) {
     if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
+      // [skate3-online] Xbox LIVE sign-in gate BYPASS: unconditionally report
+      // state=2 (signed in to LIVE) when the bypass cvar is on, so the game's
+      // Options->Online menu never shows the "sign in" prompt. Original path
+      // that read the local profile's state is preserved just below.
+      if (REXCVAR_GET(skate3_bypass_signin_gate)) {
+        signin_state = 2;  // 0=out, 1=local, 2=live.
+      } else {
+        const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+        signin_state = user_profile->signin_state();
+      }
+      // Original (kept as documentation; re-enable by flipping the cvar OFF):
+      // const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+      // signin_state = user_profile->signin_state();
     }
   }
   return signin_state;
@@ -106,12 +129,16 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  if (!user_profile->is_signed_in()) {
+  // [skate3-online] gate bypass: skip the "not signed in" early return so the
+  // game always sees valid signin info. Original check preserved below.
+  if (!REXCVAR_GET(skate3_bypass_signin_gate) && !user_profile->is_signed_in()) {
     return X_E_NO_SUCH_USER;
   }
+  // Original (kept for revert): if (!user_profile->is_signed_in()) return X_E_NO_SUCH_USER;
 
   info->xuid = user_profile->xuid();
-  info->signin_state = user_profile->signin_state();
+  info->signin_state = REXCVAR_GET(skate3_bypass_signin_gate) ? 2u
+                                                              : user_profile->signin_state();
   rex::string::util_copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   return X_E_SUCCESS;
 }
@@ -430,8 +457,16 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // [skate3-online] gate bypass: grant every privilege when the bypass cvar is
+  // on so privilege-gated online menus (multiplayer sessions etc.) open freely.
+  // Original: gate on is_live_signed_in(), preserved below.
+  if (REXCVAR_GET(skate3_bypass_signin_gate)) {
+    *out_value = 1;
+  } else {
+    *out_value = REX_KERNEL_STATE()->user_profile()->is_live_signed_in() ? 1 : 0;
+  }
+  // Original (kept for revert):
+  // *out_value = REX_KERNEL_STATE()->user_profile()->is_live_signed_in() ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
@@ -477,7 +512,14 @@ u32 XamUserIsOnlineEnabled_entry(u32 user_index) {
   if (user_index != 0) {
     return 0;
   }
+  // [skate3-online] gate bypass: report online-enabled for user 0 regardless
+  // of whether the local profile is configured live-signed-in. Original below.
+  if (REXCVAR_GET(skate3_bypass_signin_gate)) {
+    return 1;
+  }
   return REX_KERNEL_STATE()->user_profile()->is_live_signed_in() ? 1 : 0;
+  // Original (kept for revert):
+  // return REX_KERNEL_STATE()->user_profile()->is_live_signed_in() ? 1 : 0;
 }
 
 u32 XamUserGetMembershipTier_entry(u32 user_index) {
@@ -487,9 +529,13 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   if (user_index) {
     return X_ERROR_NO_SUCH_USER;
   }
-  if (!REX_KERNEL_STATE()->user_profile()->is_live_signed_in()) {
+  // [skate3-online] gate bypass: always report Gold-tier membership so online
+  // menus that gate on Gold don't refuse. Original check preserved below.
+  if (!REXCVAR_GET(skate3_bypass_signin_gate) &&
+      !REX_KERNEL_STATE()->user_profile()->is_live_signed_in()) {
     return X_ERROR_NOT_LOGGED_ON;
   }
+  // Original: if (!user_profile()->is_live_signed_in()) return X_ERROR_NOT_LOGGED_ON;
   return 6 /* 6 appears to be Gold */;
 }
 
