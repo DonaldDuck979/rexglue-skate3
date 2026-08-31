@@ -41,9 +41,6 @@
 [submodule "thirdparty/vulkan-memory-allocator"]
 	path = thirdparty/vulkan-memory-allocator
 	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
-[submodule "thirdparty/imgui"]
-	path = thirdparty/imgui
-	url = https://github.com/ocornut/imgui.git
 [submodule "thirdparty/spirv-tools"]
 	path = thirdparty/spirv-tools
 	url = https://github.com/KhronosGroup/SPIRV-Tools.git
