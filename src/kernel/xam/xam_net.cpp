@@ -841,6 +841,29 @@ static void DumpGuestMemoryOnce() {
 }
 #endif
 
+// [skate3-online] The EA Nation revival redirect points the game's service
+// lookups at our Blaze server. But CONTENT downloads (the Title Update, DLC
+// parks) are served by EA's download CDN (downloads.skate.online.ea.com), NOT
+// the Blaze server. Redirecting those to our server makes the install-time
+// title-update download hit a box that can't serve it -> HTTP 502 -> failed
+// install. Keep content-download hosts OUT of the redirect so they don't get
+// pointed at the Blaze server.
+static bool HostIsContentDownload(mapped_string host) {
+  if (!host) return false;
+  const char* h = host.host_address();
+  if (!h) return false;
+  auto lc = [](char c) -> char {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+  };
+  static const char kNeedle[] = "download";  // downloads.skate.online.ea.com
+  for (const char* p = h; *p; ++p) {
+    size_t i = 0;
+    while (kNeedle[i] && lc(p[i]) == kNeedle[i]) ++i;
+    if (kNeedle[i] == '\0') return true;
+  }
+  return false;
+}
+
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
 #if REX_PLATFORM_WIN32
   if (REXCVAR_GET(skate3_dump_guestmem)) {
@@ -862,11 +885,15 @@ u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle,
     // ea.com) reach our server on the same box instead of failing (a failed
     // lookup made the game connect to 255.255.255.255 and show "EA server not
     // available"). Only when online-for-real; otherwise report a lookup failure.
-    if (REXCVAR_GET(skate3_xnet_report_online)) {
+    if (REXCVAR_GET(skate3_xnet_report_online) && !HostIsContentDownload(host)) {
       dns->status = 0;  // success
       dns->cina = 1;    // one address
       dns->aina[0].s_addr = BlazeRedirectNBO();  // our server IP (network order)
     } else {
+      // Offline, or a content/title-update download host (see
+      // HostIsContentDownload): report a lookup failure instead of pointing it
+      // at our Blaze server, which is not EA's content CDN. This keeps the
+      // install-time title-update download from hitting the Blaze box (HTTP 502).
       dns->status = 1;  // non-zero = error
       dns->cina = 0;
     }
