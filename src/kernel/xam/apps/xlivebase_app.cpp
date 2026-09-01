@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdio>
 #include <cstring>
 
 #include <rex/cvar.h>
@@ -54,11 +55,45 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
     case 0x00058007: {
-      // Occurs if title calls XOnlineGetServiceInfo, expects dwServiceId
-      // and pServiceInfo. pServiceInfo should contain pointer to
-      // XONLINE_SERVICE_INFO structure.
-      REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return 0x80151802;  // ERROR_CONNECTION_INVALID
+      // [skate3-online v2] XOnlineGetServiceInfo -- the EA client's "where is the
+      // EA Nation server?" call, and THE source of the "EA server is not
+      // available" message (it used to hardcode 0x80151802 ERROR_CONNECTION_INVALID).
+      // Observed args: arg1 (buffer_ptr) = dwServiceId VALUE (e.g. 0x45410004,
+      // 0x4541 = 'EA'); arg2 (buffer_length) = guest pointer to the output
+      // XONLINE_SERVICE_INFO { DWORD dwServiceId; IN_ADDR inaServer; WORD wPort;
+      // WORD wReserved; } (12 bytes; big-endian, inaServer in network order).
+      // Fill it with OUR redirect server (skate3_blaze_server_ip:_port) and
+      // return SUCCESS so the game proceeds to connect to us. The output pointer
+      // is range-guarded so a wrong-layout guess cannot corrupt guest memory.
+      const uint32_t service_id = buffer_ptr;
+      const uint32_t out_guest = buffer_length;
+
+      unsigned a = 127, b = 0, c = 0, d = 1;
+      const std::string ip = rex::cvar::Query<std::string>("skate3_blaze_server_ip");
+      std::sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d);
+      const uint16_t port =
+          static_cast<uint16_t>(rex::cvar::Query<uint32_t>("skate3_blaze_server_port"));
+
+      bool wrote = false;
+      if (out_guest >= 0x1000u && out_guest < 0xC0000000u) {
+        auto out = memory_->TranslateVirtual(out_guest);
+        if (out) {
+          const uint8_t ipbytes[4] = {static_cast<uint8_t>(a), static_cast<uint8_t>(b),
+                                      static_cast<uint8_t>(c), static_cast<uint8_t>(d)};
+          memory::store_and_swap<uint32_t>(out + 0, service_id);  // dwServiceId
+          std::memcpy(out + 4, ipbytes, 4);                       // inaServer (network order)
+          memory::store_and_swap<uint16_t>(out + 8, port);        // wPort
+          memory::store_and_swap<uint16_t>(out + 10, 0);          // wReserved
+          wrote = true;
+        }
+      }
+      if (rex::cvar::Query<bool>("skate3_net_packet_log")) {
+        REXKRNL_INFO(
+            "[xlive-trace] GetServiceInfo service={:08X} out_ptr={:08X} -> "
+            "server={}.{}.{}.{}:{} wrote={} (SUCCESS)",
+            service_id, out_guest, a, b, c, d, port, wrote ? 1 : 0);
+      }
+      return X_E_SUCCESS;
     }
     case 0x00058009: {
       // [skate3-online] Was returning "Unimplemented" and blocking Skate 3's
