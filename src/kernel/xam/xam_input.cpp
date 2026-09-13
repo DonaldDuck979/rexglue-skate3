@@ -25,6 +25,17 @@
 #include <iterator>
 #include <mutex>
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+// [open-roam] Tick (ms) when LB + D-pad Up was last held; read by the game exe.
+extern "C" {
+__declspec(dllexport) unsigned long long g_rex_marker_return_tick = 0;
+// Last gamepad buttons the guest read (XINPUT bits).
+__declspec(dllexport) unsigned int g_rex_last_buttons = 0;
+}
+
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 namespace rex {
@@ -400,6 +411,14 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
       input_state->gamepad.thumb_ry = 0;
     }
     ApplySyntheticInput(input_state);
+    // [open-roam] Remember when LB + D-pad Up (session marker return) was last
+    // held, so the game exe can tell a player-requested marker teleport apart
+    // from the online-area snap-back (both use the same teleport message).
+    if (input_state) {
+      const uint16_t b = (uint16_t)input_state->gamepad.buttons;
+      if ((b & 0x0100) && (b & 0x0001)) g_rex_marker_return_tick = GetTickCount64();
+      g_rex_last_buttons = b;
+    }
     // Diagnostic: log the FINAL state the guest reads (rate-limited) so the
     // input path can be verified from the log (real input, freeze, injection).
     if (g_input_log.load(std::memory_order_relaxed) && input_state) {

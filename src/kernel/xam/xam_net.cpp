@@ -48,13 +48,12 @@ REXCVAR_DEFINE_BOOL(skate3_net_packet_log, false, "Net",
 // Reporting a non-zero online address + the ONLINE status flag is what makes
 // the game believe it has an online presence and proceed to actually connect
 // to EA Nation (instead of polling forever then "lost connection to EA
-// Nation"). Defaults to James's known home PUBLIC IP; update it here if the
-// ISP reassigns it (a public IP can be dynamic). Empty = fall back to the
-// machine's local IP.
-REXCVAR_DEFINE_STRING(skate3_xnet_online_ip, "74.221.197.102", "Net",
+// Nation"). Any public-looking address works; the default is the community
+// server's. Empty = fall back to the machine's local IP.
+REXCVAR_DEFINE_STRING(skate3_xnet_online_ip, "162.120.6.21", "Net",
                       "Public IP reported to the game as its online address "
-                      "(XNetGetTitleXnAddr inaOnline). Set to your current "
-                      "home public IP; empty = use the local IP. Only used when "
+                      "(XNetGetTitleXnAddr inaOnline). Any public address works "
+                      "(default: the community server's); empty = use the local IP. Only used when "
                       "skate3_xnet_report_online is on.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // [skate3-online] Master gate for the "report a real online presence" behavior
@@ -596,7 +595,7 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   //   ina         = this machine's real local IPv4 (a bindable local interface;
   //                 must NOT be a remote/VPS address or the game may fail to
   //                 bind a socket to it).
-  //   inaOnline   = our home PUBLIC IP (skate3_xnet_online_ip cvar) = this
+  //   inaOnline   = a public IP (skate3_xnet_online_ip cvar) = this
   //                 console's address as the outside world sees it. Falls back
   //                 to the local IP when the cvar is empty/unparseable.
   //   wPortOnline = a non-zero online port (assigned as a plain host value; the
